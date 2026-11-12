@@ -1,0 +1,17 @@
+id: infographic-flat
+name: 플랫 인포그래픽
+summary: 도형·아이콘·숫자가 움직이는 모션그래픽. 경제·과학·비교·랭킹 설명에 가장 강합니다
+best_for: [경제, 과학, 비교, 랭킹, 통계, IT]
+image_prompt:
+  prefix: "flat vector illustration, minimal geometric shapes,"
+  suffix: "bold simple forms, limited color palette, clean composition, no gradients, editorial infographic style"
+  negative: "photorealistic, 3d, text, letters, watermark, clutter"
+video_prompt: "smooth motion graphics animation, shapes sliding and scaling, clean easing"
+palette: { bg: "#0f1b2d", surface: "#17304f", text: "#ffffff", accent: "#35e0a1", accent2: "#ffd166", stroke: "#0f1b2d" }
+fonts: { display: "Do Hyeon", body: "Pretendard" }
+captions: { style: pop, stroke: false, box: true }
+motion: { ease: snappy, title: mask, shape: sharp }
+local_art: grid
+voice: { persona: "명료하고 속도감 있는 설명형 목소리", speed: 1.08 }
+music: { mood: "가볍고 리드미컬한 일렉트로닉", genre: "light electronic", bpm: 120 }
+visual_mix: { video: 0.2, image: 0.3, motion: 0.5 }   # 이 그림체는 풀스크린 모션그래픽 비중을 높임

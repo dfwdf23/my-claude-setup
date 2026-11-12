@@ -1,0 +1,16 @@
+id: neon-tech
+name: 네온 테크
+summary: 어두운 배경에 네온 라인과 홀로그램. AI·IT·게임·미래 주제에 어울립니다
+best_for: [AI, IT, 게임, 미래, 우주]
+image_prompt:
+  prefix: "futuristic sci-fi concept art, neon holographic interface,"
+  suffix: "dark environment, glowing cyan and magenta light, volumetric fog, high detail, cyberpunk atmosphere"
+  negative: "text, letters, watermark, daylight, cartoon"
+video_prompt: "slow push-in, flickering holograms, drifting particles, neon light pulses"
+palette: { bg: "#07060f", surface: "#141127", text: "#f2f5ff", accent: "#00e5ff", accent2: "#ff3df2", stroke: "#07060f" }
+fonts: { display: "Orbit", body: "Pretendard" }
+captions: { style: pop, stroke: true, box: false }
+motion: { ease: snappy, title: type, shape: sharp }
+local_art: grid
+voice: { persona: "또렷하고 차가운 톤, 약간 빠르게", speed: 1.06 }
+music: { mood: "미래적인 신스웨이브", genre: "synthwave", bpm: 104 }

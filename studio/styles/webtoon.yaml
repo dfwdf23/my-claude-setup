@@ -1,0 +1,16 @@
+id: webtoon
+name: 웹툰 컷
+summary: 굵은 외곽선과 망점, 말풍선 느낌의 만화 컷. 썰·유머·반전 이야기에 좋습니다
+best_for: [썰, 유머, 반전, 연애, 직장]
+image_prompt:
+  prefix: "korean webtoon panel illustration, bold outlines,"
+  suffix: "flat colors with halftone shading, dynamic comic composition, expressive faces, speed lines"
+  negative: "photorealistic, 3d render, speech bubble text, letters, watermark"
+video_prompt: "comic panel animation, snappy pose changes, speed lines, slight camera shake for impact"
+palette: { bg: "#fff4c2", surface: "#ffffff", text: "#111111", accent: "#ff3b30", accent2: "#1e6bff", stroke: "#ffffff" }
+fonts: { display: "Black Han Sans", body: "Pretendard" }
+captions: { style: pop, stroke: true, box: false }
+motion: { ease: snappy, title: slam, shape: sharp }
+local_art: halftone
+voice: { persona: "능청스럽고 리액션 좋은 이야기꾼", speed: 1.1 }
+music: { mood: "익살스럽고 통통 튀는 비트", genre: "comedic funk", bpm: 108 }

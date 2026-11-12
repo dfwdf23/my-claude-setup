@@ -1,0 +1,16 @@
+id: anime-2d
+name: 2D 애니메이션
+summary: 셀 애니메이션 풍의 선명한 선과 색. 스토리텔링·감정선·캐릭터 중심 영상에 좋습니다
+best_for: [스토리, 썰, 감성, 캐릭터, 교육]
+image_prompt:
+  prefix: "2D anime key visual, clean cel shading,"
+  suffix: "crisp line art, vibrant colors, dramatic anime lighting, detailed painted background"
+  negative: "photorealistic, 3d render, text, watermark, extra limbs, blurry"
+video_prompt: "anime style animation, expressive character motion, subtle parallax background, hair and cloth movement"
+palette: { bg: "#151a3a", surface: "#222a5c", text: "#ffffff", accent: "#ff5d8f", accent2: "#5ce1ff", stroke: "#1a1033" }
+fonts: { display: "Bagel Fat One", body: "Pretendard" }
+captions: { style: pop, stroke: true, box: false }
+motion: { ease: bouncy, title: slam, shape: round }
+local_art: sunburst
+voice: { persona: "생기 있고 표현이 풍부한 20대 성우", speed: 1.05 }
+music: { mood: "밝고 드라마틱한 애니 OST 느낌", genre: "anime orchestral pop", bpm: 118 }

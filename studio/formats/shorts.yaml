@@ -1,0 +1,17 @@
+id: shorts
+name: 유튜브 쇼츠
+summary: 세로 9:16, 20~60초. 1초 훅과 빠른 컷이 핵심
+platforms: [youtube_shorts]
+canvas: { width: 1080, height: 1920, fps: 30 }
+duration: { min: 20, target: 38, max: 60 }      # 초
+shot: { target_sec: 3, max_sec: 5 }             # 한 컷 길이
+visual_mix: { video: 0.6, image: 0.3, motion: 0.1 }   # 장면 중 영상 생성 / 이미지+카메라무빙 / 풀스크린 모션그래픽 비율
+captions: { style: pop, max_words: 3, y: 0.62 } # y = 화면 위에서부터의 위치 비율
+safe_area: { top: 0.10, bottom: 0.24, left: 0.06, right: 0.14 }   # 플랫폼 UI에 가려지는 영역
+thumbnail: { width: 1080, height: 1920 }
+metadata: { title_max: 60, hashtags: 3, description_max: 300 }
+guide: |
+  - 0~1초: 움직이는 화면 + 화면 중앙의 핵심 문구. 로고·인트로 없음.
+  - 3~5초마다 컷 전환 또는 새 그래픽.
+  - 한 영상에 메시지 하나. 끝 문장은 첫 문장으로 이어지게 (루프).
+  - CTA는 말로 길게 하지 않고 마지막 1초 그래픽으로.

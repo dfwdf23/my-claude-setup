@@ -1,0 +1,20 @@
+# 채널 프로필 — 채널마다 파일을 하나씩 만들면 됩니다 (복사해서 id만 바꾸세요).
+id: main
+name: 메인 채널
+language: ko
+niche: 일상 속 과학·심리·경제를 쉽고 재미있게 푸는 지식 채널
+audience: 20~40대, 출퇴근길에 가볍게 보지만 '하나는 배웠다'는 느낌을 원하는 사람
+tone: 친근한 반말체가 아닌 깔끔한 존댓말, 과장 없이 담백하게, 가끔 위트
+avoid:
+  - 정치·종교 논쟁, 의학적 진단·투자 권유
+  - 확인되지 않은 통계, 타인 비방
+cta: 도움이 됐다면 구독해 주세요
+default_format: shorts
+default_style: auto # auto = 프로듀서가 주제에 맞는 그림체를 고릅니다
+upload:
+  youtube: { category_id: "27", made_for_kids: false }
+  instagram: { share_to_feed: true }
+autopilot:
+  enabled: false # true면 아래 편수만큼 AI가 매일 주제를 찾아 기획안을 결재함에 올립니다
+  daily: { shorts: 1, long: 0, reels: 0 }
+  topics_hint: "" # 비워두면 채널 주제(niche) 안에서 트렌드를 찾아 고릅니다

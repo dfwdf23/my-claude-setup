@@ -1,0 +1,17 @@
+id: long
+name: 유튜브 롱폼
+summary: 가로 16:9, 6~12분. 이야기 구조와 시청 지속시간이 핵심
+platforms: [youtube]
+canvas: { width: 1920, height: 1080, fps: 30 }
+duration: { min: 300, target: 480, max: 780 }
+shot: { target_sec: 5, max_sec: 8 }
+visual_mix: { video: 0.25, image: 0.55, motion: 0.20 }   # 롱폼은 영상 생성 비중을 낮춰 비용을 관리
+captions: { style: clean, max_words: 7, y: 0.86 }
+safe_area: { top: 0.06, bottom: 0.10, left: 0.05, right: 0.05 }
+thumbnail: { width: 1280, height: 720 }
+metadata: { title_max: 70, hashtags: 3, description_max: 2000 }
+guide: |
+  - 0~30초: 훅 → 이 영상의 약속(무엇을 얻는지) → 바로 본론. 채널 인트로는 5초 이하.
+  - 챕터 3~6개. 각 챕터 끝에서 다음 챕터의 궁금증을 미리 건다.
+  - 2~3분마다 리듬 변화(그래픽, 정리 화면, 톤 전환)로 이탈 구간을 만들지 않는다.
+  - 마지막 20초: 가장 큰 보상 + 다음 영상으로 이어지는 한마디.

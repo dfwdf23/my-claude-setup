@@ -1,0 +1,16 @@
+id: hand-doodle
+name: 손그림 두들
+summary: 노트에 펜으로 그린 듯한 낙서 그림. 공부법·자기계발·쉬운 개념 설명에 좋습니다
+best_for: [공부, 자기계발, 개념설명, 습관, 심리]
+image_prompt:
+  prefix: "hand-drawn doodle sketch on notebook paper, marker pen lines,"
+  suffix: "simple stick figures and icons, wobbly imperfect lines, highlighter accents, whiteboard explainer style"
+  negative: "photorealistic, 3d, polished vector, text, letters, watermark"
+video_prompt: "hand-drawn lines being sketched in, wobbly boiling line animation, simple playful motion"
+palette: { bg: "#fdfcf5", surface: "#ffffff", text: "#1d1d1f", accent: "#ffcc00", accent2: "#2f6fed", stroke: "#fdfcf5" }
+fonts: { display: "Gaegu", body: "Gaegu" }
+captions: { style: pop, stroke: false, box: true }
+motion: { ease: bouncy, title: type, shape: round }
+local_art: paper
+voice: { persona: "편안하게 설명해 주는 선배 같은 목소리", speed: 1.02 }
+music: { mood: "가볍고 산뜻한 어쿠스틱", genre: "light acoustic", bpm: 100 }

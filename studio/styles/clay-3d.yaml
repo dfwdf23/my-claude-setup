@@ -1,0 +1,16 @@
+id: clay-3d
+name: 3D 클레이 토이
+summary: 말랑한 클레이·장난감 질감의 3D. 생활 정보·키즈·가벼운 설명 영상에 어울립니다
+best_for: [생활정보, 키즈, 꿀팁, 음식, 동물]
+image_prompt:
+  prefix: "3D claymation style render, soft plasticine texture,"
+  suffix: "miniature diorama, pastel colors, soft studio lighting, tilt-shift, cute rounded shapes, octane render"
+  negative: "photorealistic human, text, watermark, sharp edges, dark, scary"
+video_prompt: "stop-motion claymation movement, slightly jittery handcrafted animation, soft lighting"
+palette: { bg: "#ffe9d6", surface: "#fff6ec", text: "#33261d", accent: "#ff7a45", accent2: "#3fb8a9", stroke: "#ffffff" }
+fonts: { display: "Jua", body: "Pretendard" }
+captions: { style: pop, stroke: true, box: false }
+motion: { ease: bouncy, title: slam, shape: round }
+local_art: blobs
+voice: { persona: "밝고 다정한 목소리, 또박또박", speed: 1.0 }
+music: { mood: "경쾌하고 귀여운 우쿨렐레·실로폰", genre: "playful acoustic", bpm: 112 }

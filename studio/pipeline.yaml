@@ -1,0 +1,25 @@
+# 제작 파이프라인 — 단계 순서, 담당 AI, 결재 지점
+# needs: 먼저 끝나야 하는 단계. needs가 같은 단계들은 동시에 진행됩니다.
+# gate : 사람 결재 단계. 결재는 '기획'과 '업로드' 두 곳뿐입니다.
+phases: [기획, 프리프로덕션, 제작, 후반, 검수, 배포, 학습]
+
+stages:
+  - { id: research,    title: 트렌드 리서치,   phase: 기획,        agent: trend-scout }
+  - { id: plan,        title: 기획안 작성,     phase: 기획,        agent: producer,        needs: [research] }
+  - { id: plan_gate,   title: 기획 결재,       phase: 기획,        gate: plan,             needs: [plan] }
+
+  - { id: script,      title: 대본,            phase: 프리프로덕션, agent: scriptwriter,    needs: [plan_gate] }
+  - { id: storyboard,  title: 스토리보드,      phase: 프리프로덕션, agent: art-director,    needs: [script] }
+
+  - { id: voice,       title: 성우 녹음,       phase: 제작,        agent: voice-director,  needs: [storyboard] }
+  - { id: visuals,     title: 이미지·영상 생성, phase: 제작,        agent: visual-artist,   needs: [voice] }
+  - { id: motion,      title: 모션그래픽·자막,  phase: 제작,        agent: motion-designer, needs: [voice] }
+  - { id: sound,       title: 음악·사운드,     phase: 제작,        agent: sound-designer,  needs: [voice] }
+  - { id: package,     title: 썸네일·제목·SEO, phase: 제작,        agent: packager,        needs: [storyboard] }
+
+  - { id: edit,        title: 편집·마스터링,   phase: 후반,        agent: editor,          needs: [visuals, motion, sound] }
+  - { id: qa,          title: 품질 검수,       phase: 검수,        agent: qa-director,     needs: [edit, package] }
+  - { id: upload_gate, title: 업로드 결재,     phase: 검수,        gate: upload,           needs: [qa] }
+
+  - { id: publish,     title: 업로드,          phase: 배포,        agent: publisher,       needs: [upload_gate] }
+  - { id: analyze,     title: 성과 분석·학습,  phase: 학습,        agent: analyst,         needs: [publish] }

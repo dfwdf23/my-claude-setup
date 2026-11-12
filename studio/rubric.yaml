@@ -1,0 +1,53 @@
+# 품질 검수 기준표 — "조회수 10만 이상 영상"에서 공통으로 보이는 요소를 점수화합니다.
+# weight 합계는 100. 품질 감독(QA)이 이 표로 채점하고, 미달 항목은 담당 단계로 돌려보냅니다.
+criteria:
+  - id: hook
+    name: 첫 3초 훅
+    weight: 20
+    stage: script
+    standard: >-
+      첫 문장과 첫 화면만으로 '끝까지 봐야 할 이유'가 생긴다. 인사·자기소개·배경 설명으로 시작하지 않는다.
+      쇼츠/릴스는 1초 안에 움직임과 핵심 문구가 동시에 나온다.
+  - id: retention
+    name: 구성·페이싱
+    weight: 15
+    stage: script
+    standard: >-
+      3~5초마다 화면이나 정보가 바뀐다. 중간에 새 궁금증(오픈 루프)을 다시 걸고, 늘어지는 구간이 없다.
+      마지막은 요약 반복이 아니라 보상(페이오프)으로 끝난다.
+  - id: value
+    name: 내용의 가치·정확성
+    weight: 15
+    stage: script
+    standard: >-
+      시청자가 얻어가는 것(정보·감정·재미)이 분명하고, 사실 주장에 근거가 있다. 뻔한 말, 과장, 낚시가 없다.
+  - id: visual
+    name: 비주얼 품질·일관성
+    weight: 15
+    stage: storyboard
+    standard: >-
+      장면마다 그림체·색·인물이 일관되고, 화면이 내레이션 내용을 정확히 보여준다. AI 특유의 뭉개짐·왜곡이 없다.
+  - id: audio
+    name: 목소리·사운드
+    weight: 10
+    stage: voice
+    standard: >-
+      발음과 숫자·외래어 읽기가 자연스럽고 감정이 살아 있다. 음악이 목소리를 가리지 않으며 전체 음량이 일정하다.
+  - id: captions
+    name: 자막·가독성
+    weight: 10
+    stage: motion
+    standard: >-
+      소리 없이 봐도 이해된다. 자막이 플랫폼 UI(하단 설명·우측 버튼)에 가리지 않고, 한 번에 읽을 수 있는 길이다.
+  - id: packaging
+    name: 제목·썸네일
+    weight: 10
+    stage: package
+    standard: >-
+      제목과 썸네일이 서로 다른 정보를 주며 합쳐서 하나의 궁금증을 만든다. 썸네일 글자는 3~5단어, 작은 화면에서도 읽힌다.
+  - id: technical
+    name: 기술 규격
+    weight: 5
+    stage: edit
+    standard: >-
+      해상도·비율·길이·음량(-14 LUFS 안팎)이 플랫폼 규격에 맞고, 검은 화면·무음·끊김이 없다.

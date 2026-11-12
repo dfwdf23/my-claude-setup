@@ -1,0 +1,16 @@
+id: cinematic-real
+name: 시네마틱 실사
+summary: 영화 스틸컷 같은 실사 화면. 다큐·미스터리·역사·경제 이야기에 어울립니다
+best_for: [다큐, 미스터리, 역사, 경제, 인물]
+image_prompt:
+  prefix: "cinematic film still, photorealistic,"
+  suffix: "shot on 35mm anamorphic lens, shallow depth of field, moody natural lighting, subtle film grain, rich contrast"
+  negative: "text, watermark, logo, cartoon, illustration, deformed hands, extra fingers"
+video_prompt: "slow deliberate cinematic camera movement, realistic motion, natural lighting"
+palette: { bg: "#0c0e13", surface: "#181c25", text: "#ffffff", accent: "#ffb23e", accent2: "#63a8ff", stroke: "#000000" }
+fonts: { display: "Black Han Sans", body: "Pretendard" }
+captions: { style: pop, stroke: true, box: false }
+motion: { ease: smooth, title: mask, shape: sharp }
+local_art: bokeh
+voice: { persona: "낮고 차분한 다큐 내레이터, 30대 후반", speed: 1.0 }
+music: { mood: "긴장감 있는 시네마틱 앰비언트", genre: "cinematic ambient", bpm: 84 }

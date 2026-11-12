@@ -1,0 +1,17 @@
+id: reels
+name: 인스타그램 릴스
+summary: 세로 9:16, 15~60초. 감각적인 화면과 저장·공유를 부르는 정보
+platforms: [instagram_reels]
+canvas: { width: 1080, height: 1920, fps: 30 }
+duration: { min: 15, target: 30, max: 60 }
+shot: { target_sec: 2.5, max_sec: 4 }
+visual_mix: { video: 0.5, image: 0.3, motion: 0.2 }
+captions: { style: pop, max_words: 3, y: 0.60 }
+safe_area: { top: 0.12, bottom: 0.28, left: 0.06, right: 0.14 }
+thumbnail: { width: 1080, height: 1920 }
+metadata: { title_max: 0, hashtags: 5, description_max: 400 }
+guide: |
+  - 릴스는 '저장'과 '공유'가 도달을 키운다. 저장하고 싶은 목록·팁·비교를 담는다.
+  - 첫 화면 문구는 피드 격자(1:1 가운데 크롭)에서도 읽혀야 한다 — 화면 중앙에 둔다.
+  - 캡션 첫 줄이 곧 제목이다. 해시태그는 3~5개만.
+  - 유튜브 쇼츠보다 화면의 분위기·색감 비중을 높인다.

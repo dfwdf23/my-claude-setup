@@ -1,0 +1,35 @@
+# ─────────────────────────────────────────────────────────────
+#  스튜디오 전역 설정
+#  이 폴더(studio/)의 모든 파일은 저장하는 즉시 반영됩니다. 재시작이 필요 없습니다.
+# ─────────────────────────────────────────────────────────────
+name: 오토 스튜디오
+language: ko
+
+# auto       : API 키가 연결된 AI는 실제로 쓰고, 없는 분야는 로컬 대체 엔진으로 채웁니다.
+# simulation : 외부 AI를 전혀 호출하지 않습니다 (비용 0원, 흐름·화면 점검용).
+mode: auto
+
+quality:
+  pass_score: 80            # 품질 감독(QA) 합격선. 미달이면 담당 AI에게 돌려보내 재작업합니다.
+  max_revision_rounds: 2    # 자동 재작업 최대 횟수. 넘으면 '기준 미달' 표시를 달고 업로드 결재로 올립니다.
+  script_passes: 2          # 대본 퇴고 횟수 (1 = 작가만, 2 = 작가 + 스크립트 닥터)
+
+budget:                     # 영상 1편당 외부 AI 비용 상한(USD, 추정치). 넘으면 자동 일시정지하고 알려줍니다.
+  per_project_usd: { shorts: 15, reels: 15, long: 60 }
+
+concurrency:
+  projects: 2               # 동시에 제작하는 영상 수
+  media: 3                  # 이미지·영상·음성 생성 동시 요청 수
+
+learning:
+  enabled: true
+  max_lessons_in_prompt: 12 # 각 AI에게 매번 전달하는 학습 노트 개수
+  analytics_checkpoints_hours: [24, 72, 168]   # 업로드 후 성과를 다시 확인하는 시점
+
+publish:
+  live: false               # false = 실제 업로드 대신 data/outbox 에 업로드 패키지만 만듭니다 (안전장치)
+  default_privacy: private  # private | unlisted | public — 업로드 결재 화면에서 매번 바꿀 수 있습니다
+  disclose_ai: true         # 유튜브 'AI 생성/변형 콘텐츠' 표시
+
+simulation:
+  step_delay_ms: 900        # 시뮬레이션에서 각 단계가 일하는 척하는 시간 (화면 확인용)

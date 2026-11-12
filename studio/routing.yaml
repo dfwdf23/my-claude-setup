@@ -1,0 +1,101 @@
+# ─────────────────────────────────────────────────────────────
+#  분야별 AI 연결표 (라우팅)
+#
+#  각 분야는 위에서부터 순서대로 시도합니다.
+#   · API 키가 없는 제공사는 건너뜁니다.
+#   · 호출이 실패하면 다음 후보로 자동 전환합니다.
+#   · 연결된 AI가 하나도 없는 분야만 local/* (이 컴퓨터의 대체 엔진)을 씁니다.
+#  새 모델이 나오면 맨 위에 한 줄 추가하면 끝 — 저장 즉시 다음 작업부터 적용됩니다.
+#
+#  형식:  "<제공사>/<모델>"
+#     또는 { use: "<제공사>/<모델>", when: { style: [...], format: [...] }, options: {...} }
+#
+#  아래 모델 ID·입력 형식은 2026-11-12 각 제공사 공식 문서에서 확인한 값입니다.
+#  (실제 키로 호출 검증은 하지 않았습니다 — 첫 실행 때 'AI 팀' 화면의 연결 상태를 확인하세요)
+# ─────────────────────────────────────────────────────────────
+capabilities:
+  # 기획·대본·연출·검수 두뇌. 팀원별 모델은 studio/agents/*.md 의 model 값으로 따로 지정할 수 있습니다.
+  llm:
+    - anthropic/claude-opus-5-5
+    - local/sim-brain
+
+  # 트렌드 리서치용 웹 검색
+  search:
+    - anthropic/web_search
+    - local/none
+
+  # 장면 이미지 · 썸네일 배경  (fal 옵션: size = aspect_ratio | image_size)
+  image:
+    - use: fal/google/nano-banana-2.1
+      options: { size: aspect_ratio, extra: { resolution: 2K, output_format: png }, edit_model: google/nano-banana-2.1/edit, max_refs: 4 }
+    - use: fal/bytedance/seedream/v5.5/text-to-image
+      options: { size: image_size, edit_model: bytedance/seedream/v5.5/edit, max_refs: 4 }
+    - use: fal/blackforestlabs/flux-3/text-to-image
+      options: { size: aspect_ratio, extra: { resolution: 2k } }
+    - openai/gpt-image-2.5-sunburst
+    - local/art
+
+  # 이미지 → 영상 클립  (fal 옵션: image_field, duration_type = int | string, aspect_param, audio_field)
+  video:
+    - use: fal/kling/v4/image-to-video
+      options: { image_field: start_image_url, duration_type: int, duration_min: 3, duration_max: 10, extra: { resolution: 1080p } }
+    - use: fal/google/gemini-omni-flash/v1.2/image-to-video
+      options: { image_field: image_url, duration_type: int, duration_min: 3, duration_max: 15, aspect_param: true, extra: { resolution: 1080p } }
+    - use: fal/bytedance/seedance-2.5/us/image-to-video
+      options: { image_field: image_url, duration_type: string, duration_min: 4, duration_max: 12, audio_field: generate_audio, extra: { resolution: 720p } }
+    - local/kenburns
+
+  # 성우. eleven_v4 가 현재 최고 음질이지만 '타임스탬프 포함' 호출 지원 여부는 문서로 확인하지 못했습니다.
+  # 지원하지 않으면 자동으로 아래 multilingual_v2 (장편에서 가장 안정적)로 넘어갑니다.
+  tts:
+    - elevenlabs/eleven_v4
+    - use: elevenlabs/eleven_multilingual_v2
+      options: { speed_control: true }
+    - use: openai/gpt-4o-mini-tts        # 2027-01-06 종료 예정인 API — 예비용
+      options: { voice: marin }
+    - local/silent
+
+  # 배경음악 (연주곡)
+  music:
+    - elevenlabs/music_v2_5
+    - use: fal/elevenlabs/music/v2.5
+      options: { length_field: music_length_ms, length_unit: ms, extra: { force_instrumental: true } }
+    - use: fal/fal-ai/stable-audio-3/medium/text-to-audio
+      options: { length_field: duration, length_unit: s }
+    - local/synth
+
+  # 모션그래픽·자막 렌더러 / 편집 — 이 컴퓨터에서 직접 처리 (Chromium · ffmpeg)
+  motion:
+    - local/html
+  edit:
+    - local/ffmpeg
+
+  # 업로드. studio.yaml 의 publish.live 가 false 면 항상 local/outbox (업로드 패키지만 저장)
+  publish.youtube:
+    - youtube/data-v3
+    - local/outbox
+  publish.instagram:
+    - use: instagram/graph
+      options: { api_version: v27.0 }
+    - local/outbox
+
+  # 성과 조회
+  analytics.youtube:
+    - youtube/analytics-v2
+    - local/sim-metrics
+  analytics.instagram:
+    - use: instagram/insights
+      options: { api_version: v27.0 }
+    - local/sim-metrics
+
+# 비용 추정 단가 (USD) — 영상별 예산 상한 계산에만 쓰입니다. 실제 청구액은 각 제공사 대시보드에서 확인하세요.
+pricing:
+  anthropic/claude-opus-5-5: { input_mtok: 4, output_mtok: 20 }
+  fal/google/nano-banana-2.1: { per_image: 0.06 }
+  fal/bytedance/seedream/v5.5/text-to-image: { per_image: 0.04 }
+  fal/blackforestlabs/flux-3/text-to-image: { per_image: 0.05 }
+  fal/kling/v4/image-to-video: { per_second: 0.235 }
+  fal/google/gemini-omni-flash/v1.2/image-to-video: { per_second: 0.123 }
+  fal/bytedance/seedance-2.5/us/image-to-video: { per_second: 0.473 }
+  fal/elevenlabs/music/v2.5: { per_minute: 0.6 }
+  fal/fal-ai/stable-audio-3/medium/text-to-audio: { per_track: 0.04 }

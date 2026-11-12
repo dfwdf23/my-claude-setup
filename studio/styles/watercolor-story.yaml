@@ -1,0 +1,16 @@
+id: watercolor-story
+name: 수채화 동화
+summary: 번지는 수채 물감과 종이 질감. 감성 에세이·옛이야기·명언·힐링 영상에 어울립니다
+best_for: [감성, 에세이, 명언, 옛이야기, 힐링]
+image_prompt:
+  prefix: "delicate watercolor illustration, soft bleeding pigments,"
+  suffix: "visible paper texture, gentle pastel washes, storybook composition, hand-painted feel"
+  negative: "photorealistic, 3d, harsh lines, text, watermark, neon colors"
+video_prompt: "gentle slow movement, watercolor paint softly spreading, drifting particles, calm atmosphere"
+palette: { bg: "#f4ecdf", surface: "#fbf6ec", text: "#2f2a26", accent: "#c8553d", accent2: "#3d7a8c", stroke: "#fbf6ec" }
+fonts: { display: "Gowun Batang", body: "Gowun Batang" }
+captions: { style: clean, stroke: false, box: false }
+motion: { ease: smooth, title: fade, shape: round }
+local_art: paper
+voice: { persona: "따뜻하고 느린 호흡의 낭독 목소리", speed: 0.94 }
+music: { mood: "잔잔한 피아노와 현악", genre: "soft piano", bpm: 72 }
