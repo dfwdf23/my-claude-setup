@@ -34,7 +34,15 @@ if [[ -z "$NODE" ]]; then
   name="node-${NODE_VERSION}-${plat}-${arch}"
   echo "▶ Node.js 를 내려받는 중 (처음 한 번만)…"
   mkdir -p .runtime
-  curl -fL --progress-bar "https://nodejs.org/dist/${NODE_VERSION}/${name}.tar.gz" -o ".runtime/node.tar.gz"
+  url="https://nodejs.org/dist/${NODE_VERSION}/${name}.tar.gz"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fL --progress-bar "$url" -o ".runtime/node.tar.gz"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -O ".runtime/node.tar.gz" "$url"
+  else
+    echo "✗ 내려받기 도구(curl 또는 wget)가 필요합니다. 예: sudo apt install curl"
+    exit 1
+  fi
   rm -rf ".runtime/${name}" ".runtime/node"
   tar -xzf ".runtime/node.tar.gz" -C .runtime
   mv ".runtime/${name}" ".runtime/node"

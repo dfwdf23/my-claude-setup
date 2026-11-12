@@ -75,9 +75,21 @@ export async function flush() {
       const tmp = file + ".tmp";
       await fsp.mkdir(path.dirname(file), { recursive: true });
       await fsp.writeFile(tmp, JSON.stringify(p, null, 1));
-      await fsp.rename(tmp, file);
+      await renameWithRetry(tmp, file);
     }),
   );
+}
+
+/** Windows: antivirus or the search indexer can hold a just-written file for a moment. */
+async function renameWithRetry(from, to) {
+  for (let i = 0; ; i++) {
+    try {
+      return await fsp.rename(from, to);
+    } catch (err) {
+      if (i >= 5 || !["EPERM", "EACCES", "EBUSY"].includes(err.code)) throw err;
+      await new Promise((r) => setTimeout(r, 60 * (i + 1)));
+    }
+  }
 }
 
 export async function removeProject(id) {

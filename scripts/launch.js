@@ -7,6 +7,7 @@ import path from "node:path";
 import http from "node:http";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { createRequire } from "node:module";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 process.chdir(ROOT);
@@ -90,7 +91,14 @@ if (spawnSync(FFMPEG, ["-version"], { stdio: "ignore", windowsHide: true }).stat
   say("영상 편집 엔진(ffmpeg)을 다시 받는 중…");
   fs.rmSync(path.join(ROOT, "node_modules", "ffmpeg-static"), { recursive: true, force: true });
   runNpm(["install", "--no-audit", "--no-fund"]);
-  fail("ffmpeg 을 준비하지 못했습니다. 다시 실행해 보고, 계속 실패하면 https://ffmpeg.org/download.html 에서 설치하세요.");
+  let repaired = null;
+  try {
+    repaired = createRequire(import.meta.url)(path.join(ROOT, "node_modules", "ffmpeg-static"));
+  } catch {}
+  if (!repaired || spawnSync(repaired, ["-version"], { stdio: "ignore", windowsHide: true }).status !== 0) {
+    fail("ffmpeg 을 준비하지 못했습니다. 다시 실행해 보고, 계속 실패하면 https://ffmpeg.org/download.html 에서 설치하세요.");
+  }
+  process.env.FFMPEG_PATH = repaired; // the server (a child process) picks this up
 }
 
 // 3) A browser engine for the motion-graphics renderer: Chrome/Edge if present, otherwise download Chromium once.
@@ -115,7 +123,12 @@ await render.closeBrowser();
 // 4) Start the studio and open it.
 say("스튜디오를 켜는 중…");
 const server = spawn(process.execPath, ["server/index.js"], { stdio: "inherit", env: process.env });
-const stop = () => server.kill("SIGINT");
+// On Windows the console already delivers Ctrl+C to the server itself, and kill() there would
+// terminate it before it can save; elsewhere forward the signal so it shuts down cleanly.
+const stop = () => {
+  if (process.platform !== "win32") server.kill("SIGINT");
+  setTimeout(() => server.kill(), 8000).unref();
+};
 process.on("SIGINT", stop);
 process.on("SIGTERM", stop);
 server.on("exit", (code) => process.exit(code ?? 0));

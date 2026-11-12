@@ -1,5 +1,5 @@
 #!/bin/bash
-# 맥: 이 파일을 더블클릭하면 스튜디오가 켜집니다. (처음엔 마우스 오른쪽 클릭 → 열기)
+# 맥: 이 파일을 더블클릭하면 스튜디오가 켜집니다. 처음에 막히면 README 의 "macOS 에서 막힐 때" 참고.
 cd "$(dirname "$0")" || exit 1
 bash scripts/start-unix.sh
 status=$?
