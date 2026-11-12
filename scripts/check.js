@@ -6,6 +6,7 @@ import { initStore } from "../server/store.js";
 import { loadAll, config } from "../server/config.js";
 import { routingStatus } from "../server/providers/registry.js";
 import { getBrowser, closeBrowser } from "../server/media/render.js";
+import { FFMPEG, FFPROBE } from "../server/media/bin.js";
 
 loadDotEnv();
 initStore();
@@ -19,9 +20,9 @@ const bad = (label, detail = "") => {
 console.log("\n[필수 프로그램]");
 const major = Number(process.versions.node.split(".")[0]);
 major >= 20 ? ok("Node.js", process.versions.node) : bad("Node.js 20 이상이 필요합니다", process.versions.node);
-for (const bin of ["ffmpeg", "ffprobe"]) {
-  const r = spawnSync(bin, ["-version"], { encoding: "utf8" });
-  r.status === 0 ? ok(bin, r.stdout.split("\n")[0].split(" ").slice(0, 3).join(" ")) : bad(`${bin} 이(가) 없습니다`, "https://ffmpeg.org/download.html 에서 설치하세요");
+for (const [name, bin] of [["ffmpeg", FFMPEG], ["ffprobe", FFPROBE]]) {
+  const r = spawnSync(bin, ["-version"], { encoding: "utf8", windowsHide: true });
+  r.status === 0 ? ok(name, r.stdout.split("\n")[0].split(" ").slice(0, 3).join(" ")) : bad(`${name} 을(를) 찾지 못했습니다`, "npm install 을 다시 실행하세요");
 }
 try {
   const browser = await getBrowser();

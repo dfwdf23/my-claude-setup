@@ -1,6 +1,7 @@
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { run } from "../util.js";
+import { FFMPEG, FFPROBE } from "./bin.js";
 
 /** ffmpeg / ffprobe building blocks used by the local video engine, the editor and QA. */
 
@@ -8,7 +9,7 @@ const FF = ["-y", "-hide_banner", "-loglevel", "error"];
 const X264 = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "17", "-pix_fmt", "yuv420p"];
 
 export async function probe(file) {
-  const { stdout } = await run("ffprobe", ["-v", "error", "-print_format", "json", "-show_format", "-show_streams", file]);
+  const { stdout } = await run(FFPROBE, ["-v", "error", "-print_format", "json", "-show_format", "-show_streams", file]);
   const info = JSON.parse(stdout);
   const v = info.streams.find((s) => s.codec_type === "video");
   const a = info.streams.find((s) => s.codec_type === "audio");
@@ -47,7 +48,7 @@ export async function kenBurns({ imageFile, outFile, width, height, fps = 30, du
     `crop=${width * 2}:${height * 2}`,
     `zoompan=z='${m.z}':x='${m.x}':y='${m.y}':d=1:s=${width}x${height}:fps=${fps}`,
   ].join(",");
-  await run("ffmpeg", [...FF, "-framerate", String(fps), "-loop", "1", "-i", imageFile, "-vf", vf, "-frames:v", String(N), "-r", String(fps), ...X264, "-an", outFile]);
+  await run(FFMPEG, [...FF, "-framerate", String(fps), "-loop", "1", "-i", imageFile, "-vf", vf, "-frames:v", String(N), "-r", String(fps), ...X264, "-an", outFile]);
   return outFile;
 }
 
@@ -62,7 +63,7 @@ export async function fitClip({ inFile, outFile, width, height, fps = 30, durati
     `fps=${fps}`,
     `tpad=stop_mode=clone:stop_duration=${Math.max(0, duration - have * stretch + 0.2).toFixed(3)}`,
   ].filter(Boolean).join(",");
-  await run("ffmpeg", [...FF, "-i", inFile, "-vf", vf, "-t", duration.toFixed(3), "-r", String(fps), ...X264, "-an", outFile]);
+  await run(FFMPEG, [...FF, "-i", inFile, "-vf", vf, "-t", duration.toFixed(3), "-r", String(fps), ...X264, "-an", outFile]);
   return outFile;
 }
 
@@ -71,7 +72,7 @@ export async function composite({ baseFile, overlayFile, outFile, fps = 30, dura
   const args = [...FF, "-i", baseFile];
   if (overlayFile) args.push("-i", overlayFile, "-filter_complex", "[0:v][1:v]overlay=0:0:format=auto,format=yuv420p[v]", "-map", "[v]");
   args.push("-t", duration.toFixed(3), "-r", String(fps), ...X264, "-video_track_timescale", "30000", "-an", outFile);
-  await run("ffmpeg", args);
+  await run(FFMPEG, args);
   return outFile;
 }
 
@@ -79,9 +80,9 @@ export async function composite({ baseFile, overlayFile, outFile, fps = 30, dura
 export async function voiceSlot({ voiceFile, outFile, duration, lead = 0.12 }) {
   const ms = Math.round(lead * 1000);
   if (voiceFile) {
-    await run("ffmpeg", [...FF, "-i", voiceFile, "-af", `adelay=${ms}|${ms},apad`, "-t", duration.toFixed(3), "-ar", "48000", "-ac", "2", "-c:a", "pcm_s16le", outFile]);
+    await run(FFMPEG, [...FF, "-i", voiceFile, "-af", `adelay=${ms}|${ms},apad`, "-t", duration.toFixed(3), "-ar", "48000", "-ac", "2", "-c:a", "pcm_s16le", outFile]);
   } else {
-    await run("ffmpeg", [...FF, "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", duration.toFixed(3), "-c:a", "pcm_s16le", outFile]);
+    await run(FFMPEG, [...FF, "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", duration.toFixed(3), "-c:a", "pcm_s16le", outFile]);
   }
   return outFile;
 }
@@ -91,20 +92,21 @@ export async function silence(outFile, duration) {
 }
 
 async function concatList(files, listFile) {
-  await fsp.writeFile(listFile, files.map((f) => `file '${f.replace(/'/g, "'\\''")}'`).join("\n"));
+  // Forward slashes work on every OS and avoid backslash-escaping surprises in the concat list (Windows).
+  await fsp.writeFile(listFile, files.map((f) => `file '${f.split(path.sep).join("/").replace(/'/g, "'\\''")}'`).join("\n"));
   return listFile;
 }
 
 export async function concatVideo(files, outFile) {
   const list = await concatList(files, outFile + ".txt");
-  await run("ffmpeg", [...FF, "-f", "concat", "-safe", "0", "-i", list, "-c", "copy", outFile]);
+  await run(FFMPEG, [...FF, "-f", "concat", "-safe", "0", "-i", list, "-c", "copy", outFile]);
   await fsp.rm(list, { force: true });
   return outFile;
 }
 
 export async function concatAudio(files, outFile) {
   const list = await concatList(files, outFile + ".txt");
-  await run("ffmpeg", [...FF, "-f", "concat", "-safe", "0", "-i", list, "-c:a", "pcm_s16le", outFile]);
+  await run(FFMPEG, [...FF, "-f", "concat", "-safe", "0", "-i", list, "-c:a", "pcm_s16le", outFile]);
   await fsp.rm(list, { force: true });
   return outFile;
 }
@@ -127,7 +129,7 @@ export async function master({ videoFile, voiceFile, musicFile, outFile, duratio
     filter = hasVoice ? "[1:a]loudnorm=I=-14:TP=-1.5:LRA=11[a]" : "[1:a]anull[a]";
   }
   args.push("-filter_complex", filter, "-map", "0:v", "-map", "[a]", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-t", duration.toFixed(3), "-movflags", "+faststart", outFile);
-  await run("ffmpeg", args);
+  await run(FFMPEG, args);
   return outFile;
 }
 
@@ -135,7 +137,7 @@ export async function grabFrame(videoFile, t, outFile, { width = 0 } = {}) {
   const args = [...FF, "-ss", Math.max(0, t).toFixed(3), "-i", videoFile, "-frames:v", "1"];
   if (width) args.push("-vf", `scale=${width}:-2`);
   args.push("-q:v", "4", outFile);
-  await run("ffmpeg", args);
+  await run(FFMPEG, args);
   return outFile;
 }
 
@@ -144,12 +146,12 @@ export async function measure(videoFile) {
   const info = await probe(videoFile);
   const out = { ...info, loudness: null, silences: [], blackSeconds: 0 };
   if (info.hasAudio) {
-    const { stderr } = await run("ffmpeg", ["-hide_banner", "-nostats", "-i", videoFile, "-vn", "-af", "loudnorm=I=-14:print_format=json,silencedetect=noise=-45dB:d=2.5", "-f", "null", "-"]);
+    const { stderr } = await run(FFMPEG, ["-hide_banner", "-nostats", "-i", videoFile, "-vn", "-af", "loudnorm=I=-14:print_format=json,silencedetect=noise=-45dB:d=2.5", "-f", "null", "-"]);
     const m = /"input_i"\s*:\s*"(-?[\d.]+|-inf)"/.exec(stderr);
     if (m) out.loudness = m[1] === "-inf" ? -99 : Number(m[1]);
     for (const s of stderr.matchAll(/silence_duration:\s*([\d.]+)/g)) out.silences.push(Number(s[1]));
   }
-  const black = await run("ffmpeg", ["-hide_banner", "-nostats", "-i", videoFile, "-an", "-vf", "blackdetect=d=0.5:pix_th=0.08", "-f", "null", "-"]);
+  const black = await run(FFMPEG, ["-hide_banner", "-nostats", "-i", videoFile, "-an", "-vf", "blackdetect=d=0.5:pix_th=0.08", "-f", "null", "-"]);
   for (const b of black.stderr.matchAll(/black_duration:\s*([\d.]+)/g)) out.blackSeconds += Number(b[1]);
   return out;
 }

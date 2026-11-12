@@ -6,6 +6,7 @@ import { once } from "node:events";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright-core";
 import { NODE_MODULES, DATA_DIR } from "../paths.js";
+import { FFMPEG } from "./bin.js";
 
 /**
  * Renders motion-graphics compositions with headless Chromium.
@@ -155,7 +156,7 @@ export async function renderOverlay(comp, outFile, { onProgress } = {}) {
   await fsp.mkdir(path.dirname(outFile), { recursive: true });
 
   const page = await openPage({ ...comp, background: null });
-  const ff = spawn("ffmpeg", ["-y", "-loglevel", "error", "-f", "image2pipe", "-framerate", String(fps), "-c:v", "png", "-i", "-", "-c:v", "qtrle", "-pix_fmt", "argb", "-r", String(fps), outFile], { stdio: ["pipe", "ignore", "pipe"] });
+  const ff = spawn(FFMPEG, ["-y", "-loglevel", "error", "-f", "image2pipe", "-framerate", String(fps), "-c:v", "png", "-i", "-", "-c:v", "qtrle", "-pix_fmt", "argb", "-r", String(fps), outFile], { stdio: ["pipe", "ignore", "pipe"], windowsHide: true });
   let ffErr = "";
   ff.stderr.on("data", (d) => (ffErr += d));
   ff.stdin.on("error", () => {}); // surfaced through the exit code below

@@ -7,7 +7,7 @@ export const round = (v, d = 2) => Math.round(v * 10 ** d) / 10 ** d;
 /** Run a command, collect output, reject with stderr tail on non-zero exit. */
 export function run(cmd, args, { input, timeoutMs = 20 * 60_000, cwd } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { cwd, stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"] });
+    const child = spawn(cmd, args, { cwd, windowsHide: true, stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     const timer = setTimeout(() => {
