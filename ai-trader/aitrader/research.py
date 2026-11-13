@@ -66,9 +66,7 @@ def run_research(cfg: Config, folder: str, interval: str = "5m_60d", commission:
     m = cfg.mkt
     intraday, daily, step = load_dir(folder, interval, cfg.universe)
     cfg.strategy.bar_sec = step
-    if step >= 3600:
-        # 긴 봉을 재생할 때는 '다음 봉 시가'에 판단·체결한 것으로 본다(실매매는 매수 시작 시각의 가격).
-        cfg.session.entry_start = cfg.session.open
+    # (긴 봉은 재생기가 '다음 봉 시가'에 판단·체결한 것으로 처리한다 — backtest.Backtester.run_bars)
     if commission is not None:
         cfg.fees.commission = commission
     if no_halt:

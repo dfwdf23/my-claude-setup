@@ -96,6 +96,13 @@ class Supervisor(Agent):
         self.today: date | None = None
         self.symbols: list[str] = []
         self.days: list[dict] = []
+        if d:                                         # 재시작해도 일별 기록·연속 손실일·'변경 후 지난 날 수'가 이어지게
+            self.days = [{"day": r["day"], "equity": r["equity"], "pnl": r["pnl"], "n": r["n"], "wins": r["wins"],
+                          "version": r["pv"], "adopted": ""} for r in self.journal.load_daily(120)]
+            self.learner.day_pnls = [x["pnl"] for x in self.days[-5:]]
+            if len(self.store.history) > 1:
+                changed = str(self.m.local(float(self.store.history[-1].get("ts", 0.0))).date())
+                self.learner.days_since_change = sum(1 for x in self.days if x["day"] > changed)
         self.history: list[Trade] = self.journal.load_trades(time.time() - 60 * 86400) if d else []
         self.started = time.time()
         self.stale_sec = max(60.0, cfg.manual.poll_sec * 4) if self.manual else cfg.risk.stale_feed_sec
@@ -271,6 +278,7 @@ class Supervisor(Agent):
         report = {"lessons": [], "adopted": None}
         if self.cfg.learn.enabled:
             bars = await asyncio.to_thread(self._recent_bars, now)
+            self.learner.daily_hist = self.screener.bars     # 재생에서도 실매매처럼 일봉 맥락을 쓰게 한다
             recent = (self.history + e.trades)[-300:]
             blocks = {**self.engine.guard.blocks, **self.engine.risk.blocks}
             try:

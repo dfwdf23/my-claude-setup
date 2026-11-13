@@ -126,7 +126,8 @@ class SellAgent(Agent):
         return None
 
     def _limit(self, pos: Position, px: float, bid: float, reason: str, etf: bool) -> OrderIntent:
-        ref = bid if bid > 0 else px
+        # 호가가 현재가와 동떨어져 있으면(호가 없이 체결가만 오는 시세에서 묵은 값) 믿지 않고 현재가를 기준으로 한다
+        ref = bid if bid > 0 and abs(bid / px - 1.0) <= 0.02 else px
         tk = self.m.tick(ref, etf)
         limit = self.m.round_tick(max(ref - self.slip * tk, tk), False, etf)
         return OrderIntent(pos.symbol, SELL, pos.qty, limit, reason)

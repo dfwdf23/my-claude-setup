@@ -164,13 +164,13 @@ class RiskManager(Agent):
         notional = it.qty * (it.limit_price or last)
         if it.qty <= 0:
             why = "수량 0"
-        elif it.limit_price and last > 0 and abs(it.limit_price / last - 1.0) > c.price_band:
-            why = "주문가 이상"
-        elif it.side == BUY:          # 매도(위험 축소)는 아래 한도로 막지 않는다
+        elif it.side == BUY:          # 매도(위험 축소)는 아래 한도로 막지 않는다 — 가격 범위 검사도 매수에만 적용
             q = self.order_ts
             while q and now - q[0] > 60.0:
                 q.popleft()
-            if notional > c.max_order_notional:
+            if it.limit_price and last > 0 and abs(it.limit_price / last - 1.0) > c.price_band:
+                why = "주문가 이상"
+            elif notional > c.max_order_notional:
                 why = "주문금액 상한"
             elif self.halted:
                 why = "정지 상태"

@@ -124,6 +124,7 @@ class Engine:
         self.regime = Regime()
         self.news: dict[str, NewsState] = {}   # 정보수집 에이전트가 갱신(종목별 소식 상태)
         self.exit_now: set[str] = set()        # 심각한 악재로 즉시 청산할 종목
+        self.bar_exit: dict[str, str] = {}     # 봉 기준 청산(추세 이탈·시간 청산)이 결정됐지만 아직 체결되지 않은 종목 → 사유
         # 상태
         self.sym: dict[str, SymState] = {}
         self.positions: dict[str, Position] = {}
@@ -260,8 +261,10 @@ class Engine:
         # 1) 보유 종목이면 매도 조건부터(가장 급한 일)
         pos = self.positions.get(t.symbol)
         if pos is not None and t.symbol not in self.pending and ts >= s.retry_after:
+            # 봉 기준 청산이 결정됐는데 주문이 체결되지 않았으면(시간 초과·제안 만료) 체결될 때까지 다시 낸다.
+            # 일봉 방식은 판단이 하루 한 번뿐이라, 그러지 않으면 청산이 다음 날로 밀린다.
             force = "risk_flatten" if self.risk.flatten_all else (
-                "news_exit" if t.symbol in self.exit_now else "")
+                "news_exit" if t.symbol in self.exit_now else self.bar_exit.get(t.symbol, ""))
             it = self.seller.on_tick(pos, px, s.bid, tod, force, s.etf)
             if it is not None:
                 self._send(it, s)
@@ -283,10 +286,10 @@ class Engine:
             s.v += t.volume
 
         if s.undecided and tod >= self.decide_tod:
-            # 어제 마감 때 닫힌 봉(일봉 방식에서는 하루 전체)에 대한 판단을 오늘 매수 시작 시각에 한다
-            s.undecided = False
-            if self.carry:
-                self._decide(s, s.f, tod)
+            # 어제 마감 때 닫힌 봉(일봉 방식에서는 하루 전체)에 대한 판단을 오늘 매수 시작 시각에 한다.
+            # 진행 중인 주문·재시도 대기 때문에 판단을 못 했으면 표시를 남겨 다음 틱에 다시 본다(하루치 판단을 잃지 않게).
+            if not self.carry or self._decide(s, s.f, tod):
+                s.undecided = False
 
         if self.view_on:
             vb = ts - ts % self.view_sec
@@ -321,8 +324,9 @@ class Engine:
     def _bar_close(self, s: SymState, bar: Bar, tod: float) -> None:
         self._decide(s, self._ingest(s, bar), tod)
 
-    def _decide(self, s: SymState, f: Features, tod: float) -> None:
-        """봉 마감 시점의 매매 판단: 보유 중이면 봉 단위 청산 조건, 아니면 매수 신호."""
+    def _decide(self, s: SymState, f: Features, tod: float) -> bool:
+        """봉 마감 시점의 매매 판단: 보유 중이면 봉 단위 청산 조건, 아니면 매수 신호.
+        판단을 실제로 했으면 True, 진행 중인 주문·재시도 대기로 미뤘으면 False."""
         # 상대 거래량: 평소 이 시각까지 쌓였을 거래량 대비 오늘 누적 거래량(장 초·마감에 몰리는 U자 분포 반영)
         x = (tod - self.open_tod) / self.session_len
         if s.avg_dvol > 0.0 and x > 0.02:
@@ -331,17 +335,18 @@ class Engine:
             s.rvol = -1.0
         sym = s.symbol
         if sym in self.pending or self.now < s.retry_after:
-            return
+            return False
         p = self.p
         pos = self.positions.get(sym)
         if pos is not None:
             pos.bars_held += 1
             it = self.seller.on_bar(pos, f, s.bid, p, s.etf, s.last)
             if it is not None:
+                self.bar_exit[sym] = it.reason       # 체결돼 포지션이 닫힐 때까지 유지(_close 에서 지운다)
                 self._send(it, s)
-            return
+            return True
         if not f.ready:
-            return
+            return True
         if self.daily:
             # 일봉 방식: 판단 대상은 '방금 닫힌 일봉'이므로, 그 봉 기준의 전일 고가·종가는 한 봉 앞의 값이다.
             # (set_daily 가 주는 prev_high·prev_close 는 판단 대상 봉 자신의 값이라 여기에 쓰면 항상 0이 된다)
@@ -355,27 +360,27 @@ class Engine:
         sig = self.chart.evaluate(sym, f, p, s.rvol, s.dtrend, prev_brk)
         if sig is None:
             s.score = 0.0
-            return
+            return True
         s.score = sig.score
         ns = self.news.get(sym)
         if (ns is not None and self.now < ns.block_until) or sym in self.exit_now:
             self.guard.blocks["악재 뉴스"] += 1
             self.emit("block", sym, f"정보수집: 악재 뉴스로 매수 보류 — {ns.headline[:60] if ns is not None else ''}",
                       score=round(sig.score, 2))
-            return
+            return True
         day_gain = (f.close / ref - 1.0) * 100.0 if ref > 0 else 0.0
         why = self.guard.check(f, day_gain, s.bar_count - s.last_loss_bar, p)
         if why:
             self.guard.note(f"{sym} 차단: {why}", self.now)
             self.emit("block", sym, f"과매수 방지: {why}", score=round(sig.score, 2))
-            return
+            return True
         regime = self.regime
         # 아직 체결되지 않은 매수 주문이 잡아 둔 금액도 이미 쓴 것으로 본다(동시 신호로 한도 초과 방지)
         exposure = self.exposure + self.reserved
         qty, stop_dist = self.sizer.size(f.close, f.atr, sig.score, self.equity, self.cash - self.reserved,
                                          exposure, regime.risk_mult, p, s.etf, s.tax)
         if qty <= 0:
-            return
+            return True
         gap = (s.day_open / s.prev_close - 1.0) * 100.0 if s.prev_close > 0 and s.day_open > 0 else 0.0
         it = self.buyer.build(sig, f, s.last, s.ask, qty, stop_dist, day_gain, tod, regime.bias, s.etf,
                               {"rvol": round(s.rvol, 2), "gap": round(gap, 2), "dtrend": s.dtrend,
@@ -384,10 +389,11 @@ class Engine:
                                   exposure, self.equity, regime)
         if why:
             self.emit("block", sym, f"리스크: {why}", score=round(sig.score, 2))
-            return
+            return True
         self.chart.note(f"{sym} 매수신호 {sig.score:.2f}", self.now)
         self.sizer.note(f"{sym} {qty}주 (위험배수 {regime.risk_mult * p.size_mult:.2f})", self.now)
         self._send(it, s)
+        return True
 
     def _pending_buys(self) -> int:
         return sum(1 for it in self.pending.values() if it.side == BUY)
@@ -470,6 +476,7 @@ class Engine:
     def _close(self, pos: Position, fl: Fill) -> Trade:
         del self.positions[pos.symbol]
         self.exit_now.discard(pos.symbol)
+        self.bar_exit.pop(pos.symbol, None)
         r = pos.risk_per_share or 1.0
         tq = pos.exit_qty
         orig_cost = pos.avg_price * tq * (1 + self.commission)

@@ -947,3 +947,186 @@ async def test_dashboard_token_check_handles_non_ascii_and_page_has_security_hea
     finally:
         await dash.stop()
         sup.journal.close()
+
+
+# ====================================================================== 전략·재생·학습(세 번째 검토)
+from aitrader.agents.learner import Learner
+from aitrader.backtest import Backtester
+from aitrader.journal import Journal
+from aitrader.params import ParamStore
+
+
+def _weekdays(start: date, n: int) -> list:
+    out, x = [], start
+    while len(out) < n:
+        if x.weekday() < 5:
+            out.append(x)
+        x += timedelta(days=1)
+    return out
+
+
+def _daily_series(sym: str, n: int = 120, start: float = 100.0) -> list:
+    """오르는 구간과 쉬는 구간이 번갈아 나오는 일봉(매수 신호가 나오도록)."""
+    bars, px = [], start
+    for i, d in enumerate(_weekdays(date(2025, 1, 6), n)):
+        nxt = px * (1.004 if (i // 20) % 2 == 0 else 0.998)
+        bars.append(Bar(sym, US.epoch(d, 9, 30), px, max(px, nxt) * 1.004, min(px, nxt) * 0.996, nxt, 1_000_000))
+        px = nxt
+    return bars
+
+
+def test_learner_replay_fills_daily_entries_at_the_next_open_not_at_the_days_low():
+    """실매매 쪽 복기(학습)의 일봉 재생은 '다음 날 시가'에 사야 한다.
+    (이전: 매수 시작 시각 09:35 가 재생에서는 봉의 둘째 점(저가)에 해당해, 모든 매수가 그날 저가에 체결 → 검증이 허구)"""
+    cfg = Config.for_market("US")                        # 실매매 기본값 그대로(entry_start 09:35)
+    cfg.universe = ["AAA"]
+    bars = _daily_series("AAA")
+    by_day = {US.local(b.ts).date(): b for b in bars}
+    L = Learner(cfg, ParamStore(None, cfg.params), LLM(SimpleNamespace(enabled=False)), Journal(None))
+    bt = L._bt(L.store.current, bars)
+    trades = bt.engine.trades
+    assert len(trades) >= 2
+    tick = 0.01
+    for t in trades:
+        b = by_day[US.local(t.entry_ts).date()]
+        assert abs(t.entry_price - (b.open + cfg.fees.slippage_ticks * tick)) < 1e-3      # 시가 + 슬리피지(체결가는 소수 4자리)
+        assert t.entry_price > b.low + tick                                                # 그날 저가에 산 것이 아니다
+
+
+def test_bar_replay_tests_a_trailing_stop_raised_by_the_high_against_the_same_bars_low():
+    """봉 재생은 시가→저가→고가→저가→종가 순이다: 봉 안에서 고가를 따라 올라간 추적 손절가도 그 봉의 저가로 시험한다.
+    (이전: 고가 뒤에는 종가만 봐서, 고가 뒤에 저가가 왔을 경우의 손절을 놓침 → 결과가 낙관적)"""
+    cfg = Config.for_market("US")
+    bt = Backtester(cfg, StrategyParams())
+    e = bt.engine
+    d1, d2 = date(2026, 1, 5), date(2026, 1, 6)
+    e.on_tick(Tick("X", US.epoch(d1, 15, 0), 100.0, 10))
+    e.on_fill(Fill("X", BUY, 10, 100.0, US.epoch(d1, 15, 0), ctx={"stop_dist": 5.0, "atr": 2.0}))
+    pos = e.positions["X"]
+    pos.trail_trigger, pos.trail_dist, pos.target = 104.0, 3.0, 200.0
+    # 다음 날 봉: 시가 101, 저가 100(손절 95 위), 고가 110(추적 손절가가 107 로 올라감), 종가 108
+    bt.run_bars([Bar("X", US.epoch(d2, 9, 30), 101.0, 110.0, 100.0, 108.0, 4000)])
+    assert "X" not in e.positions                         # 고가 뒤의 저가(100)가 올라간 손절가(107)를 건드렸다
+    t = e.trades[-1]
+    assert t.exit_reason == "trailing_stop" and abs(t.exit_price - (107.0 - cfg.fees.slippage_ticks * 0.01)) < 1e-6
+
+
+def test_intraday_replay_gets_daily_context_like_live():
+    """분봉 재생에도 일봉 맥락(전일 종가·고가, 평균 거래량)을 준다 — 실매매와 같은 전략을 검증하기 위해.
+    (이전: 단타 방식의 학습 재생은 맥락 없이 돌아 상대 거래량 기준 등을 평가할 수 없었다)"""
+    cfg = Config.for_market("US", "intraday")
+    cfg.universe = ["X"]
+    days = _weekdays(date(2026, 1, 5), 8)
+    bars = []
+    for k, d in enumerate(days):
+        for j in range(20):                               # 하루 20개의 3분봉
+            o = 100.0 + k + j * 0.01
+            bars.append(Bar("X", US.epoch(d, 9, 30) + j * 180, o, o + 0.2, o - 0.2, o + 0.05, 1000))
+    seed = {"X": [Bar("X", US.epoch(date(2025, 12, 1) + timedelta(days=i), 9, 30), 90.0, 91.0, 89.0, 90.5, 50_000)
+                  for i in range(10)]}
+    bt = Backtester(cfg, StrategyParams()).run_bars(bars, daily_ctx=True, daily_seed=seed)
+    s = bt.engine.sym["X"]
+    last_full = [b for b in bars if US.local(b.ts).date() == days[-2]]       # 마지막 날 직전 거래일
+    assert abs(s.prev_close - last_full[-1].close) < 1e-9                    # 전일 종가 = 전날 마지막 분봉의 종가
+    assert abs(s.prev_high - max(b.high for b in last_full)) < 1e-9
+    assert s.avg_dvol > 0
+    bare = Backtester(cfg, StrategyParams()).run_bars(bars)                  # 맥락 없이 돌리면 비어 있다
+    assert bare.engine.sym["X"].prev_close == 0.0
+
+
+def test_daily_exit_is_retried_until_filled_and_a_blocked_decision_is_not_lost():
+    """일봉 방식의 봉 기준 청산(추세 이탈 등)은 주문이 체결되지 않으면 그날 안에 다시 낸다.
+    (이전: 하루 한 번, 10초짜리 지정가 한 번뿐 — 체결이 안 되면 다음 날까지 청산이 밀림)"""
+    cfg = Config.for_market("US")
+    orders = []
+    e = Engine(cfg, StrategyParams(), 30_000, execute=orders.append)
+    days = _weekdays(date(2026, 1, 5), 40)
+
+    def tick(d, hh, mm, px):
+        e.on_tick(Tick("X", US.epoch(d, hh, mm), px, 1000, px - 0.01, px + 0.01))
+
+    sells = []
+    for k, d in enumerate(days):
+        px = 100 + k * 0.5 if k < 28 else 114.0 - (k - 27) * 1.5          # 오르다가 꺾여서 내린다
+        n0 = len(orders)
+        tick(d, 9, 31, px)
+        tick(d, 9, 36, px)
+        for o in orders[n0:]:
+            if o.side == BUY:
+                e.on_order_done("X", False, "skip")                       # 테스트가 직접 사므로 봇의 매수는 무시
+        if k == 27:
+            e.on_fill(Fill("X", BUY, 10, px, e.now, ctx={"stop_dist": 60.0, "atr": 1.0}))
+        day_sells = [o for o in orders[n0:] if o.side != BUY]
+        if day_sells:
+            e.on_order_done("X", False, "미체결")                          # 첫 청산 주문(지정가)이 체결되지 않았다
+            tick(d, 9, 37, px)                                            # 재시도 대기(3초) 뒤의 다음 틱
+            sells = [o for o in orders[n0:] if o.side != BUY]
+            break
+        e.flush_bars()
+    assert len(sells) == 2 and sells[0].reason == "trend_exit" and sells[0].limit_price > 0
+    assert sells[1].reason == "trend_exit" and sells[1].limit_price == 0   # 두 번째는 반드시 체결되는 주문으로
+    e.on_fill(Fill("X", SELL, 10, 100.0, e.now, reason="trend_exit"))
+    assert "X" not in e.bar_exit and "X" not in e.positions               # 체결되면 지시는 사라진다
+
+    # 판단 시각에 주문이 진행 중이면 그날의 판단을 버리지 않고 다음 틱에 한다
+    e2 = Engine(cfg, StrategyParams(), 30_000, execute=lambda it: None)
+    d = days[0]
+    e2.on_tick(Tick("Y", US.epoch(d, 9, 31), 50.0, 10))
+    s = e2.sym["Y"]
+    s.undecided = True
+    e2.pending["Y"] = OrderIntent("Y", BUY, 1, 50.0, "entry")
+    e2.on_tick(Tick("Y", US.epoch(d, 9, 36), 50.0, 10))
+    assert s.undecided                                                     # 아직 판단하지 못했다
+    e2.pending.clear()
+    e2.on_tick(Tick("Y", US.epoch(d, 9, 37), 50.0, 10))
+    assert not s.undecided
+
+
+def test_sell_is_never_blocked_by_the_price_band_even_with_a_stale_bid():
+    """호가 없이 체결가만 오는 시세에서 묵은 매수호가 때문에 매도가 '주문가 이상'으로 막히지 않는다(매도는 어떤 한도로도 막지 않는다)."""
+    cfg = Config.for_market("US")
+    orders = []
+    e = Engine(cfg, StrategyParams(), 30_000, execute=orders.append)
+    t = US.epoch(date(2026, 1, 5), 10, 0)
+    e.on_tick(Tick("X", t, 100.0, 10, 99.99, 100.01))                      # 호가가 있던 틱
+    e.on_fill(Fill("X", BUY, 10, 100.0, t, ctx={"stop_dist": 2.0, "atr": 1.0}))
+    e.positions["X"].target = 110.0
+    for i, px in enumerate((104.0, 108.0, 112.5)):                         # 이후에는 호가 없이 체결가만
+        e.on_tick(Tick("X", t + 60 * (i + 1), px, 10))
+    assert orders and orders[-1].side == SELL and orders[-1].reason == "take_profit"
+    assert abs(orders[-1].limit_price / 112.5 - 1.0) < 0.01               # 묵은 호가(99.99)가 아니라 현재가 기준
+    assert not e.risk.blocks
+
+
+def test_a_rollback_is_never_rolled_back():
+    """되돌린 것을 다시 되돌리면 방금 버린 값이 검증 없이 되살아나 두 값 사이를 오간다."""
+    cfg = Config()
+    store = ParamStore(None)
+    L = Learner(cfg, store, LLM(SimpleNamespace(enabled=False)), Journal(None))
+    store.adopt(StrategyParams(entry_score_min=0.65), "채택: 검증 통과안")
+    store.rollback("v2 기대값 -0.30R < v1 +0.20R")
+    assert store.current.version == 3 and store.current.entry_score_min == 0.62
+
+    def trades(version, r, n):
+        return [SimpleNamespace(params_version=version, r_multiple=r, exit_ts=T0 + 86400.0 * (i % 5)) for i in range(n)]
+
+    recent = trades(2, -0.3, 30) + trades(3, -0.5, 30)                     # 되돌린 뒤에도 손실이 이어진다
+    assert L._maybe_rollback(recent) == "" and store.current.version == 3
+
+
+async def test_restart_keeps_daily_history_and_change_timer(tmp_path):
+    """재시작해도 일별 기록, 연속 손실일, '전략 변경 후 지난 날 수'가 이어진다.
+    (이전: 매일 다시 켜면 변경 간격 제한과 3일 연속 손실 시 크기 축소가 한 번도 작동하지 않음)"""
+    cfg = live_cfg(tmp_path, "manual")
+    sup = Supervisor(cfg, ManualBroker(cfg, base_url="http://127.0.0.1:9"))
+    sup.store.adopt(StrategyParams(**{**cfg.params, "entry_score_min": 0.64}), "채택: 시험")
+    changed = US.local(time.time()).date()
+    for i, pnl in enumerate((-50.0, -30.0, -20.0), 1):                     # 변경 뒤 사흘 연속 손실
+        sup.journal.daily(str(changed + timedelta(days=i)), 30_000 + pnl, pnl, 2, 0, 2)
+    sup.journal.flush()
+    sup.journal.close()
+    sup2 = Supervisor(cfg, ManualBroker(cfg, base_url="http://127.0.0.1:9"))
+    assert [x["pnl"] for x in sup2.days] == [-50.0, -30.0, -20.0]
+    assert sup2.learner.day_pnls == [-50.0, -30.0, -20.0] and sup2.learner.days_since_change == 3
+    assert sup2.snapshot()["days"][-1]["pnl"] == -20.0                     # 대시보드의 일별 손익도 이어진다
+    sup2.journal.close()

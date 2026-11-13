@@ -159,9 +159,12 @@ class Learner(Agent):
         self.day_pnls: list[float] = []
         self.days_since_change = 10 ** 6
         self.daily = cfg.strategy.bar_sec >= 86_400          # 일봉 방식(스윙)
+        self.daily_hist: dict[str, list[Bar]] = {}           # 종목별 과거 일봉(총괄이 넘겨 준다) — 재생의 일봉 맥락용
 
     def _bt(self, p: StrategyParams, bars: list[Bar]) -> Backtester:
-        return Backtester(self.cfg, p, self.cfg.capital).run_bars(bars, daily_ctx=self.daily)
+        """검증용 재생. 실매매와 같은 조건이어야 한다: 일봉 맥락(상대 거래량·일봉 추세·전일 고가)을 날마다 채우고,
+        긴 봉은 다음 날 시가에 체결한다(재생기가 처리). 맥락 없이 재생하면 '다른 전략'을 검증하게 된다."""
+        return Backtester(self.cfg, p, self.cfg.capital).run_bars(bars, daily_ctx=True, daily_seed=self.daily_hist)
 
     def tag(self, t: Trade, p: StrategyParams) -> list[str]:
         return tag_causes(t, p, self.open_tod, self.close_tod)
@@ -360,6 +363,9 @@ class Learner(Agent):
     def _maybe_rollback(self, recent: list[Trade]) -> str:
         cur = self.store.current
         if len(self.store.history) < 2:
+            return ""
+        if str(self.store.history[-1].get("reason", "")).startswith("롤백"):
+            # 되돌린 것을 다시 되돌리지 않는다 — 그러면 방금 버린 값이 검증 없이 되살아나 두 값 사이를 오간다
             return ""
         prev_v = self.store.history[-2]["version"]
         cur_t = [t for t in recent if t.params_version == cur.version]
