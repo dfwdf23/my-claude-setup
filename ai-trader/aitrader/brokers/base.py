@@ -12,7 +12,14 @@ from ..models import AccountSnapshot, Bar, Order, Tick
 
 
 class BrokerError(Exception):
-    """주문 거부 등 증권사 측 오류."""
+    """증권사가 명시적으로 거부했다 — 주문이라면 '접수되지 않은 것이 확실'하다는 뜻으로 쓴다."""
+
+
+class BrokerUnknown(Exception):
+    """결과를 알 수 없는 실패(게이트웨이 오류 화면, 해석할 수 없는 응답 등).
+
+    주문이 접수됐을 수도 있다. BrokerError 가 아니므로 주문 집행기는 이것을 거부로 처리하지 않고
+    증권사에 접수 여부를 조회해 확정한다."""
 
 
 async def _noop(*_a) -> None:
@@ -43,7 +50,8 @@ class Broker:
     async def subscribe(self, symbols: list[str]) -> None: ...
 
     async def place_order(self, order: Order) -> None:
-        """주문 전송. 성공 시 order.broker_id 를 채운다. 거부 시 BrokerError."""
+        """주문 전송. 성공 시 order.broker_id 를 채운다. 명시적 거부는 BrokerError,
+        접수 여부를 알 수 없는 실패는 그 밖의 예외(BrokerUnknown·시간 초과 등)로 알린다."""
         raise NotImplementedError
 
     async def cancel_order(self, order: Order) -> None:

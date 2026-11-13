@@ -207,6 +207,8 @@ class Engine:
         if not self.open_tod <= loc % DAY < self.close_tod:
             return
         day = int(loc // DAY)
+        if day < self.day:
+            return
         if day != self.day:
             self._new_day(day)
         s = self.symbol_state(symbol)
@@ -234,8 +236,10 @@ class Engine:
         tod = loc % DAY
         if tod < self.open_tod or tod >= self.close_tod:
             return                                 # 정규장 밖의 틱은 지표·판단에 쓰지 않는다
-        self.now = ts
         day = int(loc // DAY)
+        if day < self.day:
+            return                                 # 지난 날짜가 찍힌 시세(지연·정지 종목) — 날짜를 되돌리지 않고 버린다
+        self.now = ts
         if day != self.day:
             self._new_day(day)
         s = self.sym.get(t.symbol)
@@ -520,12 +524,17 @@ class Engine:
         first = self.day < 0
         self.day = day
         for s in self.sym.values():
+            if s.bar_start >= 0.0:
+                # 장 마감 처리를 못 하고 날이 바뀌었다(절전·중단 등) → 어제의 마지막 봉을 지금 닫아 지표에 반영한다
+                self._ingest(s, Bar(s.symbol, s.bar_start, s.o, s.h, s.l, s.c, s.v))
+                s.undecided = True
             s.ind.reset_session()
             s.day_open = 0.0
             s.bar_start = -1.0
             s.cum_vol = 0
             s.rvol = -1.0
-        self.exit_now.clear()
+        # 장 마감 뒤에 확인된 심각한 악재의 청산 지시는 다음 장에서 실행돼야 한다 → 보유 중인 종목의 지시는 남긴다
+        self.exit_now.intersection_update(self.positions)
         if not first:
             self.mark()
         self.day_start_equity = self.equity
@@ -557,6 +566,12 @@ class Engine:
 
     # ------------------------------------------------------------------ 재시작 대비 상태
     def export_state(self) -> dict:
+        sym = self.sym
+        # 손실 청산 뒤 재진입 금지(봉 수 기준)가 재시작으로 풀리지 않게, 종목별 '손실 후 지난 봉 수'를 남긴다
+        since = {k: s.bar_count - s.last_loss_bar for k, s in sym.items() if s.bar_count - s.last_loss_bar < 1000}
         return {"cash": self.cash, "realized_total": self.realized_total, "fees_total": self.fees_total,
                 "day": self.day, "day_start_equity": self.day_start_equity, "realized_day": self.realized_day,
-                "positions": [asdict(p) for p in self.positions.values()], "risk": self.risk.export()}
+                "positions": [asdict(p) for p in self.positions.values()], "risk": self.risk.export(),
+                # 보유 종목의 마지막 가격 — 재시작 직후 취득가로 평가하면 평가손익이 통째로 사라져 한도가 잘못 발동한다
+                "last": {p.symbol: sym[p.symbol].last for p in self.positions.values() if p.symbol in sym},
+                "since_loss": since, "exit_now": sorted(self.exit_now)}

@@ -27,7 +27,7 @@ from pathlib import Path
 from ..config import Config
 from ..market import is_trading_day
 from ..models import BUY, AccountSnapshot, Bar, Order, Tick
-from .base import BrokerError
+from .base import BrokerError, BrokerUnknown
 from .kis import KISBroker, aes_cbc_decrypt
 
 log = logging.getLogger("aitrader.kis")
@@ -40,6 +40,7 @@ TR_OS = {
 }
 ORDER_EXCH = {"NAS": "NASD", "NYS": "NYSE", "AMS": "AMEX"}
 MOCK_SELL_ALT = "VTTT1006U"
+MAX_PAGES = 40                # 주문체결내역 조회 한 번에 읽는 최대 쪽수
 
 
 def _i(v) -> int:
@@ -134,19 +135,25 @@ class KISOverseasBroker(KISBroker):
         tr = self.tr["buy"] if buy else (self._sell_tr or self.tr["sell"])
         try:
             d, _ = await self._call("POST", path, tr, body)
-        except BrokerError:
+        except BrokerError as first:
             if buy or self.env != "mock" or self._sell_tr:
                 raise
-            # 모의 매도 TR은 문서(VTTT1001U)와 예제 코드(VTTT1006U)가 다르다. 거부된 주문은 접수된 것이 아니므로 한 번만 바꿔 본다.
+            # 모의 매도 TR은 문서(VTTT1001U)와 예제 코드(VTTT1006U)가 다르고, 어느 쪽이 맞는지는 매도가 한 번
+            # 성공해야 알 수 있다. 거부된 주문(=접수 안 됨)만 다른 TR로 한 번 더 보내 보고, 그것도 거부되면
+            # 처음 거부 사유를 그대로 올린다 — 잔고 부족 같은 평범한 거부를 'TR이 틀렸다'로 단정해
+            # 한쪽에 고정해 버리면 이후 매도가 전부 막힌다.
+            try:
+                d, _ = await self._call("POST", path, MOCK_SELL_ALT, body)
+            except BrokerError:
+                raise first from None
             self._sell_tr = MOCK_SELL_ALT
-            d, _ = await self._call("POST", path, MOCK_SELL_ALT, body)
         else:
             if not buy and not self._sell_tr:
-                self._sell_tr = tr
+                self._sell_tr = tr                        # 한 번 성공한 TR로 고정
         out = d.get("output") or {}
         odno = str(out.get("ODNO", ""))
         if not odno:
-            raise BrokerError("주문번호 없음")
+            raise BrokerUnknown("주문은 성공 응답인데 주문번호가 없습니다")      # 접수됐을 가능성이 높다 → 조회로 확정
         key = _norm(odno)
         self._raw[key] = (str(out.get("KRX_FWDG_ORD_ORGNO", "")), odno)
         self._known.add(key)
@@ -161,8 +168,11 @@ class KISOverseasBroker(KISBroker):
                 "MGCO_APTM_ODNO": "", "ORD_SVR_DVSN_CD": "0"}
         await self._call("POST", "/uapi/overseas-stock/v1/trading/order-rvsecncl", self.tr["cancel"], body)
 
-    async def _orders_today(self, symbol: str) -> list[dict]:
-        """주문체결내역(현지 날짜 기준 어제~오늘). 주문번호로는 검색할 수 없어 받아서 고른다."""
+    async def _orders_today(self, symbol: str, want: str = "") -> list[dict]:
+        """주문체결내역(현지 날짜 기준 어제~오늘). 주문번호로는 검색할 수 없어 받아서 고른다.
+
+        want: 찾는 주문번호. 실전은 종목별·최신순이라 찾으면 거기서 멈춘다. 모의는 전 종목·오래된 순으로만
+        오므로(정렬 변경 불가) 끝까지 읽어야 최신 주문이 보인다."""
         today = self.m.now().date()
         real = self.env == "real"
         q = {**self._acct(), "PDNO": symbol if real else "", "ORD_STRT_DT": (today - timedelta(days=1)).strftime("%Y%m%d"),
@@ -171,18 +181,24 @@ class KISOverseasBroker(KISBroker):
              "ORD_GNO_BRNO": "", "ODNO": "", "CTX_AREA_NK200": "", "CTX_AREA_FK200": ""}
         rows: list[dict] = []
         cont = ""
-        for _ in range(6):
+        for page in range(MAX_PAGES):
             d, nxt = await self._call("GET", "/uapi/overseas-stock/v1/trading/inquire-ccnl", self.tr["ccnl"], q, cont)
-            rows += d.get("output") or []
+            got = d.get("output") or []
+            rows += got
             if nxt not in ("F", "M"):
                 break
+            if want and real and any(_norm(r.get("odno")) == want for r in got):
+                break
+            if page == MAX_PAGES - 1:
+                # 더 있는데 못 읽었다 — '주문 없음'으로 오해하면 접수된 주문을 놓친다. 모르는 것은 모른다고 올린다.
+                raise BrokerUnknown(f"주문체결내역이 {MAX_PAGES}쪽을 넘어 끝까지 읽지 못했습니다")
             cont = "N"
             q["CTX_AREA_FK200"] = d.get("ctx_area_fk200", "")
             q["CTX_AREA_NK200"] = d.get("ctx_area_nk200", "")
         return rows
 
     async def poll_order(self, order: Order) -> tuple[int, float, bool]:
-        for row in await self._orders_today(order.symbol):
+        for row in await self._orders_today(order.symbol, order.broker_id):
             if _norm(row.get("odno")) != order.broker_id:
                 continue
             filled = _i(row.get("ft_ccld_qty"))

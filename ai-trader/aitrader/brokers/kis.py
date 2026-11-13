@@ -25,7 +25,7 @@ import aiohttp
 
 from ..config import Config
 from ..models import BUY, AccountSnapshot, Bar, Order, Tick
-from .base import Broker, BrokerError
+from .base import Broker, BrokerError, BrokerUnknown
 
 try:
     import orjson
@@ -171,7 +171,11 @@ class KISBroker(Broker):
         try:
             d = _loads(body)
         except ValueError:
-            raise BrokerError(f"HTTP {status}: 응답 해석 실패")
+            d = None
+        if not isinstance(d, dict) or ("rt_cd" not in d and "msg_cd" not in d):
+            # 증권사 업무 응답이 아니다(게이트웨이 오류 화면 등). 주문이었다면 접수됐을 수도 있으므로
+            # '거부'가 아니라 '결과 모름'으로 올린다 → 주문 집행기가 조회로 확정한다.
+            raise BrokerUnknown(f"HTTP {status}: 증권사 응답을 해석할 수 없습니다")
         if d.get("rt_cd") == "0":
             return d, next_cont
         code = d.get("msg_cd", "")
@@ -203,7 +207,7 @@ class KISBroker(Broker):
         out = d.get("output") or {}
         odno = str(out.get("ODNO", ""))
         if not odno:
-            raise BrokerError("주문번호 없음")
+            raise BrokerUnknown("주문은 성공 응답인데 주문번호가 없습니다")      # 접수됐을 가능성이 높다 → 조회로 확정
         key = odno.lstrip("0") or "0"
         self._raw[key] = (str(out.get("KRX_FWDG_ORD_ORGNO", "")), odno)
         order.broker_id = key
