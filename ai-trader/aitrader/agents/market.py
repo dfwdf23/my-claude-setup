@@ -8,12 +8,16 @@ Claude의 권한은 '위험을 줄이는 방향'으로만 열려 있다: 배수�
 """
 from __future__ import annotations
 
+import logging
+
 from ..brokers.base import Broker
 from ..config import Config
 from ..engine import Engine
 from ..llm import LLM
 from ..models import Regime
 from .base import Agent
+
+log = logging.getLogger("aitrader.market")
 
 MARKET_SYSTEM = """당신은 한국 주식시장 자동매매 시스템의 '시장분석' 담당이다.
 입력은 JSON 한 개다: 감시 종목의 압축 지표(m), 종목별 요약(s), 있으면 지수(idx)와 뉴스 제목(news).
@@ -56,6 +60,8 @@ class MarketAnalyst(Agent):
         self.inverse = frozenset(cfg.inverse)
         self.etfs = frozenset(cfg.etfs)
         self.vol_base = 0.0            # 평소 변동성(느린 지수평균)
+        self.daily = cfg.strategy.bar_sec >= 86_400
+        self._vol_day = -2             # 기준선을 마지막으로 갱신한 거래일(일봉 방식)
         self.metrics: dict = {}
         self.last_sig = None
         self.last_llm_ts = 0.0
@@ -91,9 +97,18 @@ class MarketAnalyst(Agent):
         if n == 0:
             return {}
         atrp /= n
-        self.vol_base = atrp if self.vol_base == 0.0 else self.vol_base * 0.98 + atrp * 0.02
+        if self.vol_base == 0.0:
+            self.vol_base = atrp
+        vol_x = atrp / self.vol_base if self.vol_base else 1.0      # 기준선(평소 변동성) 대비 지금 — 갱신 '전'의 기준선과 비교
+        if self.daily:
+            # 일봉의 ATR 은 하루에 한 번 바뀐다. 기준선을 매분 갱신하면 하루 안에 따라잡아 변동성 급변을 못 본다.
+            if engine.day != self._vol_day:
+                self._vol_day = engine.day
+                self.vol_base = self.vol_base * 0.95 + atrp * 0.05   # 약 20거래일 평균
+        else:
+            self.vol_base = self.vol_base * 0.98 + atrp * 0.02
         self.metrics = {"n": n, "breadth": round(up / n, 2), "above_vwap": round(above / n, 2),
-                        "avg_chg": round(chg / n, 2), "vol_x": round(atrp / self.vol_base, 2) if self.vol_base else 1.0}
+                        "avg_chg": round(chg / n, 2), "vol_x": round(vol_x, 2)}
         self._rows = rows
         return self.metrics
 
@@ -192,15 +207,26 @@ class Screener(Agent):
         super().__init__()
         self.n_daily = n_daily
         self.bars: dict[str, list] = {}       # 종목별 일봉(장전 준비 때 일봉 맥락 계산에 재사용)
+        self.failed: list[str] = []
+
+    async def fetch(self, broker: Broker, sym: str) -> list:
+        try:
+            bars = await broker.get_daily_bars(sym, self.n_daily)
+        except Exception as ex:
+            log.warning("일봉 조회 실패 %s: %r", sym, ex)
+            bars = []
+        if not bars and sym not in self.failed:
+            self.failed.append(sym)
+        elif bars and sym in self.failed:
+            self.failed.remove(sym)
+        return bars
 
     async def select(self, broker: Broker, candidates: list[str], max_n: int, now: float) -> list[str]:
         self.calls += 1
         scored = []
+        self.failed = []                                # 이번에 일봉을 받지 못한 종목(총괄이 경고·재시도에 쓴다)
         for sym in candidates:
-            try:
-                bars = await broker.get_daily_bars(sym, self.n_daily)
-            except Exception:
-                bars = []
+            bars = await self.fetch(broker, sym)
             self.bars[sym] = bars
             if len(bars) < 5:
                 scored.append((0.0, sym))               # 데이터가 없으면 설정 순서를 존중

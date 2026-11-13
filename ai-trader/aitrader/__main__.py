@@ -20,6 +20,7 @@ import os
 import signal
 import sys
 import time
+import tomllib
 
 from .config import Config, load_config
 
@@ -90,7 +91,20 @@ def _loop_run(coro) -> None:
 
 
 def _cfg(a) -> Config:
-    return load_config(a.config, getattr(a, "market", None), getattr(a, "style", None))
+    try:
+        return load_config(a.config, getattr(a, "market", None), getattr(a, "style", None))
+    except FileNotFoundError as e:
+        raise SystemExit(f"설정 파일을 찾을 수 없습니다: {e}")
+    except (ValueError, tomllib.TOMLDecodeError) as e:      # 긴 오류 추적 대신 무엇이 틀렸는지 한 줄로
+        raise SystemExit(f"설정 오류: {e}")
+
+
+def _warm(bt, mk, cfg: Config) -> None:
+    """일봉 방식은 하루에 봉이 하나라, 과거 일봉으로 지표를 미리 채우지 않으면 한 달 가까이 판단이 나오지 않는다.
+    실제 실행(총괄의 장전 준비)과 같은 방법으로 예열한다."""
+    if cfg.strategy.bar_sec >= 86_400:
+        for sym in mk.symbols:
+            bt.engine.warm(sym, mk.history(sym, 3 * cfg.strategy.warmup_bars))
 
 
 def cmd_run(a) -> None:
@@ -131,6 +145,7 @@ def cmd_backtest(a) -> None:
     mk = SimMarket(cfg.universe[:cfg.max_symbols], a.seed, cfg.sim.tick_sec, etfs=frozenset(cfg.etfs),
                    market=cfg.mkt, open_hhmm=cfg.session.open, close_hhmm=cfg.session.close)
     bt = Backtester(cfg, ParamStore(None, cfg.params).current)
+    _warm(bt, mk, cfg)
     t0 = time.perf_counter()
     for _ in range(a.days):
         for sym in mk.symbols:
@@ -172,12 +187,16 @@ def cmd_bench(a) -> None:
         ticks += list(mk.day_ticks())
         mk.next_day()
     bt = Backtester(cfg, ParamStore(None, cfg.params).current)
+    _warm(bt, mk, cfg)
     t0 = time.perf_counter()
     bt.run_ticks(ticks)
     el = time.perf_counter() - t0
-    s = bt.engine.lat.summary(1000.0)
+    e = bt.engine
+    s = e.lat.summary(1000.0)
     print(f"틱 {len(ticks):,}개 · 초당 {len(ticks) / el:,.0f}틱 처리")
     print(f"틱→주문결정 지연: 중앙값 {s['p50']}µs · 99% {s['p99']}µs · 최대 {s['max']}µs")
+    print(f"(그중 매수 판단까지 간 틱 {e.chart.calls:,}회 · 매도 검사 {e.seller.calls:,}회 — "
+          f"{'일봉 방식은 판단이 하루 한 번이라 대부분은 시세 반영·매도 검사 시간입니다' if cfg.strategy.bar_sec >= 86_400 else '분봉 방식'})")
 
 
 def main() -> None:

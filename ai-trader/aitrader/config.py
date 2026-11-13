@@ -165,6 +165,7 @@ class Config:
     market: str = "KRX"                # KRX | US
     style: str = "intraday"            # swing(일봉, 며칠~몇 주 보유) | intraday(분봉, 당일 청산)
     params: dict = field(default_factory=dict)   # 전략 파라미터 기본값 덮어쓰기(학습 시작점)
+    user_params: dict = field(default_factory=dict)   # 그중 사용자가 config.toml [params] 에 직접 적은 것(안내용)
     data_dir: str = "data"
     capital: float = 50_000_000        # sim 시작 자본 / 실매매: 봇이 쓸 수 있는 최대 금액
     # 국내 기본 종목: 유동성 큰 ETF 위주. ETF는 매도 시 거래세가 없고 호가단위(5원)가 작아
@@ -258,12 +259,33 @@ class Config:
         return cfg
 
 
+def _merge_params(cur: dict, v) -> dict:
+    """[params]: 방식별 기본값 위에 '적은 항목만' 덮어쓴다. 모르는 이름·숫자가 아닌 값은 거부한다.
+    (통째로 바꿔 버리면 한 줄만 고쳐도 스윙용 기본값 여덟 개가 단타용 값으로 되돌아간다)"""
+    from .params import StrategyParams
+    if not isinstance(v, dict):
+        raise ValueError("[params] 는 '이름 = 값' 목록이어야 합니다")
+    base = StrategyParams()
+    out = {}
+    for name, val in v.items():
+        if name == "version" or not hasattr(base, name):
+            raise ValueError(f"알 수 없는 전략 파라미터: {name}")
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            raise ValueError(f"[params] {name} 의 값은 숫자여야 합니다")
+        out[name] = type(getattr(base, name))(val)
+    cur.update(out)
+    return out
+
+
 def _merge(obj, data: dict) -> None:
     names = {f.name for f in fields(obj)}
     for k, v in data.items():
-        if k not in names:
+        if k not in names or k == "user_params":
             raise ValueError(f"알 수 없는 설정 키: {k}")
         cur = getattr(obj, k)
+        if k == "params" and isinstance(obj, Config):
+            obj.user_params = _merge_params(cur, v)
+            continue
         if is_dataclass(cur) and isinstance(v, dict):
             _merge(cur, v)
         elif isinstance(cur, bool):
@@ -300,7 +322,16 @@ def load_config(path: str | None = None, market: str | None = None, style: str |
         data = tomllib.loads(p.read_text(encoding="utf-8"))
     elif path:
         raise FileNotFoundError(path)
-    cfg = Config.for_market(market or data.get("market", "US"), style or data.get("style"))
+    # 설정 파일은 '그 시장·방식'을 전제로 쓴 값(종목·자본·수수료·한도)을 담는다. 명령줄에서 다른 시장·방식을 주면
+    # 두 설정이 섞여(예: 국내 장에 미국 종목과 달러 금액) 엉뚱하게 돌아가므로, 조용히 섞지 않고 멈춘다.
+    f_market, f_style = data.get("market"), data.get("style")
+    if market and f_market and str(market).upper() != str(f_market).upper():
+        raise ValueError(f"{p} 은 market = \"{f_market}\" 기준으로 쓰여 있어 --market {market} 와 함께 쓸 수 없습니다. "
+                         "설정 파일의 market 과 시장별 값(universe, capital, fees, risk …)을 고치거나 그 줄들을 지우세요.")
+    if style and f_style and str(style) != str(f_style):
+        raise ValueError(f"{p} 은 style = \"{f_style}\" 기준으로 쓰여 있어 --style {style} 와 함께 쓸 수 없습니다. "
+                         "설정 파일의 style 과 방식별 값(universe, risk, learn …)을 고치거나 그 줄들을 지우세요.")
+    cfg = Config.for_market(market or f_market or "US", style or f_style)
     data.pop("market", None)
     data.pop("style", None)
     _merge(cfg, data)

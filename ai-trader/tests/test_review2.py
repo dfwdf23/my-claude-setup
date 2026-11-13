@@ -3,6 +3,7 @@
 각 테스트는 '고치기 전에는 장부와 계좌가 어긋나던' 상황을 그대로 재현한다.
 """
 import asyncio
+from pathlib import Path
 from datetime import date
 
 import pytest
@@ -1130,3 +1131,158 @@ async def test_restart_keeps_daily_history_and_change_timer(tmp_path):
     assert sup2.learner.day_pnls == [-50.0, -30.0, -20.0] and sup2.learner.days_since_change == 3
     assert sup2.snapshot()["days"][-1]["pnl"] == -20.0                     # 대시보드의 일별 손익도 이어진다
     sup2.journal.close()
+
+
+# ====================================================================== 시장·설정(세 번째 검토)
+from aitrader.agents.market import MarketAnalyst
+from aitrader.config import load_config
+
+
+def _closes(sym: str, last_day: date, closes: list) -> list:
+    """last_day 까지의 일봉(마지막 값이 last_day 의 종가)."""
+    days, x = [], last_day
+    while len(days) < len(closes):
+        if x.weekday() < 5:
+            days.append(x)
+        x -= timedelta(days=1)
+    days.reverse()
+    return [Bar(sym, US.epoch(d, 9, 30), c, c * 1.005, c * 0.995, c, 1_000_000) for d, c in zip(days, closes)]
+
+
+async def test_failed_daily_fetch_does_not_remark_positions_with_a_stale_close(tmp_path):
+    """장전 일봉 조회가 실패하면 남아 있는 '그 전날 종가'로 보유 종목을 다시 평가하지 않는다.
+    (이전: 어제 −1.35% 로 마감한 계좌를 이틀 전 종가로 덮어써, 오늘 −0.9% 를 −2.05% 로 계산 → 전량 청산)"""
+    cfg = live_cfg(tmp_path)
+    cfg.universe = ["S0", "S1"]
+    d0 = US.now().date()
+    d1, d2 = prev_weekday(d0), prev_weekday(prev_weekday(d0))
+    sup, br = await fresh(cfg)
+    e = sup.engine
+    br.daily = {s: _closes(s, d2, [100.0] * 30) for s in ("S0", "S1")}
+    br.now = lambda: US.epoch(d1, 9, 0)
+    await sup.day_start(d1)                                             # 어제 아침: 정상 조회(전일 종가 100)
+    feed(e, d1, 9, 31, 100.0, ["S0", "S1"])
+    for s in ("S0", "S1"):
+        e._send(OrderIntent(s, BUY, 100, 100.0, "entry", {"stop_dist": 20.0, "atr": 3.0}), e.sym[s])
+    await asyncio.sleep(0.02)
+    for bid in list(br.orders):
+        br.fill(bid)
+    feed(e, d1, 15, 59, 98.65, ["S0", "S1"])                            # 어제 −1.35% 로 마감
+    e.flush_bars()
+    eq_close = e.cash + 200 * 98.65
+
+    async def boom(symbol, n):
+        raise RuntimeError("HTTP 429")
+
+    br.get_daily_bars = boom                                            # 오늘 아침: 일봉 조회 실패
+    br.now = lambda: US.epoch(d0, 9, 0)
+    sup.notifier.send = lambda text: None
+    await sup.day_start(d0)
+    assert e.sym["S0"].last == 98.65 and e.sym["S1"].last == 98.65     # 어제 종가 그대로(이틀 전 종가 100 으로 덮어쓰지 않는다)
+    assert any("일봉을 받지 못한 종목" in ev["text"] for ev in e.events)
+    feed(e, d0, 9, 31, 97.75, ["S0", "S1"])                             # 오늘 실제로는 −0.9%
+    feed(e, d0, 9, 32, 97.75, ["S0", "S1"])
+    await asyncio.sleep(0.02)
+    assert abs(e.day_start_equity - eq_close) < 0.01
+    assert not e.risk.day_stop and not e.risk.flatten_all and not sells(br)
+    sup.journal.close()
+
+
+async def test_indicators_are_warmed_when_history_arrives_on_a_later_day(tmp_path):
+    """첫날 일봉 조회가 실패한 종목도, 조회가 되는 날 과거 이력으로 지표를 채운다.
+    (이전: 한 번 실패하면 재시작할 때까지 약 25거래일 동안 그 종목은 판단이 나오지 않음)"""
+    cfg = live_cfg(tmp_path, "manual")
+    cfg.universe = ["S0", "S1"]
+    d0 = US.now().date()
+    d1 = prev_weekday(d0)
+    sup = Supervisor(cfg, ManualBroker(cfg, base_url="http://127.0.0.1:9"))
+    hist = {s: _closes(s, prev_weekday(d1), [100.0 + i * 0.1 for i in range(80)]) for s in ("S0", "S1")}
+
+    async def bars_day1(symbol, n):
+        if symbol == "S1":
+            raise RuntimeError("timeout")
+        return hist[symbol][-n:]
+
+    async def bars_ok(symbol, n):
+        return hist[symbol][-n:]
+
+    async def none(*a, **k):
+        return []
+
+    sup.broker.get_daily_bars, sup.broker.get_intraday_bars = bars_day1, none
+    sup.broker.now = lambda: US.epoch(d1, 9, 0)
+    await sup.day_start(d1)
+    e = sup.engine
+    assert e.sym["S0"].f.ready and e.sym["S1"].ind.n == 0
+    e.on_tick(Tick("S1", US.epoch(d1, 10, 0), 108.0, 10))               # 그날의 봉이 하나 쌓인다
+    e.flush_bars()
+    assert e.sym["S1"].ind.n == 1 and not e.sym["S1"].f.ready
+    sup.broker.get_daily_bars = bars_ok
+    sup.broker.now = lambda: US.epoch(d0, 9, 0)
+    await sup.day_start(d0)
+    assert e.sym["S1"].f.ready and e.sym["S1"].ind.n >= 25 and len(e.sym["S1"].hist) >= 25
+    sup.journal.close()
+
+
+def test_params_table_overrides_single_keys_and_is_validated(tmp_path, monkeypatch):
+    """config.toml 의 [params] 는 적은 항목만 덮어쓴다(나머지 방식별 기본값은 유지). 모르는 이름·숫자가 아닌 값은 거부.
+    (이전: 한 줄만 적어도 스윙용 기본값 여덟 개가 단타용 값으로 되돌아감, 오타는 조용히 무시됨)"""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config.toml").write_text('[params]\nstop_atr_mult = 3\n', encoding="utf-8")
+    cfg = load_config()
+    base = Config.for_market("US").params
+    assert cfg.params == {**base, "stop_atr_mult": 3.0} and cfg.user_params == {"stop_atr_mult": 3.0}
+    assert ParamStore(None, cfg.params).current.take_profit_r == 5.0     # 스윙용 익절 기준이 그대로
+    for bad in ('[params]\nstop_atr_mlt = 3.0\n', '[params]\ntake_profit_r = "5"\n', '[params]\nversion = 9\n',
+                'user_params = {}\n'):
+        (tmp_path / "config.toml").write_text(bad, encoding="utf-8")
+        with pytest.raises(ValueError):
+            load_config()
+
+
+def test_command_line_market_or_style_must_not_silently_mix_with_the_config_file(tmp_path, monkeypatch):
+    """설정 파일이 전제한 시장·방식과 다른 것을 명령줄에서 주면 섞어서 돌리지 않고 멈춘다.
+    (이전: 예시 파일을 복사한 채 --market krx --style intraday 를 주면 국내 장에 미국 종목·3만 '원' 자본으로 실행)"""
+    monkeypatch.chdir(tmp_path)
+    example = (Path(__file__).resolve().parent.parent / "config.example.toml").read_text(encoding="utf-8")
+    (tmp_path / "config.toml").write_text(example, encoding="utf-8")
+    assert load_config().market == "US" and load_config(market="us", style="swing").style == "swing"   # 같은 값이면 통과
+    with pytest.raises(ValueError, match="--market"):
+        load_config(market="krx")
+    with pytest.raises(ValueError, match="--style"):
+        load_config(style="intraday")
+    (tmp_path / "config.toml").write_text('capital = 1000\n', encoding="utf-8")       # 시장·방식을 적지 않은 파일은 자유롭게
+    k = load_config(market="krx")
+    assert k.market == "KRX" and k.capital == 1000
+
+
+def test_daily_style_volatility_baseline_moves_once_per_day():
+    """일봉 방식의 변동성 기준선은 하루에 한 번만 움직인다.
+    (이전: 매분 2%씩 따라가 하루 만에 따라잡았고, 변동성이 급증한 다음 날에도 '평상'으로 판단)"""
+    cfg = Config.for_market("US")
+    e = Engine(cfg, StrategyParams(), 30_000)
+    ma = MarketAnalyst(cfg, LLM(SimpleNamespace(enabled=False)))
+    s = e.symbol_state("SPY")
+    s.f.ready, s.f.close, s.f.atr, s.f.ema_fast, s.f.ema_slow, s.f.vwap = True, 100.0, 2.0, 101.0, 100.0, 100.0
+    s.day_open, s.last = 100.0, 100.0
+    e.day = 100
+    assert ma.measure(e)["vol_x"] == 1.0
+    s.f.atr = 4.0                                                        # 다음 날: 변동성이 두 배가 됐다
+    e.day = 101
+    for _ in range(390):                                                 # 장중 내내 매분 측정해도
+        m = ma.measure(e)
+    assert m["vol_x"] >= 1.8                                             # 여전히 '확대'로 본다
+    assert ma.rule_regime(m, 0.0).risk_mult <= 0.6
+
+
+def test_backtest_and_bench_warm_daily_indicators():
+    """일봉 방식의 합성 시세 백테스트·지연 측정은 과거 일봉으로 지표를 먼저 채운다.
+    (이전: 기본 설정으로 `backtest --days 20` 을 돌리면 판단이 한 번도 나오지 않아 거래 0건)"""
+    from aitrader.__main__ import _warm
+    from aitrader.brokers.sim import SimMarket
+    cfg = Config.for_market("US")
+    mk = SimMarket(cfg.universe[:3], 7, cfg.sim.tick_sec, etfs=frozenset(), market=cfg.mkt,
+                   open_hhmm=cfg.session.open, close_hhmm=cfg.session.close)
+    bt = Backtester(cfg, ParamStore(None, cfg.params).current)
+    _warm(bt, mk, cfg)
+    assert all(bt.engine.sym[s].f.ready for s in mk.symbols)

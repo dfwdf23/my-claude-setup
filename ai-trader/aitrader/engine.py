@@ -184,6 +184,21 @@ class Engine:
     def set_params(self, p: StrategyParams) -> None:
         self.p = p                                # 참조 교체 한 번 — 핫패스는 잠금이 필요 없다
 
+    def warm(self, symbol: str, bars: list[Bar]) -> int:
+        """지표 예열: 과거 봉으로 지표와 차트 기록을 처음부터 다시 채운다(매매 판단은 하지 않는다).
+        총괄(장전 준비)·백테스트·지연 측정이 모두 이 함수를 쓴다. 넣은 봉 수를 돌려준다."""
+        s = self.symbol_state(symbol)
+        s.ind = IndicatorSet(self.cfg.strategy)
+        s.f = s.ind.f
+        s.hist.clear()
+        for b in bars:
+            if self.daily:
+                s.ind.reset_session()             # 일봉은 봉 하나가 하루(세션) — 매매·재생과 같은 기준
+            f = s.ind.update(b)
+            s.hist.append((b.ts, b.open, b.high, b.low, b.close, b.volume, f.ema_fast, f.ema_slow, f.vwap))
+        s.ind.reset_session()
+        return len(bars)
+
     def set_daily(self, symbol: str, bars: list[Bar]) -> None:
         """일봉 맥락(전일 종가·고가, 평균 거래량, 일봉 추세). bars 는 '어제까지'의 일봉, 오래된 순."""
         s = self.symbol_state(symbol)
