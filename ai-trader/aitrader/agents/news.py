@@ -15,7 +15,7 @@ import re
 import time
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
@@ -97,13 +97,26 @@ class NewsItem:
     symbols: tuple
     rule: float = 0.0       # 규칙 점수
     tags: tuple = ()
-    impact: int | None = None   # Claude 분류(−2~+2). None = 아직
+    impact: int | None = None   # Claude 판정 요약(가장 강한 것, −2~+2). None = 아직. 일지 기록·화면용
     kind: str = ""
     fresh: bool = True      # 매매 판단에 쓸 만큼 새 소식인가
+    verdicts: dict = field(default_factory=dict)   # 종목 → Claude 판정(−2~+2). 같은 제목이라도 종목마다 뜻이 다르다
+    tried: int = 0          # Claude 분류를 시도한 횟수(실패한 묶음을 끝없이 다시 보내지 않는다)
 
-    def score(self) -> float:
-        """매매에 쓰는 점수(−1~+1): Claude 분류가 있으면 그것을, 없으면 규칙 점수를 쓴다."""
+    def score(self, sym: str | None = None) -> float:
+        """매매에 쓰는 점수(−1~+1). 그 종목에 대한 Claude 판정이 있으면 그것을, 없으면 규칙 점수를 쓴다.
+        sym 을 안 주면 화면용 요약(가장 강한 판정)."""
+        if sym is not None:
+            v = self.verdicts.get(sym)
+            return v / 2.0 if v is not None else self.rule
         return self.impact / 2.0 if self.impact is not None else self.rule
+
+    def judge(self, sym: str, impact: int, kind: str) -> None:
+        self.verdicts[sym] = impact
+        worst = min(self.verdicts.values(), key=lambda v: (-abs(v), v))      # 가장 강한 판정(같으면 악재 쪽)
+        self.impact = worst
+        if impact == worst:
+            self.kind = kind
 
 
 def rule_score(title: str) -> tuple[float, tuple]:
@@ -143,22 +156,36 @@ _XML_DECL = re.compile(rb"^\s*<\?xml[^>]*?encoding=[\"']([A-Za-z0-9._-]+)[\"'][^
 _NATIVE_ENC = {"utf-8", "utf8", "us-ascii", "ascii", "iso-8859-1", "latin-1", "latin1", "utf-16"}
 
 
+class _NoDTD(ET.TreeBuilder):
+    """DTD(DOCTYPE)가 있는 문서를 파서 단계에서 거부한다 — 엔티티 폭탄·외부 엔티티 차단.
+    앞부분 글자를 훑는 방식은 UTF-16 이나 긴 머리말로 피할 수 있어서 쓰지 않는다."""
+
+    def doctype(self, name, pubid, system):
+        raise ValueError("DTD not allowed")
+
+
+def _xml(data):
+    return ET.fromstring(data, parser=ET.XMLParser(target=_NoDTD()))
+
+
 def parse_feed(body: bytes, source: str) -> list[tuple[float, str, str]]:
     """RSS 2.0 / Atom 본문 → [(발행시각, 제목, 링크)]. 형식이 이상하면 빈 목록."""
+    return _parse(body) or []
+
+
+def _parse(body: bytes) -> list[tuple[float, str, str]] | None:
+    """parse_feed 와 같지만, 읽지 못한 문서(None)와 소식이 없는 정상 문서([])를 구분한다."""
     if len(body) > MAX_FEED_BYTES:
-        return []
-    head = body[:4096].lower()
-    if b"<!doctype" in head or b"<!entity" in head:      # 외부 엔티티·엔티티 폭탄 차단
-        return []
+        return None
     try:
         m = _XML_DECL.match(body[:300])
         enc = m.group(1).decode("ascii").lower() if m else "utf-8"
         if enc in _NATIVE_ENC:
-            root = ET.fromstring(body)
+            root = _xml(body)
         else:                                             # EUC-KR 같은 다중 바이트 인코딩은 파서가 못 읽는다 → 직접 풀어서 넘긴다
-            root = ET.fromstring(body[m.end():].decode(enc, errors="replace"))
-    except Exception:                                     # 깨진 문서·모르는 인코딩 — 소식 한 건 때문에 다른 일이 멈추면 안 된다
-        return []
+            root = _xml(body[m.end():].decode(enc, errors="replace"))
+    except Exception:                                     # 깨진 문서·모르는 인코딩·DTD — 소식 한 건 때문에 다른 일이 멈추면 안 된다
+        return None
     out = []
     for it in root.iter("item"):                          # RSS
         title = (it.findtext("title") or "").strip()
@@ -193,16 +220,22 @@ class NewsAgent(Agent):
         self.symbols: list[str] = list(cfg.universe[:cfg.max_symbols])
         self.items: OrderedDict[str, NewsItem] = OrderedDict()     # 최근 소식(중복 제거 겸용)
         self.session = None
+        self.started = time.time()
         self.last_llm = 0.0
         self.llm_calls_day = 0
         self.fetch_errors = 0
+        self.parse_errors = 0
         self.fetched = 0
+        self.last_ok = 0.0            # 마지막으로 피드를 정상 해석한 시각
+        self.llm_off = ""             # Claude 분류를 못 쓰는 이유(화면 표시용). 빈 문자열 = 정상
         self._stop = False
         self._alias: list[tuple[re.Pattern, str]] = []
         self.set_symbols(self.symbols)
 
     def new_day(self) -> None:
         self.llm_calls_day = 0
+        if self.llm_off.startswith("오늘"):
+            self.llm_off = ""
 
     def set_symbols(self, symbols: list[str]) -> None:
         self.symbols = list(symbols)
@@ -243,7 +276,9 @@ class NewsAgent(Agent):
                 except Exception as ex:                   # 소식 수집은 보조 기능 — 어떤 오류도 매매를 멈추게 하지 않는다
                     self.fetch_errors += 1
                     self.note(f"수집 오류: {ex!r}"[:80], now)
-                self.status = "warn" if self.fetch_errors > 20 and self.fetched == 0 else "ok"
+                # 피드가 있는데 15분 넘게 한 건도 제대로 읽지 못했거나, Claude 분류가 꺼져 있으면 '주의'
+                dead = bool(jobs) and self.fetch_errors > 5 and now - max(self.last_ok, self.started) > 900.0
+                self.status = "warn" if dead or self.llm_off else "ok"
                 await asyncio.sleep(gap)
         finally:
             await self.session.close()
@@ -259,12 +294,22 @@ class NewsAgent(Agent):
                 if r.status != 200:
                     self.fetch_errors += 1
                     return
-                body = await r.content.read(MAX_FEED_BYTES + 1)
+                buf = bytearray()                         # read(n) 한 번은 '지금 도착한 만큼'만 준다 → 끝까지 읽는다
+                async for chunk in r.content.iter_chunked(65536):
+                    buf += chunk
+                    if len(buf) > MAX_FEED_BYTES:
+                        break
         except Exception:
             self.fetch_errors += 1
             return
+        rows = _parse(bytes(buf))
+        if rows is None:                                  # 읽었지만 해석하지 못했다 — '소식 없음'과 구분해 센다
+            self.fetch_errors += 1
+            self.parse_errors += 1
+            return
         self.fetched += 1
-        self.ingest([(ts, title, link, src, (symbol,) if symbol else ()) for ts, title, link in parse_feed(body, src)], now)
+        self.last_ok = now
+        self.ingest([(ts, title, link, src, (symbol,) if symbol else ()) for ts, title, link in rows], now)
 
     async def _poll_broker(self, now: float) -> None:
         try:
@@ -285,7 +330,16 @@ class NewsAgent(Agent):
         for ts, title, link, src, syms in rows:
             title = title.strip()[:300]
             iid = item_id(title)
-            if not title or iid in self.items:
+            if not title:
+                continue
+            old = self.items.get(iid)
+            if old is not None:
+                # 같은 제목이 다른 종목의 피드에서 또 왔다 → 그 종목도 이 소식의 대상에 넣는다(안 그러면 영영 판정받지 못한다)
+                add = tuple(s for s in syms if s in known and s not in old.symbols)
+                if add:
+                    old.symbols += add
+                    if old.fresh:
+                        self._apply(old, now, old.rule, add)
                 continue
             ts = ts if 0 < ts <= now + 300 else now
             syms = tuple(dict.fromkeys([s for s in syms if s in known] + list(self.find_symbols(title))))
@@ -305,10 +359,10 @@ class NewsAgent(Agent):
             self.note(f"새 소식 {new}건 · 최근: {next(reversed(self.items.values())).title[:40]}", now)
         return new
 
-    def _apply(self, it: NewsItem, now: float, delta: float) -> None:
-        """소식 점수를 종목 상태에 반영한다(반감기로 감쇠). 악재면 신규 매수를 잠시 막는다."""
+    def _apply(self, it: NewsItem, now: float, delta: float, syms: tuple | None = None) -> None:
+        """소식 점수를 종목 상태에 반영한다(반감기로 감쇠). 악재면 신규 매수를 잠시 막는다. syms: 반영할 종목(기본: 전부)."""
         hl = self.nc.half_life_min * 60.0
-        for sym in it.symbols:
+        for sym in (it.symbols if syms is None else syms):
             ns = self.engine.news.get(sym)
             if ns is None:
                 ns = self.engine.news[sym] = NewsState()
@@ -317,59 +371,97 @@ class NewsAgent(Agent):
             ns.score = max(-2.0, min(2.0, ns.score + delta))
             ns.ts = now
             ns.headline = it.title
-            if it.score() <= -0.5:
+            if it.score(sym) <= -0.5:
                 ns.block_until = max(ns.block_until, now + self.nc.block_min * 60.0)
                 self.engine.emit("news", sym, f"악재 감지({it.source}): {it.title[:80]} — {self.nc.block_min:.0f}분간 매수 보류")
 
     # ---------------------------------------------------------------- Claude 정밀 분류
+    HELD_MAX_AGE = 20 * 3600.0     # 보유 종목의 소식은 이만큼 지나도 판정한다(장 마감 뒤 소식을 다음 날 아침에라도 본다)
+    BATCH = 24
+
+    def _pairs(self, now: float) -> list[tuple]:
+        """아직 Claude 판정을 받지 않은 (소식, 종목) 쌍. 보유 종목 것을 앞에, 그다음은 최신순."""
+        held = self.engine.positions
+        fresh_sec = self.nc.max_age_min * 60.0
+        out = []
+        for it in self.items.values():
+            if not it.fresh or it.tried >= 2:
+                continue
+            age = now - it.ts
+            for sym in it.symbols:
+                if sym in it.verdicts:
+                    continue
+                if age <= fresh_sec or (sym in held and age <= self.HELD_MAX_AGE):
+                    out.append((it, sym))
+        out.sort(key=lambda p: (p[1] not in held, -p[0].ts))
+        return out[:self.BATCH]
+
+    def _llm_unavailable(self, why: str, now: float) -> None:
+        if self.llm_off != why:
+            self.llm_off = why
+            self.engine.emit("news", "", f"Claude 소식 분류 중단: {why} — 규칙 판정(매수 보류)만 동작하고 악재 청산 지시는 나가지 않습니다")
+            self.note(f"Claude 분류 중단: {why}"[:80], now)
+
     async def classify(self, now: float) -> int:
+        """새 소식을 '제목×종목' 단위로 묶어 Claude 에게 한 번에 묻는다. 판정은 물어본 그 종목에만 적용한다.
+
+        한 제목에 여러 종목이 걸릴 수 있다("A사 회계부정 … B·C사 반사이익"). 종목 하나에 대한 판정을
+        제목에 언급된 모든 종목에 적용하면 무관한 보유 종목까지 강제 매도된다."""
         c = self.cfg.llm
-        if (not self.llm.enabled or now - self.last_llm < c.news_min_interval_min * 60.0
-                or self.llm_calls_day >= c.news_max_calls):
+        if not self.llm.enabled or now - self.last_llm < c.news_min_interval_min * 60.0:
             return 0
-        todo = [it for it in self.items.values() if it.impact is None and it.fresh
-                and now - it.ts <= self.nc.max_age_min * 60.0][-20:]
-        if not todo:
+        pairs = self._pairs(now)
+        if not pairs:
             return 0
+        held = self.engine.positions
+        has_held = any(sym in held for _, sym in pairs)
+        reserve = max(5, c.news_max_calls // 3)          # 하루 횟수의 일부는 보유 종목 소식을 위해 남겨 둔다
+        if self.llm_calls_day >= c.news_max_calls:
+            self._llm_unavailable("오늘의 분류 횟수를 다 썼습니다", now)
+            return 0
+        if self.llm_calls_day >= c.news_max_calls - reserve and not has_held:
+            return 0                                     # 잡다한 소식으로 남은 횟수를 태우지 않는다
         self.last_llm = now
         self.llm_calls_day += 1
-        payload = {"items": [[i, it.symbols[0], it.title[:140]] for i, it in enumerate(todo)]}
+        for it in {id(it): it for it, _ in pairs}.values():
+            it.tried += 1
+        payload = {"items": [[i, sym, it.title[:140]] for i, (it, sym) in enumerate(pairs)]}
         d = await self.llm.ask_json("news", c.model_news, c.effort_news, NEWS_SYSTEM, payload, NEWS_SCHEMA,
                                     max_tokens=4096)
-        if d is None:
-            for it in todo:                                 # 실패한 묶음을 무한 재시도하지 않는다
-                it.impact = round(it.rule * 2) if abs(it.rule) >= 0.5 else 0
+        if d is None:                                    # 실패: 판정을 지어내지 않는다(규칙 판정 그대로). 두 번까지만 다시 묻는다
+            self._llm_unavailable("Claude 응답 없음(예산 소진·장애)", now)
             return 0
+        if self.llm_off and not self.llm_off.startswith("오늘"):
+            self.llm_off = ""
         n = 0
+        seen: set[int] = set()
         for row in d.get("items", []):
             try:
-                it = todo[int(row["i"])]
+                i = int(row["i"])
                 impact = max(-2, min(2, int(row["impact"])))
-            except (KeyError, IndexError, TypeError, ValueError):
+            except (KeyError, TypeError, ValueError):
                 continue
-            before = it.score()
-            it.impact, it.kind = impact, str(row.get("kind", ""))[:16]
+            if not 0 <= i < len(pairs) or i in seen:     # 범위를 벗어난 번호·중복 번호는 버린다(음수 번호가 뒤에서부터 세어지지 않게)
+                continue
+            seen.add(i)
+            it, sym = pairs[i]
+            before = it.score(sym)
+            it.judge(sym, impact, str(row.get("kind", ""))[:16])
             n += 1
-            self._apply(it, now, it.score() - before)        # 규칙 점수와의 차이만큼 보정
-            for sym in it.symbols:
-                ns = self.engine.news.get(sym)
-                if ns is None:
-                    continue
-                if impact >= 0 and before <= -0.5 and not self._has_negative(sym, now):
-                    ns.block_until = 0.0                     # 규칙이 잘못 막은 것을 푼다
-                if impact <= -2 and self.nc.exit_on_severe:
-                    self.engine.exit_now.add(sym)
-                    self.engine.emit("news", sym, f"심각한 악재 확인(Claude): {it.title[:80]} — 보유분 청산")
+            self._apply(it, now, it.score(sym) - before, (sym,))      # 규칙 점수와의 차이만큼, 그 종목에만
+            ns = self.engine.news.get(sym)
+            if ns is not None and impact >= 0 and before <= -0.5 and not self._has_negative(sym, now):
+                ns.block_until = 0.0                     # 규칙이 잘못 막은 것을 푼다
+            if impact <= -2 and self.nc.exit_on_severe and sym in held:
+                self.engine.exit_now.add(sym)            # 보유 중인 종목만 청산 지시(보유하지 않은 종목은 매수 보류로 충분)
+                self.engine.emit("news", sym, f"심각한 악재 확인(Claude): {it.title[:80]} — 보유분 청산")
             if self.journal is not None:
                 self.journal.news(it)
-        for it in todo:
-            if it.impact is None:
-                it.impact = 0
         return n
 
     def _has_negative(self, sym: str, now: float) -> bool:
         lim = self.nc.block_min * 60.0
-        return any(sym in it.symbols and it.score() <= -0.5 and now - it.seen <= lim for it in self.items.values())
+        return any(sym in it.symbols and it.score(sym) <= -0.5 and now - it.seen <= lim for it in self.items.values())
 
     # ---------------------------------------------------------------- 화면용
     def recent(self, n: int = 40) -> list[dict]:
@@ -377,7 +469,7 @@ class NewsAgent(Agent):
         for it in heapq.nlargest(n, self.items.values(), key=lambda x: x.ts):       # 최신 소식이 위로
             out.append({"ts": it.ts, "source": it.source, "title": it.title, "url": it.url,
                         "symbols": list(it.symbols), "score": round(it.score(), 2),
-                        "by": "claude" if it.impact is not None else "rule", "kind": it.kind or ",".join(it.tags),
+                        "by": "claude" if it.verdicts else "rule", "kind": it.kind or ",".join(it.tags),
                         "fresh": it.fresh})
         return out
 
@@ -385,4 +477,5 @@ class NewsAgent(Agent):
         d = super().info()
         d["fetched"] = self.fetched
         d["errors"] = self.fetch_errors
+        d["llm_off"] = self.llm_off
         return d

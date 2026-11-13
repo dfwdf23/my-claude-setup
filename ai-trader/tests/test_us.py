@@ -185,6 +185,19 @@ class FakeLLM:
         return self.out
 
 
+class SymLLM(FakeLLM):
+    """종목별로 정해 둔 판정을 돌려주는 가짜 Claude(묻는 순서와 무관하게 '그 종목'에 대해 답한다)."""
+
+    def __init__(self, by_symbol: dict, default: int = 0):
+        super().__init__(None)
+        self.by, self.default = by_symbol, default
+
+    async def ask_json(self, role, model, effort, system, payload, schema, max_tokens=0):
+        self.calls.append(payload)
+        return {"items": [{"i": i, "impact": self.by.get(sym, self.default), "kind": "other"}
+                          for i, sym, _ in payload["items"]]}
+
+
 def news_env(llm=None):
     cfg = Config.for_market("US")
     cfg.universe = ["ACME", "NVDA"]
@@ -215,15 +228,18 @@ def test_news_blocks_buys_on_bad_news_and_dedupes():
 
 
 async def test_news_claude_classification_unblocks_and_forces_exit():
-    out = {"items": [{"i": 0, "impact": 0, "kind": "analyst"}, {"i": 1, "impact": -2, "kind": "legal"}]}
-    llm = FakeLLM(out)
+    llm = SymLLM({"ACME": 0, "NVDA": -2})
     cfg, e, na = news_env(llm)
     now = 1794571400.0
+    e.on_tick(Tick("NVDA", US.epoch(date(2026, 1, 5), 10, 0), 100.0, 10))
+    e.on_fill(Fill("NVDA", BUY, 10, 100.0, now, ctx={"stop_dist": 5.0, "atr": 2.0}))      # NVDA 는 보유 중
     na.ingest([(now, "Acme downgraded by one analyst on valuation", "", "x", ())], now)       # 규칙: 악재
     na.ingest([(now, "Nvidia under investigation for accounting fraud", "", "x", ())], now)
     assert e.news["ACME"].block_until > now and e.news["NVDA"].block_until > now
     assert await na.classify(now + 400) == 2 and len(llm.calls) == 1
-    assert llm.calls[0]["items"][0][:2] == [0, "ACME"] and len(json.dumps(llm.calls[0])) < 600   # 제목만 압축해서 보낸다
+    items = llm.calls[0]["items"]
+    assert items[0][:2] == [0, "NVDA"] and items[1][:2] == [1, "ACME"]        # 보유 종목 소식을 먼저 묻는다
+    assert len(json.dumps(llm.calls[0])) < 600                                # 제목만 압축해서 보낸다
     assert e.news["ACME"].block_until == 0.0                                  # Claude가 '영향 없음' → 차단 해제
     assert "NVDA" in e.exit_now and e.news["NVDA"].block_until > now          # 심각한 악재 → 보유분 청산 지시
     assert await na.classify(now + 500) == 0 and len(llm.calls) == 1          # 최소 간격 안에는 다시 묻지 않는다

@@ -740,3 +740,210 @@ async def test_dashboard_refuses_requests_addressed_to_another_host_name(tmp_pat
                 assert r.status == 200
     finally:
         await dash2.stop()
+
+
+# ====================================================================== 소식·대시보드 보안(세 번째 검토)
+from types import SimpleNamespace
+
+from aitrader.agents.news import MAX_FEED_BYTES, NewsAgent
+from aitrader.llm import LLM
+
+
+class SymLLM:
+    """종목별로 정해 둔 판정을 돌려주는 가짜 Claude. fail=True 면 응답 없음(None)."""
+
+    def __init__(self, by_symbol=None, default=0):
+        self.enabled, self.by, self.default, self.calls, self.fail, self.raw = True, by_symbol or {}, default, [], False, None
+
+    async def ask_json(self, role, model, effort, system, payload, schema, max_tokens=0):
+        self.calls.append(payload)
+        if self.fail:
+            return None
+        if self.raw is not None:
+            return self.raw
+        return {"items": [{"i": i, "impact": self.by.get(sym, self.default), "kind": "legal"}
+                          for i, sym, _ in payload["items"]]}
+
+
+def news_env2(llm, held=("AMD", "NVDA", "AAPL", "MSFT")):
+    cfg = Config.for_market("US")
+    e = Engine(cfg, StrategyParams(), 100_000)
+    na = NewsAgent(cfg, llm, e, Broker())
+    na.set_symbols(cfg.universe)
+    t = US.epoch(date(2026, 1, 5), 10, 0)
+    for sym in held:
+        e.on_tick(Tick(sym, t, 100.0, 10))
+        e.on_fill(Fill(sym, BUY, 10, 100.0, t, ctx={"stop_dist": 5.0, "atr": 2.0}))
+    return cfg, e, na
+
+
+NOW = 1794571400.0
+FRAUD = "AMD plunges after SEC charges it with accounting fraud; Nvidia, Apple and Microsoft seen gaining share"
+
+
+async def test_news_verdict_applies_only_to_the_symbol_that_was_asked_about():
+    """한 제목에 여러 종목이 걸려도 판정은 '물어본 그 종목'에만 적용한다.
+    (이전: AMD 에 대한 −2 판정이 제목에 언급된 NVDA·AAPL·MSFT 보유분까지 전부 강제 매도)"""
+    llm = SymLLM({"AMD": -2, "NVDA": 1, "AAPL": 0, "MSFT": 1})
+    cfg, e, na = news_env2(llm)
+    na.ingest([(NOW, FRAUD, "", "x", ("AMD",))], NOW)
+    it = next(iter(na.items.values()))
+    assert set(it.symbols) == {"AMD", "NVDA", "AAPL", "MSFT"}
+    assert await na.classify(NOW + 400) == 4
+    asked = {sym for _, sym, _ in llm.calls[0]["items"]}
+    assert asked == {"AMD", "NVDA", "AAPL", "MSFT"}                      # 종목마다 따로 묻는다
+    assert e.exit_now == {"AMD"}                                         # 청산 지시는 AMD 만
+    assert e.news["AMD"].block_until > NOW and e.news["NVDA"].block_until == 0.0   # 반사이익 종목의 매수 보류는 풀린다
+    assert it.verdicts == {"AMD": -2, "NVDA": 1, "AAPL": 0, "MSFT": 1} and it.impact == -2
+
+
+async def test_news_subject_is_judged_even_when_first_seen_in_another_symbols_feed():
+    """엔비디아 소식이 SPY 피드에서 먼저 보여도 NVDA 에 대해 따로 판정받는다. 같은 제목이 다른 종목 피드에서
+    다시 오면 그 종목도 대상에 붙는다. (이전: SPY 기준 '영향 없음' 판정으로 NVDA 매수 보류가 풀리고 청산도 누락)"""
+    llm = SymLLM({"SPY": 0, "NVDA": -2})
+    cfg, e, na = news_env2(llm, held=("NVDA",))
+    title = "Nvidia under investigation for accounting fraud, trading halted"
+    na.ingest([(NOW, title, "", "x", ("SPY",))], NOW)
+    assert await na.classify(NOW + 400) == 2
+    assert e.exit_now == {"NVDA"} and e.news["NVDA"].block_until > NOW
+    # 제목에 종목 이름이 없는 소식: 처음엔 SPY 피드에서만 보였다가 나중에 TSLA 피드에서도 온다
+    vague = "Chipmaker faces lawsuit over defective product recall"
+    na.ingest([(NOW, vague, "", "x", ("SPY",))], NOW)
+    assert na.ingest([(NOW, vague, "", "x", ("TSLA",))], NOW + 1) == 0   # 새 소식으로 세지는 않지만
+    it = [x for x in na.items.values() if x.title == vague][0]
+    assert it.symbols == ("SPY", "TSLA") and e.news["TSLA"].block_until > NOW      # TSLA 에도 반영된다
+
+
+async def test_news_classifier_ignores_bad_indices_and_never_invents_verdicts_on_failure():
+    """모델이 엉뚱한 번호를 돌려줘도 다른 소식에 적용되지 않고, 응답이 없을 때 판정을 지어내지 않는다.
+    (이전: i=−1 이 '마지막 소식'으로 해석됨. 응답 실패 시 규칙 점수를 'Claude 판정'으로 표시)"""
+    llm = SymLLM()
+    cfg, e, na = news_env2(llm, held=("MSFT",))
+    na.ingest([(NOW, "Nvidia wins approval for new chip", "", "x", ())], NOW)
+    na.ingest([(NOW, "Microsoft announces $2B public offering", "", "x", ())], NOW)
+    llm.raw = {"items": [{"i": -1, "impact": -2, "kind": "legal"}, {"i": 99, "impact": -2, "kind": "legal"},
+                         {"i": "x", "impact": -2, "kind": "legal"}]}
+    assert await na.classify(NOW + 400) == 0 and not e.exit_now
+    llm.raw, llm.fail = None, True                                       # 응답 없음(예산 소진·장애)
+    assert await na.classify(NOW + 800) == 0
+    assert all(not it.verdicts and it.impact is None for it in na.items.values())
+    assert all(v["by"] == "rule" for v in na.recent(5))                  # 화면에도 '규칙 판정'으로 남는다
+    assert na.llm_off and any("Claude 소식 분류 중단" in ev["text"] for ev in e.events)
+    n = len(llm.calls)
+    assert await na.classify(NOW + 1200) == 0 and len(llm.calls) == n    # 같은 묶음을 끝없이 다시 보내지 않는다(두 번까지)
+    llm.fail = False
+    na.ingest([(NOW + 1300, "Microsoft cuts full-year guidance", "", "x", ())], NOW + 1300)
+    assert await na.classify(NOW + 1700) == 1 and na.llm_off == ""       # 다시 되면 정상으로 돌아온다
+
+
+async def test_news_keeps_calls_for_held_symbols_and_judges_overnight_news():
+    """하루 분류 횟수의 일부는 보유 종목 소식을 위해 남겨 두고, 보유 종목의 소식은 늦게라도 판정한다.
+    (이전: 잡다한 소식으로 오후 2시쯤 60회를 다 쓰고, 장 마감 뒤의 악재는 다음 날에도 판정받지 못함)"""
+    llm = SymLLM({"NVDA": -2})
+    cfg, e, na = news_env2(llm, held=("NVDA",))
+    cfg.llm.news_max_calls = 6
+    t = NOW
+    for i in range(10):                                                  # 보유하지 않은 종목의 잡다한 소식이 5분마다
+        t = NOW + i * 400
+        na.ingest([(t, f"Tesla update number {i} on deliveries", "", "x", ())], t)
+        await na.classify(t)
+    assert na.llm_calls_day == 1                                         # 6회 중 5회는 보유 종목 몫으로 남긴다(잡다한 소식에는 1회만)
+    t += 400
+    na.ingest([(t, "Nvidia misses estimates and slashes guidance", "", "x", ())], t)
+    late = t + 6 * 3600                                                  # 장 마감 뒤 소식을 6시간 뒤에야 판정할 기회가 왔다
+    assert await na.classify(late) >= 1
+    assert e.exit_now == {"NVDA"}                                        # 90분이 넘었어도 보유 종목이면 판정한다
+
+
+async def test_severe_news_on_a_symbol_we_do_not_hold_only_blocks_buying():
+    """보유하지 않은 종목의 심각한 악재는 매수 보류로 끝낸다 — 청산 지시를 남겨 두면 나중에 산 것을 곧바로 판다."""
+    llm = SymLLM({"TSLA": -2})
+    cfg, e, na = news_env2(llm, held=())
+    na.ingest([(NOW, "Tesla under investigation for accounting fraud", "", "x", ())], NOW)
+    assert await na.classify(NOW + 400) == 1
+    assert not e.exit_now and e.news["TSLA"].block_until > NOW
+
+
+def test_engine_does_not_buy_a_symbol_with_a_pending_exit_order():
+    """악재 청산 지시가 걸린 종목은 새로 사지 않는다."""
+    cfg = Config.for_market("US", "intraday")
+    sent = []
+    e = Engine(cfg, StrategyParams(), 30_000, execute=sent.append)
+    e.chart.evaluate = lambda *a, **k: SimpleNamespace(symbol="X", score=0.9, parts={})
+    t = US.epoch(date(2026, 1, 5), 10, 0)
+    e.on_tick(Tick("X", t, 100.0, 100))
+    s = e.sym["X"]
+    s.f.ready, s.f.close, s.f.atr = True, 100.0, 1.0
+    e.exit_now.add("X")
+    e._decide(s, s.f, 10 * 3600.0)
+    assert not sent and e.guard.blocks["악재 뉴스"] == 1
+
+
+async def test_feed_body_is_read_to_the_end_and_dtd_is_rejected(unused_tcp_port):
+    """피드 본문을 '지금 도착한 만큼'만 읽으면 여러 조각으로 오는 응답이 잘려 통째로 버려진다.
+    DTD(엔티티 폭탄)는 인코딩·머리말 길이와 무관하게 파서에서 거부한다."""
+    items = "".join(f"<item><title>Nvidia headline number {i} about chips and demand</title>"
+                    f"<link>https://example.com/{i}</link></item>" for i in range(300))
+    body = f'<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel>{items}</channel></rss>'.encode()
+
+    async def split(req):
+        r = web.StreamResponse(headers={"Content-Type": "application/rss+xml"})
+        await r.prepare(req)
+        await r.write(body[:len(body) // 2])
+        await asyncio.sleep(0.05)                                        # 나머지 절반은 조금 뒤에 온다
+        await r.write(body[len(body) // 2:])
+        await r.write_eof()
+        return r
+
+    async def huge(req):
+        return web.Response(body=b"<rss>" + b"x" * (MAX_FEED_BYTES + 10) + b"</rss>")
+
+    app = web.Application()
+    app.router.add_get("/split", split)
+    app.router.add_get("/huge", huge)
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    await web.TCPSite(runner, "127.0.0.1", unused_tcp_port).start()
+    cfg, e, na = news_env2(LLM(SimpleNamespace(enabled=False)), held=())
+    na.session = aiohttp.ClientSession()
+    try:
+        await na._poll_feed(f"http://127.0.0.1:{unused_tcp_port}/split", "NVDA", time.time())
+        assert len(na.items) == 300 and na.fetched == 1 and na.fetch_errors == 0
+        await na._poll_feed(f"http://127.0.0.1:{unused_tcp_port}/huge", "NVDA", time.time())
+        assert na.parse_errors == 1 and na.fetch_errors == 1             # 해석 못 한 것은 '소식 없음'이 아니라 오류로 센다
+    finally:
+        await na.session.close()
+        await runner.cleanup()
+
+    bomb = ('<?xml version="1.0"?><!DOCTYPE r [<!ENTITY a "EXPANDED">]>'
+            '<rss><channel><item><title>Nvidia &a;</title></item></channel></rss>')
+    assert parse_feed(bomb.encode(), "x") == []
+    assert parse_feed(bomb.replace('<?xml version="1.0"?>', "").encode("utf-16"), "x") == []          # UTF-16 으로 숨겨도
+    padded = bomb.replace("?>", "?><!--" + "p" * 5000 + "-->", 1)
+    assert parse_feed(padded.encode(), "x") == []                                                      # 긴 머리말 뒤에 숨겨도
+    ok = '<?xml version="1.0"?><rss><channel><item><title>Nvidia fine</title></item></channel></rss>'
+    assert [t for _, t, _ in parse_feed(ok.encode("utf-16"), "x")] == ["Nvidia fine"]                   # 정상 문서는 그대로
+
+
+async def test_dashboard_token_check_handles_non_ascii_and_page_has_security_headers(tmp_path, unused_tcp_port):
+    """영문이 아닌 토큰·입력에서 500 오류가 나지 않는다. 화면에는 틀 삽입·바깥 전송을 막는 헤더가 붙는다."""
+    cfg = live_cfg(tmp_path, "manual")
+    sup = Supervisor(cfg, ManualBroker(cfg, base_url="http://127.0.0.1:9"))
+    dash = Dashboard(sup, "0.0.0.0", unused_tcp_port, token="비밀번호123")
+    await dash.start()
+    base = f"http://127.0.0.1:{unused_tcp_port}"
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(base + "/api/state", params={"token": "é"}) as r:
+                assert r.status == 401                                   # (이전: 500 + 로그에 예외)
+            async with s.get(base + "/api/state", params={"token": "비밀번호123"}) as r:
+                assert r.status == 200                                   # (이전: 맞는 토큰인데도 500)
+            async with s.get(base + "/api/state", params={"token": "비밀번호124"}) as r:
+                assert r.status == 401
+            async with s.get(base + "/") as r:
+                h = r.headers
+                assert h["X-Frame-Options"] == "DENY" and h["Referrer-Policy"] == "no-referrer"
+                assert "frame-ancestors 'none'" in h["Content-Security-Policy"] and "default-src 'none'" in h["Content-Security-Policy"]
+    finally:
+        await dash.stop()
+        sup.journal.close()

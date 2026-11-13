@@ -358,9 +358,10 @@ class Engine:
             return
         s.score = sig.score
         ns = self.news.get(sym)
-        if ns is not None and self.now < ns.block_until:
+        if (ns is not None and self.now < ns.block_until) or sym in self.exit_now:
             self.guard.blocks["악재 뉴스"] += 1
-            self.emit("block", sym, f"정보수집: 악재 뉴스로 매수 보류 — {ns.headline[:60]}", score=round(sig.score, 2))
+            self.emit("block", sym, f"정보수집: 악재 뉴스로 매수 보류 — {ns.headline[:60] if ns is not None else ''}",
+                      score=round(sig.score, 2))
             return
         day_gain = (f.close / ref - 1.0) * 100.0 if ref > 0 else 0.0
         why = self.guard.check(f, day_gain, s.bar_count - s.last_loss_bar, p)

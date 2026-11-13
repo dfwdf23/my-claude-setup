@@ -67,7 +67,8 @@ class Dashboard:
         if not self.token:
             return True
         got = req.headers.get("X-Token") or req.query.get("token", "")
-        return hmac.compare_digest(got, self.token)
+        # 바이트로 비교한다: 문자열 비교는 영문이 아닌 글자가 섞이면 예외를 던진다(한글 토큰을 못 쓰고, 아무나 오류를 유발)
+        return hmac.compare_digest(got.encode("utf-8", "backslashreplace"), self.token.encode("utf-8", "backslashreplace"))
 
     @staticmethod
     def _same_origin(req: web.Request) -> bool:
@@ -99,8 +100,19 @@ class Dashboard:
             await self.runner.cleanup()
 
     async def index(self, req: web.Request) -> web.Response:
+        host = "".join(ch for ch in req.headers.get("Host", "") if ch.isalnum() or ch in ".:-[]")
+        headers = {
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+            "X-Frame-Options": "DENY",                    # 다른 사이트가 이 화면을 틀 안에 넣어 버튼을 누르게 하는 것 차단
+            "Referrer-Policy": "no-referrer",             # 주소에 든 토큰이 바깥 링크로 새지 않게
+            # 이 화면은 파일 하나(스크립트·스타일 포함)라 inline 은 허용하되, 바깥 자원·전송은 모두 막는다
+            "Content-Security-Policy": ("default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+                                        f"connect-src 'self' ws://{host} wss://{host}; img-src 'self' data:; "
+                                        "frame-ancestors 'none'; base-uri 'none'; form-action 'none'"),
+        }
         return web.Response(text=(STATIC / "index.html").read_text(encoding="utf-8"),
-                            content_type="text/html", headers={"Cache-Control": "no-store"})
+                            content_type="text/html", headers=headers)
 
     async def state(self, req: web.Request) -> web.Response:
         if not self._ok(req):
