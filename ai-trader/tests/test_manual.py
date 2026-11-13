@@ -108,9 +108,12 @@ async def test_manual_feed_quotes_ticks_and_daily_bars(tmp_path, unused_tcp_port
         br.on_tick = ticks.append
         await br.subscribe(["SPY", "QQQ"])
         br.expect_data = True
+        t_start = time.time()
+        fake.quotes["SPY"] = (500.5, t_start - 3, 1_000_000)                        # 방금 체결된 시세
+        fake.quotes["QQQ"] = (430.25, t_start - 3600, 500_000)                      # 한 시간 전 시세(지연·거래정지)
         task = asyncio.create_task(br.run())
         await asyncio.sleep(0.12)
-        fake.quotes["SPY"] = (501.0, T0 + 20, 1_000_700)                            # 다음 조회에서 거래량이 700 늘었다
+        fake.quotes["SPY"] = (501.0, time.time() - 1, 1_000_700)                    # 다음 조회에서 거래량이 700 늘었다
         for _ in range(100):
             await asyncio.sleep(0.02)
             if any(t.symbol == "SPY" and t.price == 501.0 for t in ticks):
@@ -120,7 +123,9 @@ async def test_manual_feed_quotes_ticks_and_daily_bars(tmp_path, unused_tcp_port
         first = next(t for t in ticks if t.symbol == "SPY")
         assert first.volume == 0 and first.cum_volume == 1_000_000                  # 첫 조회는 증가분을 알 수 없다
         nxt = next(t for t in ticks if t.symbol == "SPY" and t.price == 501.0)
-        assert nxt.volume == 700 and nxt.cum_volume == 1_000_700 and nxt.ts == T0 + 20
+        assert nxt.volume == 700 and nxt.cum_volume == 1_000_700
+        assert t_start <= first.ts <= nxt.ts <= time.time()                         # 틱 시각은 조회한 시각
+        assert not any(t.symbol == "QQQ" for t in ticks) and br.stale > 0           # 오래된 시세는 판단에 쓰지 않는다
         assert await br.is_trading_day(DAY) and not await br.is_trading_day(date(2026, 1, 1))
     finally:
         await br.stop()
@@ -171,6 +176,7 @@ async def test_manual_ticket_confirm_skip_and_expiry(tmp_path):
     await asyncio.sleep(0.01)
     t2 = list(br.tickets.values())[-1]
     assert t2["market"] and t2["side"] == SELL and t2["ref"] == 500.0
+    assert "먼저" in sup.manual_sell("SPY", 1, 500.0) and e.positions["SPY"].qty == 6   # 열린 제안이 있으면 그 제안으로 답한다
     assert "건너뜀" in br.skip(t2["id"]) and t2["status"] == "SKIPPED"
     assert e.positions["SPY"].qty == 6 and "SPY" not in e.pending
     assert s.retry_after == e.now + cfg.manual.snooze_min * 60.0
@@ -260,6 +266,25 @@ async def test_dashboard_ticket_chart_and_origin_guard(tmp_path, unused_tcp_port
             async with s.post(base + "/api/ticket", json={"id": tid2, "action": "skip"}, headers=h) as r:
                 assert r.status == 200
             assert br.tickets[tid2]["status"] == "SKIPPED" and e.positions["SPY"].qty == 10
+            cash0 = e.cash
+
+            # 제안 없이 직접 판 것(걸어 둔 손절 주문이 체결된 경우 등)을 장부에 반영
+            async with s.post(base + "/api/ticket", json={"id": "SPY", "action": "sold", "qty": "4", "price": "498"},
+                              headers={**h, "Origin": "http://evil.example"}) as r:
+                assert r.status == 403
+            async with s.post(base + "/api/ticket", json={"id": "SPY", "action": "sold", "qty": "4"}, headers=h) as r:
+                assert r.status == 400                                  # 가격 없이는 받지 않는다
+            async with s.post(base + "/api/ticket", json={"id": "SPY", "action": "sold", "qty": "99", "price": "498"},
+                              headers=h) as r:
+                assert "확인" in (await r.json())["message"] and e.positions["SPY"].qty == 10
+            async with s.post(base + "/api/ticket", json={"id": "NOPE", "action": "sold", "qty": "1", "price": "5"},
+                              headers=h) as r:
+                assert "없습니다" in (await r.json())["message"]
+            async with s.post(base + "/api/ticket", json={"id": "spy", "action": "sold", "qty": "4", "price": "498"},
+                              headers=h) as r:
+                assert r.status == 200 and "직접 매도 반영" in (await r.json())["message"]
+            assert e.positions["SPY"].qty == 6 and abs(e.cash - cash0 - 4 * 498 * (1 - cfg.fees.commission - cfg.fees.sell_tax)) < 0.01
+            e.positions["SPY"].qty += 4                                 # 아래 차트 검사를 위해 수량만 되돌린다
 
             # 차트 자료
             async with s.get(base + "/api/chart?symbol=SPY") as r:
@@ -308,6 +333,7 @@ async def test_ticket_api_is_manual_mode_only(tmp_path, unused_tcp_port):
         async with aiohttp.ClientSession() as s:
             async with s.post(f"http://127.0.0.1:{unused_tcp_port}/api/ticket", json={"id": "M1", "action": "fill"}) as r:
                 assert r.status == 400 and (await r.json())["error"] == "manual mode only"
+        assert "주문 보조 모드" in sup.manual_sell("SPY", 1, 100.0)        # 자동 주문 모드에서는 장부를 손으로 고칠 수 없다
     finally:
         await dash.stop()
         sup.journal.close()

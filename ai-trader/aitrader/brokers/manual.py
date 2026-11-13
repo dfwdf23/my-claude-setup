@@ -48,6 +48,8 @@ class ManualBroker(Broker):
         self._n = 0
         self._stop = False
         self.errors = 0
+        self.stale = 0                        # 너무 오래돼 버린 시세(지연·거래정지) 건수
+        self.max_quote_age = 900.0            # 마지막 체결이 이보다 오래된 시세는 판단에 쓰지 않는다(초)
         self.on_ticket: Callable[[dict], None] = lambda t: None      # 새 주문 제안(알림용)
         self._oh, self._om = divmod(cfg.session.tod("open") // 60, 60)
 
@@ -88,11 +90,17 @@ class ManualBroker(Broker):
                 await asyncio.sleep(1.0)
                 continue
             try:
-                for sym, px, ts, cum in await self._quotes(self.symbols):
+                quotes = await self._quotes(self.symbols)
+                now = time.time()
+                for sym, px, mts, cum in quotes:
+                    if now - mts > self.max_quote_age:
+                        self.stale += 1                 # 지연된 시세를 현재가로 착각하지 않는다 → 시세 끊김 감지에 맡긴다
+                        continue
                     prev = self._cum.get(sym, cum)
                     self._cum[sym] = cum
                     self.last[sym] = px
-                    self.on_tick(Tick(sym, ts, px, max(cum - prev, 0), 0.0, 0.0, cum))
+                    # 틱 시각은 조회 시각 — 종목마다 마지막 체결 시각이 달라 엔진 시계가 앞뒤로 흔들리는 것을 막는다
+                    self.on_tick(Tick(sym, now, px, max(cum - prev, 0), 0.0, 0.0, cum))
             except Exception as e:
                 self.errors += 1
                 log.debug("시세 조회 오류: %r", e)

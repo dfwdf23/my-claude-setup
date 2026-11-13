@@ -507,6 +507,22 @@ class Supervisor(Agent):
         self._save_state()
         return msg
 
+    def manual_sell(self, symbol: str, qty: int | None, price: float) -> str:
+        """주문 보조 모드: 사용자가 봇의 제안 없이 증권사 앱에서 직접 판 것(걸어 둔 손절 주문 체결 등)을 장부에 반영."""
+        if not self.manual:
+            return "주문 보조 모드에서만 쓸 수 있습니다"
+        e = self.engine
+        pos = e.positions.get(symbol)
+        if pos is None:
+            return f"{symbol} 보유 기록이 없습니다"
+        if symbol in e.pending:
+            return f"{symbol} 에 대기 중인 주문 제안이 있습니다 — 그 제안에서 [체결됨] 또는 [건너뜀]을 먼저 누르세요"
+        q = pos.qty if qty is None else int(qty)
+        if q <= 0 or q > pos.qty or not price > 0:
+            return "수량·가격을 확인하세요"
+        e.on_fill(Fill(symbol, SELL, q, float(price), self.broker.now(), reason="manual_sell"))
+        return f"{symbol} {q}주 @ {self.m.px(price)} 직접 매도 반영"
+
     # ------------------------------------------------------------------ 대시보드 스냅샷
     def chart(self, symbol: str, since_ts: float = 0.0) -> dict | None:
         """선택한 종목의 실시간 차트 자료: 마감된 봉(지표 포함) + 진행 중인 봉 + 오늘 체결 표시."""

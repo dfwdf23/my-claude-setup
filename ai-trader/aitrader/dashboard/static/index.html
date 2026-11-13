@@ -330,7 +330,8 @@ function render(s) {
     ["종목", p => p.symbol], ["수량", p => num(p.qty, 0)], ["평균가", p => px(p.avg)], ["현재가", p => px(p.last)],
     ["평가손익", p => span(arrow(p.pnl) + signed(p.pnl), cls(p.pnl))], ["수익률", p => span((p.pnl_pct >= 0 ? "+" : "") + p.pnl_pct.toFixed(2) + "%", cls(p.pnl_pct))],
     ["손절가", p => px(p.stop) + " (" + (STOPK[p.stop_kind] || p.stop_kind) + ")"], ["익절가", p => px(p.target)], ["보유", p => p.bars + "봉"],
-  ], s.positions, "보유 종목 없음");
+  ].concat(s.mode === "manual" ? [["", p => { const b = el("button", {class: "sm", text: "직접 팔았음", title: "봇의 제안 없이 증권사 앱에서 직접 판 경우 장부에 반영"}); b.addEventListener("click", () => soldMyself(p)); return b; }]] : []),
+  s.positions, "보유 종목 없음");
   if (!sel && s.watch.length) pick((s.positions[0] || s.watch[0]).symbol);
   table($("watch"), [
     ["종목", w => w.symbol + (w.held ? " ●" : "")], ["현재가", w => w.last ? px(w.last) : "–"],
@@ -438,12 +439,19 @@ function ticketFill(t) {
   if (q === null) return;
   ticket(t.id, "fill", q, p);
 }
+function soldMyself(p) {
+  const pr = prompt(p.symbol + " — 직접 판 가격을 입력하세요", Number(p.last || p.avg).toFixed(M.decimals));
+  if (pr === null) return;
+  const q = prompt("판 수량 (보유 " + p.qty + "주)", p.qty);
+  if (q === null) return;
+  ticket(p.symbol, "sold", q, pr);
+}
 async function post(path, body) {
   try {
     const r = await fetch(path, {method: "POST", headers: {"Content-Type": "application/json", "X-Token": token}, body: JSON.stringify(body)});
     if (r.status === 401) alert("권한 없음 — 주소에 ?token=… 을 붙여 접속하세요.");
     else if (!r.ok) alert("요청 실패 (" + r.status + ")");
-    else { const d = await r.json(); if (d.message) console.info(d.message); }
+    else { const d = await r.json(); if (d.message) { console.info(d.message); if (/확인하세요|없습니다|먼저|이미/.test(d.message)) alert(d.message); } }
   } catch (e) { alert("명령 전송 실패: " + e); }
 }
 const ticket = (id, action, qty, price) => post("/api/ticket", {id, action, qty, price});

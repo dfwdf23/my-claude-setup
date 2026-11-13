@@ -3,7 +3,9 @@
   GET  /            대시보드 화면
   GET  /ws          실시간 상태 푸시(WebSocket, 0.5초 간격 + 이벤트 증분)
   GET  /api/state   현재 상태 JSON
+  GET  /api/chart?symbol=…   선택한 종목의 차트 자료
   POST /api/control {"action": "halt" | "flatten" | "resume"}
+  POST /api/ticket  {"id", "action": "fill" | "skip" | "sold", "qty", "price"}   (주문 보조 모드)
 
 제어 API와 상태는 DASHBOARD_TOKEN 이 설정돼 있으면 토큰이 있어야 접근된다.
 토큰 없이 외부 주소(0.0.0.0 등)에 바인딩하는 것은 거부한다 — 누구나 매매를 멈추거나 풀 수 있게 되기 때문이다.
@@ -126,6 +128,10 @@ class Dashboard:
             msg = br.confirm(tid, qty, price)
         elif action == "skip":
             msg = br.skip(tid)
+        elif action == "sold":                           # 제안 없이 직접 판 것 — id 자리에 종목 코드
+            if price is None:
+                return web.json_response({"error": "bad request"}, status=400)
+            msg = self.sup.manual_sell(tid.upper()[:16], qty, price)
         else:
             return web.json_response({"error": "unknown action"}, status=400)
         return web.json_response({"ok": True, "message": msg})
