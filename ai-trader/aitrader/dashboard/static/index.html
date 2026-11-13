@@ -197,6 +197,11 @@ svg text.halo { paint-order: stroke; stroke: var(--surface); stroke-width: 4px; 
     <section class="card c7" aria-label="보유 포지션">
       <h2>보유 포지션</h2>
       <div class="scroll" id="positions"></div>
+      <div id="orders-wrap" hidden>
+        <div style="height:14px"></div>
+        <h2>진행 중 주문 <span class="sub">(증권사에 나가 있고 아직 끝나지 않은 주문)</span></h2>
+        <div class="scroll" id="orders"></div>
+      </div>
       <div style="height:14px"></div>
       <h2>감시 종목 <span class="sub">(행을 누르면 위 차트가 바뀝니다)</span></h2>
       <div class="scroll" id="watch"></div>
@@ -283,6 +288,7 @@ const KINDTAG = {fast: "규칙·수치", llm: "Claude", slow: "일과"};
 const PNAME = {entry_score_min: "매수 최소 점수", rsi_min: "RSI 하한", rsi_overbought: "RSI 과매수", max_ext_atr: "이격 상한(ATR)", max_day_gain_pct: "당일 급등 한도(%)", vol_ratio_min: "봉 거래량 배수", rvol_min: "상대 거래량 하한", stop_atr_mult: "손절폭(ATR)", take_profit_r: "익절(R)", trail_start_r: "추적 시작(R)", trail_atr_mult: "추적 간격(ATR)", time_stop_bars: "시간 청산(봉)", cooldown_bars: "재진입 금지(봉)", size_mult: "크기 배수"};
 const STOPK = {stop_loss: "손절", trailing_stop: "추적"};
 const REASON = {entry: "매수 신호", stop_loss: "손절", trailing_stop: "추적 손절(이익 보호)", take_profit: "익절", time_stop: "시간 청산", trend_exit: "추세 이탈", eod_flatten: "장 마감 청산", news_exit: "악재 소식", risk_flatten: "전량 청산"};
+const OSTATE = {SENT: "전송 중", ACK: "접수됨(체결 대기)", UNKNOWN: "접수 여부 확인 중", STUCK: "⚠ 확인 불가 — 계좌 확인 필요", CANCELING: "취소 중"};
 const lastOf = sym => { const w = S && S.watch.find(x => x.symbol === sym); return w && w.last ? w.last : 0; };
 
 let S = null, logSeq = 0, logDay = "", showEqTable = false, showChTable = false, sel = "", tf = "", tfUser = false, WS = null;
@@ -332,6 +338,13 @@ function render(s) {
     ["손절가", p => px(p.stop) + " (" + (STOPK[p.stop_kind] || p.stop_kind) + ")"], ["익절가", p => px(p.target)], ["보유", p => p.bars + "봉"],
   ].concat(s.mode === "manual" ? [["", p => { const b = el("button", {class: "sm", text: "직접 팔았음", title: "봇의 제안 없이 증권사 앱에서 직접 판 경우 장부에 반영"}); b.addEventListener("click", () => soldMyself(p)); return b; }]] : []),
   s.positions, "보유 종목 없음");
+  const ords = s.mode === "manual" ? [] : (s.orders || []);          // 주문 보조 모드에서는 위쪽 '주문 제안'이 같은 내용
+  $("orders-wrap").hidden = !ords.length;
+  if (ords.length) table($("orders"), [
+    ["종목", o => o.symbol], ["구분", o => span(o.side === "BUY" ? "매수" : "매도", o.side === "BUY" ? "up" : "down")],
+    ["체결/주문", o => num(o.filled, 0) + " / " + num(o.qty, 0) + "주"], ["가격", o => o.price ? px(o.price) : "시장가"],
+    ["상태", o => OSTATE[o.status] || o.status], ["사유", o => REASON[o.reason] || o.reason],
+  ], ords, "");
   if (!sel && s.watch.length) pick((s.positions[0] || s.watch[0]).symbol);
   table($("watch"), [
     ["종목", w => w.symbol + (w.held ? " ●" : "")], ["현재가", w => w.last ? px(w.last) : "–"],
