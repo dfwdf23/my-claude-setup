@@ -142,7 +142,30 @@ async def test_fill_that_lands_after_cancel_was_accepted_is_found_later():
     await asyncio.sleep(0.25)
     assert e.positions["E"].qty == 100
     assert any("취소 처리 뒤" in ev["text"] for ev in e.events)
-    ex.stop_background()
+    ex.shutdown()
+
+
+async def test_shutdown_does_not_turn_an_unconfirmed_cancel_into_a_halt():
+    """종료 중에 취소 확정이 끝나지 않았다고 '확인 불가 → 정지'를 저장하지 않는다. 그 주문은 다음 시작 때 정리한다."""
+    br, e, ex = desk_env()
+    ex.settle_delays = (0.0, 0.2, 0.2, 0.2)
+    br.cancel_effective = False
+    send(e, ex)
+    await asyncio.sleep(0.01)
+    br.poll_fail = 99                                    # 연결이 닫혀 조회가 계속 실패하는 상황
+    await ex.cancel_all(timeout=0.05)
+    ex.shutdown()
+    await asyncio.sleep(0.5)
+    assert not e.risk.halted
+    saved = ex.export()
+    assert len(saved) == 1 and saved[0]["status"] == "CANCELING" and saved[0]["broker_id"] == "1"
+    br.poll_fail = 0                                     # 다음 시작: 조회가 되고, 그 사이 30주가 체결돼 있었다
+    br.fill("1", 30, 10_000)
+    e2 = Engine(Config(), StrategyParams(), 10_000_000)
+    ex2 = Executor(br, e2)
+    ex2.settle_delays = (0.0, 0.01, 0.01, 0.01)
+    e2.on_tick(Tick("E", T0, 10_000, 1, 10_000, 10_005))
+    assert await ex2.recover(saved) == 1 and e2.positions["E"].qty == 30
 
 
 async def test_polled_partial_fills_are_booked_at_their_own_prices():

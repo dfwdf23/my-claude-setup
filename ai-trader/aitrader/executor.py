@@ -461,7 +461,10 @@ class Executor(Agent):
         if self._tasks:
             await asyncio.wait(list(self._tasks), timeout=timeout)
 
-    def stop_background(self) -> None:
-        """종료 시: 추적 조회 작업을 정리한다."""
-        for t in list(self._bg):
+    def shutdown(self) -> None:
+        """종료 시: 아직 돌고 있는 작업(취소 확정 대기·추적 조회)을 멈춘다.
+
+        증권사 연결을 닫은 뒤에도 확정 대기가 계속 돌면, 조회 실패를 '확인 불가'로 오인해 정지 상태를
+        저장해 버린다. 확정하지 못한 주문은 진행 중 주문으로 저장되므로 다음 시작 때 recover 가 정리한다."""
+        for t in list(self._tasks) + list(self._bg):
             t.cancel()

@@ -140,12 +140,12 @@ class Supervisor(Agent):
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-            self.executor.stop_background()
             if self.live:                               # 걸려 있는 주문을 남긴 채 꺼지지 않는다
                 try:
                     await asyncio.wait_for(self.executor.cancel_all(), 8.0)
                 except Exception:
                     pass
+            self.executor.shutdown()                    # 확정 못 한 주문은 저장해 두고 다음 시작 때 정리한다
             await self.broker.stop()
             self._save_state()
             await self.notifier.close()
