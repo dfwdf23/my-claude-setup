@@ -161,15 +161,18 @@ async def test_manual_ticket_confirm_skip_and_expiry(tmp_path):
     snap = sup.snapshot()
     assert snap["tickets"][0]["id"] == t["id"] and snap["tickets"][0]["ttl"] == 300.0 and snap["style"] == "swing"
 
-    assert "확인" in br.confirm(t["id"], 11, 500.0)                      # 제안 수량보다 많게는 받지 않는다
-    assert "확인" in br.confirm(t["id"], 6, -1)
-    assert "너무 다릅니다" in br.confirm(t["id"], 6, 4995.0) and not e.positions   # 자릿수를 잘못 넣은 가격은 거부
-    msg = br.confirm(t["id"], 6, 499.5)
-    assert "체결 반영" in msg and t["status"] == "FILLED"
+    ok, msg = br.confirm(t["id"], 11, 500.0)                            # 제안 수량보다 많게는 받지 않는다
+    assert not ok and "확인" in msg and "반영되지 않았습니다" in msg
+    assert br.confirm(t["id"], 6, -1)[0] is False
+    ok, msg = br.confirm(t["id"], 6, 4995.0)                            # 자릿수를 잘못 넣은 가격은 거부
+    assert not ok and "너무 다릅니다" in msg and not e.positions
+    ok, msg = br.confirm(t["id"], 6, 499.5)
+    assert ok and "체결 반영" in msg and t["status"] == "FILLED"
     pos = e.positions["SPY"]
     assert pos.qty == 6 and pos.avg_price == 499.5                      # 실제 체결가·수량으로 장부에 반영
     assert "SPY" not in e.pending and not sup.executor.orders           # 남은 4주는 주문하지 않은 것으로 정리
-    assert "이미 처리" in br.confirm(t["id"]) and e.positions["SPY"].qty == 6     # 두 번 눌러도 중복 반영 없음
+    ok, msg = br.confirm(t["id"])                                       # 두 번 눌러도 중복 반영 없음
+    assert not ok and "이미 처리" in msg and e.positions["SPY"].qty == 6
     assert (tmp_path / "manual-us" / "state.json").exists()            # 재시작 대비 장부 저장
 
     # 2) 매도 제안을 건너뜀 → 포지션 그대로, 같은 종목 제안은 한동안 다시 뜨지 않는다
@@ -177,8 +180,10 @@ async def test_manual_ticket_confirm_skip_and_expiry(tmp_path):
     await asyncio.sleep(0.01)
     t2 = list(br.tickets.values())[-1]
     assert t2["market"] and t2["side"] == SELL and t2["ref"] == 500.0
-    assert "먼저" in sup.manual_sell("SPY", 1, 500.0) and e.positions["SPY"].qty == 6   # 열린 제안이 있으면 그 제안으로 답한다
-    assert "건너뜀" in br.skip(t2["id"]) and t2["status"] == "SKIPPED"
+    ok, msg = sup.manual_sell("SPY", 1, 500.0)                          # 열린 제안이 있으면 그 제안으로 답한다
+    assert not ok and "먼저" in msg and e.positions["SPY"].qty == 6
+    ok, msg = br.skip(t2["id"])
+    assert ok and "건너뜀" in msg and t2["status"] == "SKIPPED"
     assert e.positions["SPY"].qty == 6 and "SPY" not in e.pending
     assert s.retry_after == e.now + cfg.manual.snooze_min * 60.0
     assert not e.risk.halted                                            # 건너뛰기는 '거부 반복' 정지 사유가 아니다
@@ -196,15 +201,23 @@ async def test_manual_ticket_confirm_skip_and_expiry(tmp_path):
     sup.executor.on_timer(sup.executor.clock() + cfg.manual.ticket_ttl_min * 60 + 1)
     await asyncio.sleep(0.01)
     assert t3["status"] == "EXPIRED" and not sup.executor.orders and "SPY" not in e.pending
-    assert "이미 처리" in br.confirm(t3["id"]) and e.positions["SPY"].qty == 6    # 만료된 제안은 체결로 못 바꾼다
+    # 만료된 제안도 한동안은 '사실은 체결했다'는 확인을 받는다(주문하느라 5분을 넘기는 일은 흔하다)
+    assert br.late_ok(t3) and sup.snapshot()["tickets"][0]["late_ok"]
+    ok, msg = br.confirm(t3["id"], 2, 505.0)
+    assert ok and "늦은 체결 반영" in msg and e.positions["SPY"].qty == 4 and t3["status"] == "FILLED"
+    assert br.confirm(t3["id"], 2, 505.0)[0] is False and e.positions["SPY"].qty == 4      # 두 번은 안 된다
+    t3["status"], t3["closed"] = "EXPIRED", time.time() - cfg.manual.snooze_min * 60 - 5   # 너무 오래된 제안
+    ok, msg = br.confirm(t3["id"], 1, 505.0)
+    assert not ok and "반영되지 않았습니다" in msg and e.positions["SPY"].qty == 4
 
     # 4) 매도 체결 → 거래 종료, 손익이 일지에 남는다
     s.retry_after = 0.0
-    e._send(OrderIntent("SPY", SELL, 6, 0.0, "take_profit"), s)
+    e._send(OrderIntent("SPY", SELL, 4, 0.0, "take_profit"), s)
     await asyncio.sleep(0.01)
     t4 = list(br.tickets.values())[-1]
-    br.confirm(t4["id"], None, 510.0)
-    assert not e.positions and len(e.trades) == 1 and e.trades[0].exit_price == 510.0 and e.trades[0].pnl > 0
+    assert br.confirm(t4["id"], None, 510.0)[0]
+    assert not e.positions and len(e.trades) == 1 and e.trades[0].pnl > 0
+    assert abs(e.trades[0].exit_price - (2 * 505.0 + 4 * 510.0) / 6) < 1e-9          # 나눠 판 가격의 평균
     sup.journal.close()
 
 
@@ -277,13 +290,14 @@ async def test_dashboard_ticket_chart_and_origin_guard(tmp_path, unused_tcp_port
                 assert r.status == 400                                  # 가격 없이는 받지 않는다
             async with s.post(base + "/api/ticket", json={"id": "SPY", "action": "sold", "qty": "99", "price": "498"},
                               headers=h) as r:
-                assert "확인" in (await r.json())["message"] and e.positions["SPY"].qty == 10
+                d = await r.json()                                      # 반영되지 않았으면 성공처럼 답하지 않는다
+                assert r.status == 409 and d["ok"] is False and "확인" in d["message"] and e.positions["SPY"].qty == 10
             async with s.post(base + "/api/ticket", json={"id": "SPY", "action": "sold", "qty": "4", "price": "49.8"},
                               headers=h) as r:
-                assert "너무 다릅니다" in (await r.json())["message"] and e.positions["SPY"].qty == 10
+                assert r.status == 409 and "너무 다릅니다" in (await r.json())["message"] and e.positions["SPY"].qty == 10
             async with s.post(base + "/api/ticket", json={"id": "NOPE", "action": "sold", "qty": "1", "price": "5"},
                               headers=h) as r:
-                assert "없습니다" in (await r.json())["message"]
+                assert r.status == 409 and "없습니다" in (await r.json())["message"]
             async with s.post(base + "/api/ticket", json={"id": "spy", "action": "sold", "qty": "4", "price": "498"},
                               headers=h) as r:
                 assert r.status == 200 and "직접 매도 반영" in (await r.json())["message"]
@@ -337,7 +351,7 @@ async def test_ticket_api_is_manual_mode_only(tmp_path, unused_tcp_port):
         async with aiohttp.ClientSession() as s:
             async with s.post(f"http://127.0.0.1:{unused_tcp_port}/api/ticket", json={"id": "M1", "action": "fill"}) as r:
                 assert r.status == 400 and (await r.json())["error"] == "manual mode only"
-        assert "주문 보조 모드" in sup.manual_sell("SPY", 1, 100.0)        # 자동 주문 모드에서는 장부를 손으로 고칠 수 없다
+        assert sup.manual_sell("SPY", 1, 100.0) == (False, "주문 보조 모드에서만 쓸 수 있습니다")   # 자동 주문 모드에서는 장부를 손으로 못 고친다
     finally:
         await dash.stop()
         sup.journal.close()

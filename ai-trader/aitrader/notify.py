@@ -53,8 +53,15 @@ class Notifier:
                             self.failed += 1
                 except Exception:
                     self.failed += 1
+                finally:
+                    self._q.task_done()
 
-    async def close(self) -> None:
+    async def close(self, grace: float = 6.0) -> None:
+        """종료. 아직 못 보낸 알림(예: '오류로 멈춥니다')은 잠깐 기다려 보내고 끝낸다."""
         if self._task is not None:
+            try:
+                await asyncio.wait_for(self._q.join(), grace)
+            except (asyncio.TimeoutError, Exception):
+                pass
             self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)

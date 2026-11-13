@@ -35,7 +35,12 @@ _POS_FIELDS = {f.name for f in fields(Position)}
 
 
 def store_dir(cfg: Config) -> Path:
-    return Path(cfg.data_dir) / (cfg.mode if cfg.market == "KRX" else f"{cfg.mode}-{cfg.market.lower()}")
+    """모드·시장·방식별 저장 폴더. 방식이 다르면 학습된 전략 파라미터와 기록 봉(분봉/일봉)이 전혀 다른 것이므로 섞지 않는다."""
+    name = cfg.mode if cfg.market == "KRX" else f"{cfg.mode}-{cfg.market.lower()}"
+    default_style = "intraday" if cfg.market == "KRX" else "swing"
+    if cfg.style != default_style:
+        name += f"-{cfg.style}"
+    return Path(cfg.data_dir) / name
 
 
 class Supervisor(Agent):
@@ -81,6 +86,7 @@ class Supervisor(Agent):
             self.executor.on_change = self._save_state
         if self.manual and hasattr(broker, "on_ticket"):
             broker.on_ticket = self._on_ticket
+            broker.on_late = self._on_late_fill
         broker.on_tick = e.on_tick                     # 큐 없이 직결: 수신 루프 → 엔진
         broker.on_day_start = self.day_start
         broker.on_day_end = self.day_end
@@ -103,6 +109,7 @@ class Supervisor(Agent):
         self._recon_ts = 0.0
         self._recon_prev: dict[str, int] = {}
         self._save_ts = 0.0
+        self._save_failed = False
         self._day_started: date | None = None
         self._day_ended: date | None = None
 
@@ -119,17 +126,21 @@ class Supervisor(Agent):
         if not self.broker.drives_clock:
             tasks.append(asyncio.create_task(self._scheduler(), name="scheduler"))
         if self.news is not None:
-            tasks.append(asyncio.create_task(self.news.run(), name="news"))
+            tasks.append(asyncio.create_task(self._aux("정보수집", self.news.run), name="news"))
         try:
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for t in done:
                 if t.get_name() != "stop" and t.exception() is not None:
                     log.error("작업 %s 오류로 종료: %r", t.get_name(), t.exception())
+                    n = len(self.engine.positions)
+                    self.notifier.send(f"⛔ 자동매매 프로그램이 오류로 멈춥니다({t.get_name()}: {t.exception()!r})."
+                                       + (f" 보유 종목 {n}개는 더 이상 감시되지 않습니다 — 직접 확인하세요." if n else ""))
                     raise t.exception()
         finally:
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            self.executor.stop_background()
             if self.live:                               # 걸려 있는 주문을 남긴 채 꺼지지 않는다
                 try:
                     await asyncio.wait_for(self.executor.cancel_all(), 8.0)
@@ -142,6 +153,19 @@ class Supervisor(Agent):
 
     def stop(self) -> None:
         self._stop.set()
+
+    async def _aux(self, name: str, fn) -> None:
+        """보조 작업(소식 수집 등)을 돌린다. 오류로 끝나도 매매는 계속하고, 잠시 뒤 그 작업만 다시 시작한다."""
+        while True:
+            try:
+                await fn()
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as ex:
+                log.exception("%s 작업 오류 — 30초 뒤 다시 시작", name)
+                self.engine.emit("system", "", f"{name} 오류(매매는 계속, 30초 뒤 다시 시작): {ex!r}"[:160])
+                await asyncio.sleep(30.0)
 
     # ------------------------------------------------------------------ 하루 일과
     async def day_start(self, d: date) -> None:
@@ -177,6 +201,7 @@ class Supervisor(Agent):
                 s.ind.reset_session()
                 if self.daily and warm and early:
                     s.undecided = True                # 장 초반에 켜졌다면 어제 봉에 대한 판단을 오늘 한다
+        self._mark_at_prev_close(now)
         if e.view_on:
             await self._backfill_view(syms, now)
         if self.news is not None:
@@ -188,6 +213,26 @@ class Supervisor(Agent):
         self._last_tick_wall = time.monotonic()
         self.note(f"{d} 장 시작 — {len(syms)}종목 감시 · 전략 v{e.p.version}", now)
         e.emit("system", "", f"{d} 장 시작 — 감시 {len(syms)}종목, 전략 v{e.p.version}")
+
+    def _mark_at_prev_close(self, now: float) -> None:
+        """오늘 시세를 아직 받지 않았다면 보유 종목을 '전일 종가'로 평가하고, 그 자산을 오늘 손익의 기준으로 삼는다.
+
+        며칠 꺼져 있다가 켜지면 장부의 마지막 가격은 꺼지던 때의 값이다. 그대로 두면 그 사이의 가격 변화가
+        전부 '오늘 하루의 손실'로 계산돼 일일 손실 한도(전량 청산)가 잘못 발동한다."""
+        e = self.engine
+        if not e.positions or e.day == self.m.local_day(now):
+            return                                    # 보유 없음, 또는 오늘 시세를 이미 받는 중(같은 날 재시작 포함)
+        moved = False
+        for sym in e.positions:
+            s = e.sym[sym]
+            if s.prev_close > 0 and s.prev_close != s.last:
+                s.last = s.prev_close
+                moved = True
+        if moved:
+            eq = e.cash + sum(p.qty * e.sym[p.symbol].last for p in e.positions.values())
+            e.day_start_equity = eq
+            e.risk.start_equity = eq
+            e.mark()
 
     async def _backfill_view(self, syms: list[str], now: float) -> None:
         """장중에 켜졌을 때 이미 지나간 분봉을 채워 실시간 차트가 비어 보이지 않게 한다(화면 전용, 매매 판단과 무관)."""
@@ -333,14 +378,7 @@ class Supervisor(Agent):
             if realtime:
                 k = self.m.now()
                 tod = k.hour * 3600 + k.minute * 60 + k.second
-                in_session = open_tod + 60 <= tod < close_tod
-                self.broker.expect_data = in_session
-                stale = in_session and mono - self._last_tick_wall > self.stale_sec
-                if stale != e.risk.feed_stale:
-                    e.risk.feed_stale = stale
-                    e.emit("risk", "", "시세 수신 지연 — 신규 매수 보류" if stale else "시세 수신 정상화")
-                    if stale:
-                        self.notifier.send("⚠ 시세 수신이 끊겼습니다 — 신규 매수를 보류합니다")
+                self._watch_feed(mono, open_tod + 60 <= tod < close_tod)
             if self.live:
                 if mono - self._recon_ts >= 60.0:
                     self._recon_ts = mono
@@ -348,8 +386,21 @@ class Supervisor(Agent):
                         await self.reconcile()
                     except Exception as ex:
                         e.emit("system", "", f"계좌 대사 실패: {ex!r}")
-                if mono - self._save_ts >= 60.0:        # 고점·한도 상태를 주기적으로 남긴다
-                    self._save_state()
+            if self.keep_state and mono - self._save_ts >= 60.0:
+                self._save_state()                      # 고점·추적 손절가·마지막 가격을 주기적으로 남긴다(체결이 없어도)
+
+    def _watch_feed(self, mono: float, in_session: bool) -> None:
+        """시세가 들어와야 할 시간인데 끊겼는지 본다. 끊기면 신규 매수를 보류하고 알린다."""
+        e = self.engine
+        if in_session and not self.broker.expect_data:
+            self._last_tick_wall = mono                 # 방금 장이 열렸다 — 지금부터 기다린다(장 전의 무소식은 끊김이 아니다)
+        self.broker.expect_data = in_session
+        stale = in_session and mono - self._last_tick_wall > self.stale_sec
+        if stale != e.risk.feed_stale:
+            e.risk.feed_stale = stale
+            e.emit("risk", "", "시세 수신 지연 — 신규 매수 보류" if stale else "시세 수신 정상화")
+            if stale:
+                self.notifier.send("⚠ 시세 수신이 끊겼습니다 — 신규 매수를 보류합니다")
 
     async def _market_update(self) -> None:
         try:
@@ -389,9 +440,17 @@ class Supervisor(Agent):
             return
         self._save_ts = time.monotonic()
         data = {"engine": self.engine.export_state(), "orders": self.executor.export(), "ts": time.time()}
-        tmp = self.dir / "state.tmp"
-        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(self.dir / "state.json")
+        try:
+            tmp = self.dir / "state.tmp"
+            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(self.dir / "state.json")
+        except OSError as ex:                           # 디스크 문제로 매매 루프가 죽으면 안 된다
+            if not self._save_failed:
+                self._save_failed = True
+                self.engine.emit("system", "", f"상태 저장 실패(매매는 계속): {ex!r}")
+                self.notifier.send(f"⚠ 상태 저장에 실패했습니다({ex!r}) — 디스크를 확인하세요. 이 상태로 재시작하면 장부가 어긋날 수 있습니다.")
+        else:
+            self._save_failed = False
 
     async def reconcile(self, initial: bool = False) -> None:
         """증권사 계좌와 내부 장부를 맞춘다. 봇이 산 종목만 관리하고 그 외 보유분은 건드리지 않는다."""
@@ -427,7 +486,14 @@ class Supervisor(Agent):
             self._save_state()
 
     async def _restore(self, acct) -> None:
-        """시작 시: 저장된 장부가 있으면 이어받고, 없으면 계좌 현금(운용 한도 이내)으로 새로 시작한다."""
+        """시작 시: 저장된 장부가 있으면 이어받고, 없으면 계좌 현금(운용 한도 이내)으로 새로 시작한다.
+
+        이어받는 순서가 중요하다(순서가 틀리면 멀쩡한 계좌를 '큰 손실'로 착각해 전량 청산이 나간다):
+          1) 장부를 저장된 그대로 되살린다. 보유 종목은 취득가가 아니라 저장 시점의 '마지막 가격'으로 평가한다.
+          2) 꺼져 있는 동안 체결된 주문을 그 장부에 반영한다.
+          3) 그다음에 계좌와 비교한다. 계좌에 없는 수량은 그냥 지우지 않고 '판 것'으로 정리(현금 반영)한 뒤
+             신규 매수를 멈추고 사람에게 알린다.
+        acct=None 은 주문 보조 모드(계좌를 조회할 수 없다 → 저장된 장부를 그대로 믿는다)."""
         e = self.engine
         f = self.dir / "state.json" if self.dir else None
         st = None
@@ -437,33 +503,33 @@ class Supervisor(Agent):
             except ValueError:
                 e.emit("system", "", "저장된 상태 파일을 읽을 수 없어 새로 시작합니다")
         cap = self.cfg.capital
-        if acct is None:                                # 주문 보조 모드: 계좌를 조회할 수 없다 → 저장된 장부를 믿는다
-            from .models import AccountSnapshot
-            held = {pd["symbol"]: (int(pd["qty"]), 0.0) for pd in (st or {}).get("engine", {}).get("positions", [])}
-            acct = AccountSnapshot(float("inf"), held)
         if not st or "engine" not in st:
-            e.cash = min(acct.cash, cap) if cap > 0 else acct.cash
-            e.equity = e.cash
-            e.day_start_equity = e.cash
-            e.risk.peak_equity = e.cash                 # 고점은 '설정 자본'이 아니라 실제 시작 자산에서 출발
-            e.risk.start_equity = e.cash
-            e.emit("system", "", f"계좌 연결 — 운용 현금 {self.m.money(e.cash, signed=False)}")
+            cash = cap if acct is None else (min(acct.cash, cap) if cap > 0 else acct.cash)
+            e.cash = cash
+            e.equity = cash
+            e.day_start_equity = cash
+            e.risk.peak_equity = cash                   # 고점은 '설정 자본'이 아니라 실제 시작 자산에서 출발
+            e.risk.start_equity = cash
+            e.emit("system", "", f"계좌 연결 — 운용 현금 {self.m.money(cash, signed=False)}")
             return
         es = st["engine"]
+        # 1) 저장된 장부 그대로
+        lasts = es.get("last") or {}
         for pd in es.get("positions", []):
-            bq = int(acct.positions.get(pd["symbol"], (0, 0.0))[0])
-            q = min(int(pd["qty"]), bq)
-            if q <= 0:
-                e.emit("risk", pd["symbol"], f"이전 실행의 {pd['symbol']} 포지션이 계좌에 없어 제외합니다")
-                continue
             pd = {k: v for k, v in pd.items() if k in _POS_FIELDS}
-            pd["cost"] = pd["cost"] * q / pd["qty"]
-            pd["qty"] = q
-            e.positions[pd["symbol"]] = Position(**pd)
-            e.symbol_state(pd["symbol"]).last = pd["avg_price"]
-        e.cash = max(0.0, min(float(es.get("cash", cap)), acct.cash))
+            if int(pd.get("qty", 0)) <= 0:
+                continue
+            pos = Position(**pd)
+            e.positions[pos.symbol] = pos
+            px = float(lasts.get(pos.symbol) or 0.0)
+            e.symbol_state(pos.symbol).last = px if px > 0 else pos.avg_price
+        e.cash = max(0.0, float(es.get("cash", cap)))
         e.realized_total = float(es.get("realized_total", 0.0))
         e.fees_total = float(es.get("fees_total", 0.0))
+        for sym, since in (es.get("since_loss") or {}).items():
+            st_sym = e.symbol_state(sym)                # 손실 청산 뒤 재진입 금지 기간을 이어 간다
+            st_sym.last_loss_bar = st_sym.bar_count - int(since)
+        e.exit_now.update(x for x in (es.get("exit_now") or []) if x in e.positions)
         eq = e.cash + sum(p.qty * e.sym[p.symbol].last for p in e.positions.values())
         same_day = int(es.get("day", -1)) == self.m.local_day(time.time())
         if same_day:                                    # 같은 거래일에 다시 켜졌다 → 당일 손익·한도 상태를 이어간다
@@ -472,13 +538,37 @@ class Supervisor(Agent):
             e.realized_day = float(es.get("realized_day", 0.0))
             e.trades_day = [t for t in self.history if self.m.local_day(t.exit_ts) == e.day]
         else:
-            e.day_start_equity = eq
+            e.day_start_equity = eq                     # 장전 준비 때 전일 종가 기준으로 다시 잡는다(_mark_at_prev_close)
+        e.equity = eq
         e.risk.start_equity = e.day_start_equity
         e.risk.peak_equity = eq
         e.risk.restore(es.get("risk", {}), same_day)
         e.risk.peak_equity = max(e.risk.peak_equity, eq)
+        # 2) 꺼져 있는 동안의 체결
+        saved_orders = st.get("orders", [])
+        n = await self.executor.recover(saved_orders) if self.live else 0
+        # 3) 계좌와 비교
+        mism = []
+        if acct is not None:
+            if saved_orders:
+                acct = await self.broker.get_account()  # 주문 정리(체결 반영·취소) 뒤의 계좌를 다시 본다
+            for sym, pos in list(e.positions.items()):
+                bq = int(acct.positions.get(sym, (0, 0.0))[0])
+                if bq < pos.qty:
+                    missing = pos.qty - bq
+                    last = e.sym[sym].last or pos.avg_price
+                    mism.append(f"{sym} 장부 {pos.qty}주 ≠ 계좌 {bq}주")
+                    # 그냥 지우면 그만큼의 자산이 사라진 것처럼 보여 낙폭 한도가 잘못 발동한다 → 판 것으로 기록
+                    e.on_fill(Fill(sym, SELL, missing, last, time.time(), reason="reconcile"))
+            if acct.cash < e.cash - max(1.0, 0.001 * e.cash):
+                e.emit("risk", "", f"계좌의 주문가능금액({self.m.money(acct.cash, signed=False)})이 장부 현금"
+                       f"({self.m.money(e.cash, signed=False)})보다 적습니다 — 매수 주문이 거부될 수 있습니다")
         e.mark()
-        n = await self.executor.recover(st.get("orders", [])) if self.live else 0
+        if mism:
+            msg = "계좌 대사(재시작): " + ", ".join(mism) + " — 모자란 수량은 마지막 가격에 판 것으로 정리했습니다"
+            e.emit("risk", "", msg)
+            e.risk.halt("장부·계좌 불일치 — 계좌 확인 후 [재개]", flatten=False)
+            self.notifier.send("⛔ " + msg + ". 신규 매수를 멈췄습니다. 계좌를 확인한 뒤 [재개]를 눌러 주세요.")
         e.emit("system", "", f"계좌 연결 — 장부 복원: 현금 {self.m.money(e.cash, signed=False)}, 포지션 "
                f"{len(e.positions)}개, 이어받은 체결 {n}건" + (" · 당일 한도 상태 유지" if same_day else ""))
         self._save_state()
@@ -507,23 +597,39 @@ class Supervisor(Agent):
         self._save_state()
         return msg
 
-    def manual_sell(self, symbol: str, qty: int | None, price: float) -> str:
-        """주문 보조 모드: 사용자가 봇의 제안 없이 증권사 앱에서 직접 판 것(걸어 둔 손절 주문 체결 등)을 장부에 반영."""
+    def _on_late_fill(self, t: dict, qty: int, price: float) -> tuple[bool, str]:
+        """주문 보조 모드: 만료·건너뛴 제안을 사람이 뒤늦게 체결했다고 알렸다 → 장부에 직접 반영한다."""
+        e = self.engine
+        sym, side = t["symbol"], t["side"]
+        if sym in e.pending:
+            return False, f"{sym} 에 새 주문 제안이 떠 있습니다 — 그 제안에서 처리하세요(장부에 반영되지 않았습니다)"
+        pos = e.positions.get(sym)
+        if side == SELL and (pos is None or qty > pos.qty):
+            return False, f"{sym} 보유 수량보다 많이 팔 수는 없습니다 — 장부에 반영되지 않았습니다"
+        s = e.symbol_state(sym)
+        s.last = s.last or price
+        e.on_fill(Fill(sym, side, qty, price, self.broker.now(), reason=t["reason"], ctx=dict(t.get("ctx") or {})))
+        e.emit("order", sym, f"만료된 제안의 늦은 체결 반영: {side} {qty}주 @ {self.m.px(price)}")
+        return True, f"{sym} {side} {qty}주 @ {self.m.px(price)} 늦은 체결 반영"
+
+    def manual_sell(self, symbol: str, qty: int | None, price: float) -> tuple[bool, str]:
+        """주문 보조 모드: 사용자가 봇의 제안 없이 증권사 앱에서 직접 판 것(걸어 둔 손절 주문 체결 등)을 장부에 반영.
+        (반영 여부, 메시지)"""
         if not self.manual:
-            return "주문 보조 모드에서만 쓸 수 있습니다"
+            return False, "주문 보조 모드에서만 쓸 수 있습니다"
         e = self.engine
         pos = e.positions.get(symbol)
         if pos is None:
-            return f"{symbol} 보유 기록이 없습니다"
+            return False, f"{symbol} 보유 기록이 없습니다"
         if symbol in e.pending:
-            return f"{symbol} 에 대기 중인 주문 제안이 있습니다 — 그 제안에서 [체결됨] 또는 [건너뜀]을 먼저 누르세요"
+            return False, f"{symbol} 에 대기 중인 주문 제안이 있습니다 — 그 제안에서 [체결됨] 또는 [건너뜀]을 먼저 누르세요"
         q = pos.qty if qty is None else int(qty)
         if q <= 0 or q > pos.qty or not price > 0:
-            return "수량·가격을 확인하세요"
+            return False, "수량·가격을 확인하세요 — 장부에 반영되지 않았습니다"
         if hasattr(self.broker, "plausible") and not self.broker.plausible(symbol, float(price), e.sym[symbol].last):
-            return "입력한 가격이 현재가와 너무 다릅니다 — 가격을 확인하세요"
+            return False, "입력한 가격이 현재가와 너무 다릅니다 — 가격을 확인하세요(장부에 반영되지 않았습니다)"
         e.on_fill(Fill(symbol, SELL, q, float(price), self.broker.now(), reason="manual_sell"))
-        return f"{symbol} {q}주 @ {self.m.px(price)} 직접 매도 반영"
+        return True, f"{symbol} {q}주 @ {self.m.px(price)} 직접 매도 반영"
 
     # ------------------------------------------------------------------ 대시보드 스냅샷
     def chart(self, symbol: str, since_ts: float = 0.0) -> dict | None:

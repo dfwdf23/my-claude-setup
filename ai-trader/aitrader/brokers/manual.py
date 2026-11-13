@@ -51,6 +51,9 @@ class ManualBroker(Broker):
         self.stale = 0                        # 너무 오래돼 버린 시세(지연·거래정지) 건수
         self.max_quote_age = 900.0            # 마지막 체결이 이보다 오래된 시세는 판단에 쓰지 않는다(초)
         self.on_ticket: Callable[[dict], None] = lambda t: None      # 새 주문 제안(알림용)
+        # 만료·건너뛴 제안을 사람이 뒤늦게 체결했다고 알릴 때(총괄이 장부에 직접 반영): (제안, 수량, 가격) → (성공, 메시지)
+        self.on_late: Callable[[dict, int, float], tuple[bool, str]] = lambda t, q, px: (False, "늦은 체결을 반영할 수 없습니다")
+        self.late_sec = cfg.manual.snooze_min * 60.0                  # 만료 뒤 이 시간까지는 늦은 체결 확인을 받는다
         self._oh, self._om = divmod(cfg.session.tod("open") // 60, 60)
 
     async def start(self) -> None:
@@ -150,7 +153,7 @@ class ManualBroker(Broker):
         t = {"id": tid, "symbol": order.symbol, "side": order.side, "qty": order.qty,
              "price": order.limit_price, "market": not order.limit_price, "reason": order.reason,
              "ref": self.last.get(order.symbol, 0.0), "created": time.time(), "status": "OPEN",
-             "stop": 0.0, "fill_qty": 0, "fill_price": 0.0}
+             "stop": 0.0, "fill_qty": 0, "fill_price": 0.0, "closed": 0.0, "ctx": dict(order.ctx or {})}
         sd = (order.ctx or {}).get("stop_dist")
         if sd and order.limit_price:
             t["stop"] = round(order.limit_price - sd, 4)              # 매수 제안에는 손절 예정가를 함께 보여 준다
@@ -163,41 +166,56 @@ class ManualBroker(Broker):
         t = self.tickets.get(order.broker_id)
         if t is None or t["status"] != "OPEN":
             raise BrokerError("이미 처리된 제안")
-        t["status"] = "EXPIRED"
+        t["status"], t["closed"] = "EXPIRED", time.time()
 
-    def confirm(self, tid: str, qty: int | None = None, price: float | None = None) -> str:
-        """사용자가 '직접 주문해서 체결됐다'고 알림. 수량·가격을 안 주면 제안값을 쓴다."""
+    def late_ok(self, t: dict, now: float | None = None) -> bool:
+        """만료·건너뛴 제안이라도 얼마 동안은 '사실은 체결했다'는 확인을 받는다(주문하느라 5분을 넘기는 일은 흔하다)."""
+        return t["status"] in ("EXPIRED", "SKIPPED") and (now or time.time()) - t["closed"] <= self.late_sec
+
+    def confirm(self, tid: str, qty: int | None = None, price: float | None = None) -> tuple[bool, str]:
+        """사용자가 '직접 주문해서 체결됐다'고 알림. 수량·가격을 안 주면 제안값을 쓴다. (반영 여부, 메시지)"""
         t = self.tickets.get(tid)
-        if t is None or t["status"] != "OPEN":
-            return "이미 처리됐거나 만료된 제안입니다"
+        if t is None:
+            return False, "없는 제안입니다"
+        late = self.late_ok(t)
+        if t["status"] != "OPEN" and not late:
+            return False, "이미 처리됐거나 만료된 지 오래된 제안입니다 — 장부에 반영되지 않았습니다"
         q = t["qty"] if qty is None else int(qty)
         px = float(price) if price else (t["price"] or self.last.get(t["symbol"], 0.0) or t["ref"])
         if q <= 0 or q > t["qty"] or not px > 0:
-            return "수량·가격을 확인하세요"
+            return False, "수량·가격을 확인하세요 — 장부에 반영되지 않았습니다"
         if not self.plausible(t["symbol"], px, t["price"] or t["ref"]):
-            return "입력한 가격이 현재가와 너무 다릅니다 — 가격을 확인하세요"
-        t["status"], t["fill_qty"], t["fill_price"] = "FILLED", q, px
+            return False, "입력한 가격이 현재가와 너무 다릅니다 — 가격을 확인하세요(장부에 반영되지 않았습니다)"
+        if late:                                                      # 주문은 이미 끝난 것으로 정리됐다 → 장부에 직접 반영
+            ok, msg = self.on_late(t, q, px)
+            if ok:
+                t["status"], t["fill_qty"], t["fill_price"] = "FILLED", q, px
+            return ok, msg
+        t["status"], t["fill_qty"], t["fill_price"], t["closed"] = "FILLED", q, px, time.time()
         self.on_fill(tid, q, px, time.time())
         if q < t["qty"]:
             self.on_cancel(tid)                                       # 남은 수량은 주문하지 않은 것으로 본다
-        return f"{t['symbol']} {t['side']} {q}주 @ {self.m.px(px)} 체결 반영"
+        return True, f"{t['symbol']} {t['side']} {q}주 @ {self.m.px(px)} 체결 반영"
 
     def plausible(self, symbol: str, px: float, ref: float = 0.0) -> bool:
         """잘못 입력한 가격(자릿수 실수 등)이 장부에 들어가지 않게: 현재가(없으면 기준가)와 20% 넘게 다르면 거부."""
         ref = self.last.get(symbol, 0.0) or ref
         return not ref > 0 or abs(px / ref - 1.0) <= 0.2
 
-    def skip(self, tid: str) -> str:
+    def skip(self, tid: str) -> tuple[bool, str]:
         t = self.tickets.get(tid)
         if t is None or t["status"] != "OPEN":
-            return "이미 처리됐거나 만료된 제안입니다"
-        t["status"] = "SKIPPED"
+            return False, "이미 처리됐거나 만료된 제안입니다"
+        t["status"], t["closed"] = "SKIPPED", time.time()
         self.on_cancel(tid)
-        return f"{t['symbol']} 제안을 건너뜀"
+        return True, f"{t['symbol']} 제안을 건너뜀"
 
     def tickets_view(self) -> list[dict]:
         now = time.time()
         out = []
         for t in list(self.tickets.values())[-20:][::-1]:
-            out.append({**t, "age": round(now - t["created"]), "ttl": self.cfg.manual.ticket_ttl_min * 60.0})
+            v = {k: x for k, x in t.items() if k != "ctx"}            # 내부용 정보는 화면으로 보내지 않는다
+            v.update(age=round(now - t["created"]), ttl=self.cfg.manual.ticket_ttl_min * 60.0,
+                     late_ok=self.late_ok(t, now), late_left=max(0, round(self.late_sec - (now - t["closed"]))))
+            out.append(v)
         return out

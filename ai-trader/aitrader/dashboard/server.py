@@ -9,6 +9,12 @@
 
 제어 API와 상태는 DASHBOARD_TOKEN 이 설정돼 있으면 토큰이 있어야 접근된다.
 토큰 없이 외부 주소(0.0.0.0 등)에 바인딩하는 것은 거부한다 — 누구나 매매를 멈추거나 풀 수 있게 되기 때문이다.
+
+브라우저를 통한 공격을 막는 장치:
+  · 출처 검사 — 다른 사이트의 화면이 사용자의 브라우저로 이 서버에 명령을 보내는 것(CSRF, 웹소켓 가로채기) 차단
+  · 호스트 이름 검사 — 내 컴퓨터에서만 여는 경우(127.0.0.1) localhost 계열 이름으로 온 요청만 받는다.
+    공격자가 자기 도메인을 127.0.0.1 로 바꿔치기해(DNS 리바인딩) '같은 출처'인 척하는 것을 막는다.
+  · 명령 본문은 JSON 만 — 단순 폼 전송으로 위장한 요청 차단
 """
 from __future__ import annotations
 
@@ -38,12 +44,24 @@ class Dashboard:
             raise ValueError("외부에서 접속 가능한 주소로 대시보드를 열려면 DASHBOARD_TOKEN 을 설정해야 합니다.")
         self.sup = supervisor
         self.host, self.port, self.token = host, port, token
-        self.app = web.Application()
+        self.local_only = host in LOOPBACK
+        self.app = web.Application(middlewares=[self._host_guard])
         self.app.add_routes([web.get("/", self.index), web.get("/ws", self.ws),
                              web.get("/api/state", self.state), web.get("/api/chart", self.chart),
                              web.post("/api/control", self.control), web.post("/api/ticket", self.ticket)])
         self.runner: web.AppRunner | None = None
         self.clients: set[web.WebSocketResponse] = set()
+
+    @web.middleware
+    async def _host_guard(self, req: web.Request, handler):
+        """내 컴퓨터에서만 여는 대시보드는 localhost 계열 이름으로 온 요청만 받는다(DNS 리바인딩 차단).
+        외부에 여는 경우에는 토큰이 필수라, 이름을 속인 화면이 와도 토큰을 모르면 아무것도 못 한다."""
+        if self.local_only:
+            host = req.headers.get("Host", "")
+            name = host[:host.index("]") + 1] if host.startswith("[") and "]" in host else host.rsplit(":", 1)[0]
+            if name.lower() not in ("127.0.0.1", "localhost", "[::1]"):
+                return web.Response(status=403, text="forbidden host")
+        return await handler(req)
 
     def _ok(self, req: web.Request) -> bool:
         if not self.token:
@@ -125,16 +143,17 @@ class Dashboard:
         except Exception:
             return web.json_response({"error": "bad request"}, status=400)
         if action == "fill":
-            msg = br.confirm(tid, qty, price)
+            ok, msg = br.confirm(tid, qty, price)
         elif action == "skip":
-            msg = br.skip(tid)
+            ok, msg = br.skip(tid)
         elif action == "sold":                           # 제안 없이 직접 판 것 — id 자리에 종목 코드
             if price is None:
                 return web.json_response({"error": "bad request"}, status=400)
-            msg = self.sup.manual_sell(tid.upper()[:16], qty, price)
+            ok, msg = self.sup.manual_sell(tid.upper()[:16], qty, price)
         else:
             return web.json_response({"error": "unknown action"}, status=400)
-        return web.json_response({"ok": True, "message": msg})
+        # 장부에 반영되지 않았으면 성공처럼 답하지 않는다 — 사람은 이미 실제로 주문했을 수 있다
+        return web.json_response({"ok": ok, "message": msg}, status=200 if ok else 409)
 
     async def ws(self, req: web.Request) -> web.StreamResponse:
         if not self._same_origin(req):

@@ -139,6 +139,10 @@ def _parse_time(s: str | None) -> float:
         return 0.0
 
 
+_XML_DECL = re.compile(rb"^\s*<\?xml[^>]*?encoding=[\"']([A-Za-z0-9._-]+)[\"'][^>]*\?>", re.I)
+_NATIVE_ENC = {"utf-8", "utf8", "us-ascii", "ascii", "iso-8859-1", "latin-1", "latin1", "utf-16"}
+
+
 def parse_feed(body: bytes, source: str) -> list[tuple[float, str, str]]:
     """RSS 2.0 / Atom 본문 → [(발행시각, 제목, 링크)]. 형식이 이상하면 빈 목록."""
     if len(body) > MAX_FEED_BYTES:
@@ -147,8 +151,13 @@ def parse_feed(body: bytes, source: str) -> list[tuple[float, str, str]]:
     if b"<!doctype" in head or b"<!entity" in head:      # 외부 엔티티·엔티티 폭탄 차단
         return []
     try:
-        root = ET.fromstring(body)
-    except ET.ParseError:
+        m = _XML_DECL.match(body[:300])
+        enc = m.group(1).decode("ascii").lower() if m else "utf-8"
+        if enc in _NATIVE_ENC:
+            root = ET.fromstring(body)
+        else:                                             # EUC-KR 같은 다중 바이트 인코딩은 파서가 못 읽는다 → 직접 풀어서 넘긴다
+            root = ET.fromstring(body[m.end():].decode(enc, errors="replace"))
+    except Exception:                                     # 깨진 문서·모르는 인코딩 — 소식 한 건 때문에 다른 일이 멈추면 안 된다
         return []
     out = []
     for it in root.iter("item"):                          # RSS
@@ -220,14 +229,20 @@ class NewsAgent(Agent):
                        [(f, "") for f in feeds if "{symbol}" not in f]
                 gap = max(1.0, self.nc.poll_sec / max(len(jobs), 1))
                 now = time.time()
-                if jobs:
-                    f, sym = jobs[k % len(jobs)]
-                    k += 1
-                    await self._poll_feed(f, sym, now)
-                if now - last_broker >= 60.0:
-                    last_broker = now
-                    await self._poll_broker(now)
-                await self.classify(now)
+                try:
+                    if jobs:
+                        f, sym = jobs[k % len(jobs)]
+                        k += 1
+                        await self._poll_feed(f, sym, now)
+                    if now - last_broker >= 60.0:
+                        last_broker = now
+                        await self._poll_broker(now)
+                    await self.classify(now)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as ex:                   # 소식 수집은 보조 기능 — 어떤 오류도 매매를 멈추게 하지 않는다
+                    self.fetch_errors += 1
+                    self.note(f"수집 오류: {ex!r}"[:80], now)
                 self.status = "warn" if self.fetch_errors > 20 and self.fetched == 0 else "ok"
                 await asyncio.sleep(gap)
         finally:

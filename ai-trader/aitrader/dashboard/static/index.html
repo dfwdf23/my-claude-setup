@@ -432,16 +432,21 @@ function renderNews(s) {
 }
 
 function renderTickets(s) {
-  const open = (s.tickets || []).filter(t => t.status === "OPEN");
+  // 열린 제안 + 만료됐지만 아직 '늦은 체결'을 받아 주는 제안
+  const open = (s.tickets || []).filter(t => t.status === "OPEN" || t.late_ok);
   $("tickets-card").className = "card c12" + (open.length ? " on" : "");
   if (!open.length) return;
   table($("tickets"), [
     ["종목", t => t.symbol], ["구분", t => span(t.side === "BUY" ? "매수" : "매도", t.side === "BUY" ? "up" : "down")],
     ["수량", t => num(t.qty, 0) + "주"], ["주문 방법", t => t.market ? "바로 체결(시장가 또는 현재가 근처)" : "지정가 " + px(t.price)],
     ["현재가", t => lastOf(t.symbol) ? px(lastOf(t.symbol)) : "–"],
-    ["손절 예정가", t => t.stop ? px(t.stop) : "–"], ["사유", t => REASON[t.reason] || t.reason], ["남은 시간", t => Math.max(0, Math.round((t.ttl - t.age) / 60 * 10) / 10) + "분"],
-    ["", t => { const w = el("span"); const f = el("button", {class: "sm", text: "체결됨"}), k = el("button", {class: "sm", text: "건너뜀"});
-      f.addEventListener("click", () => ticketFill(t)); k.addEventListener("click", () => ticket(t.id, "skip")); w.append(f, " ", k); return w; }],
+    ["손절 예정가", t => t.stop ? px(t.stop) : "–"], ["사유", t => REASON[t.reason] || t.reason],
+    ["남은 시간", t => t.status === "OPEN" ? Math.max(0, Math.round((t.ttl - t.age) / 60 * 10) / 10) + "분"
+      : (t.status === "EXPIRED" ? "만료됨" : "건너뜀") + " · 이미 체결했다면 " + Math.ceil(t.late_left / 60) + "분 안에 알려 주세요"],
+    ["", t => { const w = el("span"); const f = el("button", {class: "sm", text: t.status === "OPEN" ? "체결됨" : "사실은 체결됨"});
+      f.addEventListener("click", () => ticketFill(t)); w.append(f);
+      if (t.status === "OPEN") { const k = el("button", {class: "sm", text: "건너뜀"}); k.addEventListener("click", () => ticket(t.id, "skip")); w.append(" ", k); }
+      return w; }],
   ], open, "");
 }
 function ticketFill(t) {
@@ -462,9 +467,10 @@ function soldMyself(p) {
 async function post(path, body) {
   try {
     const r = await fetch(path, {method: "POST", headers: {"Content-Type": "application/json", "X-Token": token}, body: JSON.stringify(body)});
-    if (r.status === 401) alert("권한 없음 — 주소에 ?token=… 을 붙여 접속하세요.");
-    else if (!r.ok) alert("요청 실패 (" + r.status + ")");
-    else { const d = await r.json(); if (d.message) { console.info(d.message); if (/확인하세요|없습니다|먼저|이미/.test(d.message)) alert(d.message); } }
+    if (r.status === 401) { alert("권한 없음 — 주소에 ?token=… 을 붙여 접속하세요."); return; }
+    let d = null; try { d = await r.json(); } catch (e) {}
+    if (!r.ok || (d && d.ok === false)) alert("⚠ 장부에 반영되지 않았습니다.\n" + (d && d.message ? d.message : "요청 실패 (" + r.status + ")"));
+    else if (d && d.message) console.info(d.message);
   } catch (e) { alert("명령 전송 실패: " + e); }
 }
 const ticket = (id, action, qty, price) => post("/api/ticket", {id, action, qty, price});

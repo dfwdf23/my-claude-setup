@@ -207,9 +207,14 @@ class Executor(Agent):
     def poke(self, broker_id: str) -> None:
         """증권사가 '이 주문에 변화가 있다'고 알려 왔다 — 수량·가격은 조회로 확인한다(통보 내용을 그대로 믿지 않는다)."""
         o = self.by_bid.get(broker_id)
-        if o is not None and o.status == "ACK" and self.can_poll:
-            self.polled[o.id] = time.monotonic()
-            self._spawn(self._poll(o))
+        if o is not None:
+            if o.status == "ACK" and self.can_poll:
+                self.polled[o.id] = time.monotonic()
+                self._spawn(self._poll(o))
+            return
+        late = self.recent.get(broker_id)
+        if late is not None and self.can_poll:        # 이미 끝낸 주문에 변화 통보 → 뒤늦은 체결일 수 있으니 바로 조회
+            self._follow_up(late, once=True)
 
     def on_cancel(self, broker_id: str) -> None:
         """증권사·사람 쪽에서 취소된 주문(거부가 아니므로 '거부 반복' 정지 횟수에 넣지 않는다)."""
@@ -337,15 +342,16 @@ class Executor(Agent):
         self.engine.emit("risk", o.symbol, msg)
         self._changed()
 
-    def _follow_up(self, o: Order) -> None:
-        t = asyncio.get_running_loop().create_task(self._follow(o))
+    def _follow_up(self, o: Order, once: bool = False) -> None:
+        t = asyncio.get_running_loop().create_task(self._follow(o, (0.0,) if once else self.follow_delays))
         self._bg.add(t)
         t.add_done_callback(self._bg.discard)
 
-    async def _follow(self, o: Order) -> None:
+    async def _follow(self, o: Order, delays: tuple) -> None:
         """취소로 끝낸 주문을 얼마간 더 조회한다 — 취소 처리 직전에 체결된 수량이 뒤늦게 나타나는 경우를 잡는다."""
-        for delay in self.follow_delays:
-            await asyncio.sleep(delay)
+        for delay in delays:
+            if delay:
+                await asyncio.sleep(delay)
             if self.recent.get(o.broker_id) is not o:
                 return
             try:
