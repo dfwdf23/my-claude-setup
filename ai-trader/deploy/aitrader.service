@@ -1,0 +1,26 @@
+# systemd 서비스 — 서버가 재부팅되거나 프로그램이 죽어도 자동으로 다시 뜹니다.
+#   sudo cp deploy/aitrader.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now aitrader
+#   journalctl -u aitrader -f      # 로그 보기
+[Unit]
+Description=AI Auto Trader
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trader
+WorkingDirectory=/opt/ai-trader
+EnvironmentFile=/opt/ai-trader/.env
+Environment=TZ=Asia/Seoul
+ExecStart=/opt/ai-trader/.venv/bin/python -m aitrader run --mode kis-mock
+Restart=always
+RestartSec=5
+# 종료 신호를 받으면 상태를 저장하고 끝낼 시간을 준다
+TimeoutStopSec=20
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

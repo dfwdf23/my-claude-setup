@@ -1,0 +1,48 @@
+# config.toml 로 복사해 필요한 값만 바꾸세요. 적지 않은 항목은 기본값을 씁니다.
+mode = "sim"                 # sim | kis-mock | kis-live
+capital = 50000000           # sim: 시작 자본 / kis: 봇이 운용할 수 있는 최대 금액(계좌 잔고가 더 많아도 이만큼만)
+
+# 감시 후보. ETF는 매도 거래세가 없고 호가단위(5원)가 작아 잦은 매매에 유리합니다.
+universe = ["069500", "122630", "114800", "252670", "229200", "233740", "251340", "005930"]
+etfs     = ["069500", "122630", "114800", "252670", "229200", "233740", "251340"]
+inverse  = ["114800", "252670", "251340"]   # 인버스(시장 방향 계산 시 뒤집음)
+max_symbols = 8
+
+[session]
+entry_start = "09:05"        # 시초가 직후는 건너뜀
+entry_end = "14:50"          # 이후 신규 매수 없음
+flatten = "15:15"            # 당일 전량 청산 시각
+intraday_only = true         # false 면 다음 날로 보유(갭 위험 감수)
+
+[risk]                       # 학습 에이전트가 바꿀 수 없는 고정 한도
+risk_per_trade = 0.005       # 거래 1건이 손절될 때 잃는 금액 = 자산의 0.5%
+max_positions = 5
+max_weight = 0.20            # 종목당 최대 비중
+max_exposure = 0.80          # 총 주식 비중 상한
+max_daily_loss = 0.02        # 당일 -2% → 전량 청산 + 그날 매매 중단
+max_drawdown = 0.08          # 고점 대비 -8% → 완전 정지(대시보드에서 [재개]를 눌러야 풀림)
+max_trades_per_day = 40
+
+[fees]
+commission = 0.00015         # 본인 계좌 수수료율로 수정
+sell_tax = 0.0020            # 주식 매도 시 세금(ETF는 0으로 자동 처리)
+
+[llm]
+enabled = true
+model_market = "claude-opus-5-5"   # 장중 시장분석. 비용을 더 줄이려면 "claude-haiku-5-5"
+model_review = "claude-opus-5-5"   # 장후 복기(하루 1회)
+daily_token_budget = 60000         # 하루 토큰 상한 — 넘으면 규칙 기반으로만 동작
+market_min_interval_min = 30
+market_max_calls = 10
+
+[learn]
+enabled = true
+lookback_days = 10           # 개선안 검증에 쓰는 최근 거래일 수
+min_days_between_changes = 3
+
+[dashboard]
+host = "127.0.0.1"           # 외부 공개 시 "0.0.0.0" + DASHBOARD_TOKEN 필수
+port = 8787
+
+[sim]
+speed = 120                  # 시뮬레이션 배속

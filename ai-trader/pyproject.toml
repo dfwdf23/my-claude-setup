@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aitrader"
+version = "0.1.0"
+description = "AI 자동매매 시스템 — 빠른 규칙 엔진 + Claude 시장분석/복기 + 실시간 대시보드"
+requires-python = ">=3.11"
+dependencies = [
+    "aiohttp>=3.11",
+    "orjson>=3.10",
+    "anthropic>=1.0",
+    "cryptography>=42",
+    "uvloop>=0.21; sys_platform != 'win32'",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.24"]
+
+[project.scripts]
+aitrader = "aitrader.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["aitrader*"]
+
+[tool.setuptools.package-data]
+aitrader = ["dashboard/static/*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]

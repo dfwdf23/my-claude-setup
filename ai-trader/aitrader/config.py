@@ -1,0 +1,187 @@
+"""설정. config.toml(없으면 기본값) + 환경변수(비밀값)."""
+from __future__ import annotations
+
+import os
+import tomllib
+from dataclasses import dataclass, field, fields, is_dataclass
+from pathlib import Path
+
+
+def _tod(hhmm: str) -> int:
+    h, m = hhmm.split(":")
+    return int(h) * 3600 + int(m) * 60
+
+
+@dataclass
+class SessionCfg:
+    open: str = "09:00"
+    close: str = "15:30"
+    entry_start: str = "09:05"     # 시초가 변동성 구간은 건너뜀
+    entry_end: str = "14:50"       # 이후 신규 매수 금지
+    flatten: str = "15:15"         # intraday_only 일 때 전량 청산 시각
+    intraday_only: bool = True     # 당일 청산(오버나이트 위험 제거)
+    pre_open: str = "08:40"        # 장전 준비(종목선정·시장분석)
+    post: str = "15:40"            # 장후 복기
+
+    def tod(self, name: str) -> int:
+        return _tod(getattr(self, name))
+
+
+@dataclass
+class RiskCfg:
+    risk_per_trade: float = 0.005      # 거래당 위험 = 자산의 0.5%
+    max_positions: int = 5
+    max_weight: float = 0.20           # 종목당 최대 비중
+    max_exposure: float = 0.80         # 총 주식 비중 상한
+    cash_buffer: float = 0.02
+    max_daily_loss: float = 0.02       # 당일 -2% → 신규매수 중단 + 전량청산
+    max_drawdown: float = 0.08         # 고점 대비 -8% → 완전 정지(수동 해제 필요)
+    max_orders_per_min: int = 20
+    max_trades_per_day: int = 40
+    max_consec_losses: int = 4         # 연속 손실 시 냉각
+    cooldown_min: int = 20
+    max_order_notional: float = 20_000_000
+    price_band: float = 0.05           # 주문가가 현재가 ±5% 밖이면 거부
+    stale_feed_sec: float = 15.0       # 시세 끊김 감지
+    max_rejects_per_min: int = 5
+    order_timeout_sec: float = 10.0
+    min_stop_cost_mult: float = 4.0    # 손절폭(1R)은 왕복 거래비용의 최소 4배 — 비용에 먹히는 거래 방지
+
+
+@dataclass
+class FeeCfg:
+    commission: float = 0.00015        # 매수·매도 각각(증권사·계좌별로 다름 — 본인 요율로 수정)
+    sell_tax: float = 0.0020           # 매도 시 거래세+농특세(세법 개정 시 수정)
+    slippage_ticks: int = 1
+
+
+@dataclass
+class StrategyCfg:
+    bar_sec: int = 180                 # 3분봉. 1분봉은 손절폭이 거래비용에 묻혀 구조적으로 불리하다
+    ema_fast: int = 9
+    ema_slow: int = 21
+    rsi: int = 14
+    atr: int = 14
+    bb: int = 20
+    bb_k: float = 2.0
+    breakout: int = 20
+    vol_avg: int = 20
+    warmup_bars: int = 25
+
+
+@dataclass
+class LLMCfg:
+    enabled: bool = True
+    model_market: str = "claude-opus-5-5"
+    model_review: str = "claude-opus-5-5"
+    effort_market: str = "low"
+    effort_review: str = "medium"
+    daily_token_budget: int = 60_000   # 하루 입력+출력 토큰 상한 — 넘으면 규칙 기반으로만 동작
+    market_min_interval_min: int = 30  # 장중 시장분석 최소 호출 간격
+    market_max_calls: int = 10
+    timeout_sec: float = 60.0
+
+
+@dataclass
+class LearnCfg:
+    enabled: bool = True
+    lookback_days: int = 10            # 검증 재생에 쓰는 최근 거래일 수
+    min_trades: int = 8                # 이보다 표본이 적으면 파라미터를 건드리지 않음
+    min_improve: float = 0.05          # 후보가 기준 대비 이만큼 좋아야 채택
+    rollback_min_trades: int = 20
+    rollback_min_days: int = 2         # 새 버전을 최소 이틀은 지켜본 뒤 롤백 여부 판단
+    min_days_between_changes: int = 3  # 파라미터를 매일 바꾸면 효과를 측정할 수 없다
+
+
+@dataclass
+class DashCfg:
+    host: str = "127.0.0.1"
+    port: int = 8787
+    token: str = ""                    # 제어 API(정지/재개/청산) 보호용. 외부 공개 시 필수
+
+
+@dataclass
+class KISCfg:
+    env: str = "mock"                  # mock(모의투자) | real(실전)
+    app_key: str = ""
+    app_secret: str = ""
+    account: str = ""                  # 계좌번호 앞 8자리
+    product: str = "01"
+    hts_id: str = ""                   # 체결통보 수신용
+    exchange: str = "KRX"
+
+
+@dataclass
+class SimCfg:
+    speed: float = 120.0               # 시뮬레이션 배속(1 = 실시간)
+    tick_sec: float = 5.0
+    seed: int = 7
+    days: int = 0                      # 0 = 무한
+    latency_ms: float = 2.0            # 모의 주문 왕복 지연
+
+
+@dataclass
+class Config:
+    mode: str = "sim"                  # sim | kis-mock | kis-live
+    data_dir: str = "data"
+    capital: float = 50_000_000        # sim 시작 자본(원)
+    # 기본 종목: 유동성 큰 ETF 위주. ETF는 매도 시 거래세가 없고 호가단위(5원)가 작아
+    # 왕복 비용이 일반 주식의 1/4 수준이다 — 잦은 자동매매는 비용이 수익을 좌우한다.
+    universe: list = field(default_factory=lambda: [
+        "069500", "122630", "114800", "252670", "229200", "233740", "251340", "005930"])
+    etfs: list = field(default_factory=lambda: [
+        "069500", "122630", "114800", "252670", "229200", "233740", "251340"])
+    inverse: list = field(default_factory=lambda: ["114800", "252670", "251340"])   # 시장 방향 계산 시 뒤집는 종목
+    max_symbols: int = 8
+    session: SessionCfg = field(default_factory=SessionCfg)
+    risk: RiskCfg = field(default_factory=RiskCfg)
+    fees: FeeCfg = field(default_factory=FeeCfg)
+    strategy: StrategyCfg = field(default_factory=StrategyCfg)
+    llm: LLMCfg = field(default_factory=LLMCfg)
+    learn: LearnCfg = field(default_factory=LearnCfg)
+    dashboard: DashCfg = field(default_factory=DashCfg)
+    kis: KISCfg = field(default_factory=KISCfg)
+    sim: SimCfg = field(default_factory=SimCfg)
+
+
+def _merge(obj, data: dict) -> None:
+    names = {f.name for f in fields(obj)}
+    for k, v in data.items():
+        if k not in names:
+            raise ValueError(f"알 수 없는 설정 키: {k}")
+        cur = getattr(obj, k)
+        if is_dataclass(cur) and isinstance(v, dict):
+            _merge(cur, v)
+        else:
+            setattr(obj, k, type(cur)(v) if isinstance(cur, (int, float)) and not isinstance(cur, bool) else v)
+
+
+def load_dotenv(path: str = ".env") -> None:
+    p = Path(path)
+    if not p.exists():
+        return
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+def load_config(path: str | None = None) -> Config:
+    load_dotenv()
+    cfg = Config()
+    p = Path(path or "config.toml")
+    if p.exists():
+        _merge(cfg, tomllib.loads(p.read_text(encoding="utf-8")))
+    elif path:
+        raise FileNotFoundError(path)
+    env = os.environ
+    k = cfg.kis
+    k.app_key = env.get("KIS_APP_KEY", k.app_key)
+    k.app_secret = env.get("KIS_APP_SECRET", k.app_secret)
+    k.account = env.get("KIS_ACCOUNT", k.account)
+    k.product = env.get("KIS_PRODUCT", k.product)
+    k.hts_id = env.get("KIS_HTS_ID", k.hts_id)
+    cfg.dashboard.token = env.get("DASHBOARD_TOKEN", cfg.dashboard.token)
+    return cfg

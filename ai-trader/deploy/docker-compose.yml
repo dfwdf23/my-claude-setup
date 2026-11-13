@@ -1,0 +1,15 @@
+# 사용: (ai-trader 폴더에서)  docker compose -f deploy/docker-compose.yml up -d --build
+services:
+  aitrader:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["run", "--mode", "kis-mock", "--host", "0.0.0.0"]
+    env_file: ../.env            # DASHBOARD_TOKEN 필수(외부 바인딩)
+    volumes:
+      - ../data:/app/data        # 매매 일지·학습된 파라미터·토큰 캐시 보존
+      - ../config.toml:/app/config.toml:ro
+    ports:
+      - "127.0.0.1:8787:8787"    # 원격에서 보려면 SSH 터널 권장: ssh -L 8787:127.0.0.1:8787 서버
+    restart: unless-stopped
+    stop_grace_period: 20s
