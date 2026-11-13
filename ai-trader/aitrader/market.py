@@ -82,6 +82,47 @@ def get_market(code: str) -> Market:
         raise ValueError(f"알 수 없는 시장: {code} (KRX 또는 US)") from None
 
 
+def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
+    d = date(year, month, 1)
+    d += timedelta(days=(weekday - d.weekday()) % 7)
+    return d + timedelta(weeks=n - 1)
+
+
+def _easter(year: int) -> date:
+    a, b, c = year % 19, year // 100, year % 100
+    d, e = b // 4, b % 4
+    g = (8 * b + 13) // 25
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = c // 4, c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 19 * l) // 433
+    month = (h + l - 7 * m + 90) // 25
+    return date(year, month, (h + l - 7 * m + 33 * month + 19) % 32)
+
+
+def us_market_holidays(year: int) -> set[date]:
+    """뉴욕증권거래소·나스닥 정규 휴장일(규칙으로 계산). 임시 휴장(국장일 등)은 포함하지 않는다."""
+    def observed(d: date) -> date:
+        return d - timedelta(days=1) if d.weekday() == 5 else (d + timedelta(days=1) if d.weekday() == 6 else d)
+    last_mon_may = date(year, 5, 31)
+    last_mon_may -= timedelta(days=last_mon_may.weekday())
+    out = {
+        observed(date(year, 1, 1)), _nth_weekday(year, 1, 0, 3), _nth_weekday(year, 2, 0, 3),
+        _easter(year) - timedelta(days=2), last_mon_may, observed(date(year, 6, 19)),
+        observed(date(year, 7, 4)), _nth_weekday(year, 9, 0, 1), _nth_weekday(year, 11, 3, 4),
+        observed(date(year, 12, 25)),
+    }
+    if date(year + 1, 1, 1).weekday() == 5:               # 다음 해 1월 1일이 토요일이면 올해 12월 31일은 쉬지 않는다
+        out.discard(date(year, 12, 31))
+    return out
+
+
+def is_trading_day(market: "Market", d: date) -> bool:
+    if d.weekday() >= 5:
+        return False
+    return not (market.code == "US" and d in us_market_holidays(d.year))
+
+
 def next_weekday(d: date) -> date:
     d += timedelta(days=1)
     while d.weekday() >= 5:

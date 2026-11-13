@@ -72,20 +72,24 @@ def aes_cbc_decrypt(key: str, iv: str, b64: str) -> str:
 
 class KISBroker(Broker):
     name = "kis"
+    need_hts = True            # 국내: 체결통보(웹소켓)에 HTS ID 필요
+    TR_TABLE = TR
 
     def __init__(self, cfg: Config, base_url: str = "", ws_url: str = "") -> None:
         super().__init__()
         k = cfg.kis
         self.cfg = cfg
         self.env = "real" if k.env == "real" else "mock"
-        missing = [n for n, v in (("KIS_APP_KEY", k.app_key), ("KIS_APP_SECRET", k.app_secret),
-                                  ("KIS_ACCOUNT", k.account), ("KIS_HTS_ID", k.hts_id)) if not v]
+        need = [("KIS_APP_KEY", k.app_key), ("KIS_APP_SECRET", k.app_secret), ("KIS_ACCOUNT", k.account)]
+        if self.need_hts:
+            need.append(("KIS_HTS_ID", k.hts_id))
+        missing = [n for n, v in need if not v]
         if missing:
             raise SystemExit("한국투자증권 연동에 필요한 환경변수가 없습니다: " + ", ".join(missing)
                              + "\n(.env.example 참고. KIS_HTS_ID 는 체결통보 수신에 필요합니다)")
         self.base = base_url or REST[self.env]
         self.ws_base = ws_url or WS[self.env]
-        self.tr = TR[self.env]
+        self.tr = self.TR_TABLE[self.env]
         self.rl = RateLimiter(18.0 if self.env == "real" else 1.8)
         self.session: aiohttp.ClientSession | None = None
         self._tok = ""
@@ -96,6 +100,7 @@ class KISBroker(Broker):
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._approval = ""
         self._aes: tuple[str, str] | None = None
+        self._aes_by_tr: dict[str, tuple[str, str]] = {}
         self._raw: dict[str, tuple[str, str]] = {}       # 주문번호(정규화) → (주문조직번호, 원주문번호)
         self._day_cache: dict[str, float] = {}
         self._stop = False
@@ -416,8 +421,8 @@ class KISBroker(Broker):
                 return
 
     async def _recv(self, ws) -> None:
-        on_tick = self.on_tick
         notice = self.tr["notice"]
+        on_data = self._on_data
         async for msg in ws:
             self._last_msg = time.monotonic()
             if msg.type != aiohttp.WSMsgType.TEXT:
@@ -428,24 +433,8 @@ class KISBroker(Broker):
             c = raw[0]
             if c == "0" or c == "1":                     # 실시간 데이터: 암호화여부|TR|건수|본문
                 p = raw.split("|", 3)
-                if len(p) < 4:
-                    continue
-                if p[1] == "H0STCNT0":
-                    f = p[3].split("^")
-                    n = int(p[2]) if p[2].isdigit() else 1
-                    per = len(f) // n if n > 0 else len(f)
-                    for i in range(n):
-                        o = i * per
-                        try:
-                            if per > 43 and f[o + 43] != "0":          # 예상체결(동시호가 등)은 실제 체결이 아님
-                                continue
-                            t = f[o + 1]
-                            ts = (self._day_epoch(f[o + 33]) + int(t[:2]) * 3600 + int(t[2:4]) * 60 + int(t[4:6]))
-                            on_tick(Tick(f[o], ts, float(f[o + 2]), int(f[o + 12]), float(f[o + 11]), float(f[o + 10])))
-                        except (ValueError, IndexError):
-                            continue
-                elif p[1] == notice:
-                    self._on_notice(p[3], c == "1")
+                if len(p) >= 4:
+                    on_data(p[1], c == "1", p[2], p[3])
             else:                                        # 제어 메시지(JSON)
                 try:
                     d = _loads(raw)
@@ -457,10 +446,33 @@ class KISBroker(Broker):
                     continue
                 body = d.get("body") or {}
                 out = body.get("output") or {}
-                if tr_id == notice and out.get("key"):
-                    self._aes = (out["key"], out["iv"])
-                if body.get("rt_cd") not in (None, "0"):
-                    self.on_status(f"구독 응답 오류 {tr_id}: {body.get('msg1', '')}")
+                if out.get("key"):                       # 암호화 피드의 키는 TR별로 따로 온다
+                    self._aes_by_tr[tr_id] = (out["key"], out["iv"])
+                    if tr_id == notice:
+                        self._aes = (out["key"], out["iv"])
+                msg1 = str(body.get("msg1", ""))
+                if body.get("rt_cd") not in (None, "0") and "ALREADY IN SUBSCRIBE" not in msg1:
+                    self.on_status(f"구독 응답 오류 {tr_id}: {msg1}")
+
+    def _on_data(self, tr_id: str, encrypted: bool, count: str, payload: str) -> None:
+        """실시간 데이터 한 프레임 처리(국내: 체결가 H0STCNT0, 체결통보 H0STCNI0/9)."""
+        if tr_id == "H0STCNT0":
+            on_tick = self.on_tick
+            f = payload.split("^")
+            n = int(count) if count.isdigit() else 1
+            per = len(f) // n if n > 0 else len(f)
+            for i in range(n):
+                o = i * per
+                try:
+                    if per > 43 and f[o + 43] != "0":          # 예상체결(동시호가 등)은 실제 체결이 아님
+                        continue
+                    t = f[o + 1]
+                    ts = (self._day_epoch(f[o + 33]) + int(t[:2]) * 3600 + int(t[2:4]) * 60 + int(t[4:6]))
+                    on_tick(Tick(f[o], ts, float(f[o + 2]), int(f[o + 12]), float(f[o + 11]), float(f[o + 10])))
+                except (ValueError, IndexError):
+                    continue
+        elif tr_id == self.tr["notice"]:
+            self._on_notice(payload, encrypted)
 
     def _on_notice(self, payload: str, encrypted: bool) -> None:
         """체결통보: CNTG_YN=2 체결, RFUS_YN=1 거부."""

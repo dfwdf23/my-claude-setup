@@ -50,6 +50,7 @@ def test_default_config_is_us_swing_and_krx_still_available(tmp_path, monkeypatc
     assert cfg.market == "US" and cfg.style == "swing" and cfg.strategy.bar_sec == 86_400
     assert not cfg.session.intraday_only and "SQQQ" not in cfg.universe          # 인버스는 장기 보유 대상에서 제외
     assert ParamStore(None, cfg.params).current.take_profit_r == 5.0
+    assert cfg.learn.enabled and not cfg.learn.auto_apply                         # 복기는 하되 자동 적용은 기본으로 끔
     (tmp_path / "config.toml").write_text('market = "KRX"\n[risk]\nmax_positions = 3\n', encoding="utf-8")
     k = load_config()
     assert k.market == "KRX" and k.risk.max_positions == 3 and k.universe[0] == "069500"

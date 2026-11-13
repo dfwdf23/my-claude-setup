@@ -255,8 +255,10 @@ class NewsAgent(Agent):
             rows = await self.broker.get_news(40)
         except Exception:
             return
-        self.ingest([(float(r.get("ts") or now), str(r.get("title", "")), "", str(r.get("source") or self.broker.name),
-                      tuple(r.get("symbols") or ())) for r in rows if r.get("title")], now)
+        old = now - self.nc.max_age_min * 60.0 - 1.0     # '묵은 목록'으로 표시된 것은 화면에만 보이고 판단에는 안 쓴다
+        self.ingest([(old if r.get("stale") else float(r.get("ts") or now), str(r.get("title", "")), "",
+                      str(r.get("source") or self.broker.name), tuple(r.get("symbols") or ()))
+                     for r in rows if r.get("title")], now)
 
     def ingest(self, rows: list[tuple], now: float) -> int:
         """rows: (발행시각, 제목, 링크, 출처, 종목들). 새 소식 수를 돌려준다."""

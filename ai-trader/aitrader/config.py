@@ -91,11 +91,13 @@ class LLMCfg:
 
 @dataclass
 class LearnCfg:
-    enabled: bool = True
+    enabled: bool = True               # 장후 복기(손실 원인 분석·개선안 검증)
+    auto_apply: bool = True            # 검증을 통과한 개선안을 자동으로 적용할지(false 면 제안만 기록)
     lookback_days: int = 10            # 검증 재생에 쓰는 최근 거래일 수
     holdout_frac: float = 0.35         # 그중 가장 최근 구간은 '후보를 만들 때 보지 않은' 표본외 검증용
     min_trades: int = 8                # 이보다 표본이 적으면 파라미터를 건드리지 않음
     min_improve: float = 0.05          # 후보가 기준 대비 이만큼 좋아야 채택
+    min_trade_keep: float = 0.8        # 후보의 거래 수가 현재값의 이 비율보다 적으면 채택하지 않음
     rollback_min_trades: int = 20
     rollback_min_days: int = 2         # 새 버전을 최소 이틀은 지켜본 뒤 롤백 여부 판단
     min_days_between_changes: int = 3  # 파라미터를 매일 바꾸면 효과를 측정할 수 없다
@@ -225,6 +227,9 @@ class Config:
                           "stop_atr_mult": 2.5, "time_stop_bars": 60, "cooldown_bars": 5,
                           "rsi_overbought": 85.0, "max_ext_atr": 4.0, "max_day_gain_pct": 25.0}
             cfg.learn.lookback_days = 250          # 일봉이라 1년치 기록으로 검증
+            # 실제 5년 데이터 검증에서 자동 적용은 낙폭을 줄였지만(6.5%→4.0%) 수익도 줄였다(+23.7%→+13.8%).
+            # 수익 개선 근거가 없으므로 기본은 '분석·제안만'. 켜려면 config.toml 의 [learn] auto_apply = true
+            cfg.learn.auto_apply = False
             cfg.learn.min_days_between_changes = 20
             cfg.learn.rollback_min_trades = 10
             cfg.learn.rollback_min_days = 20

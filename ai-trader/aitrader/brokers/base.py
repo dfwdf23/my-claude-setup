@@ -31,6 +31,7 @@ class Broker:
         self.on_tick: Callable[[Tick], None] = lambda t: None
         self.on_fill: Callable[[str, int, float, float], None] = lambda bid, qty, px, ts: None
         self.on_reject: Callable[[str, str], None] = lambda bid, msg: None
+        self.on_poke: Callable[[str], None] = lambda bid: None   # "이 주문에 변화가 있다 — 지금 조회해 보라"
         self.on_day_start: Callable[[date], Awaitable[None]] = _noop
         self.on_day_end: Callable[[date], Awaitable[None]] = _noop
         self.on_status: Callable[[str], None] = lambda msg: None

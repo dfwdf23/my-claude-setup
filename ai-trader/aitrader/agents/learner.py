@@ -253,8 +253,9 @@ class Learner(Agent):
         best = None
         for name, p, why in cands:
             sd, sh, n, m = run(p)
-            # 설계 구간에서 뚜렷이 개선 + 표본외 구간에서도 개선 + 거래를 거의 안 하는 방식의 '개선'은 제외
-            ok = sd > need and sh > bh + 0.0002 and n >= 0.4 * b_n
+            # 설계 구간에서 뚜렷이 개선 + 표본외 구간에서도 개선 + 거래를 줄여서 얻는 '개선'은 제외
+            # (실제 5년 데이터 검증에서, 거래 수를 크게 줄이는 변경을 허용하면 낙폭은 줄지만 수익도 절반이 됐다)
+            ok = sd > need and sh > bh + 0.0002 and n >= self.cfg.learn.min_trade_keep * b_n
             table.append({"name": name, "design": round(sd, 5), "holdout": round(sh, 5), **m, "ok": ok})
             if ok and (best is None or sd + sh > best["score"]):
                 best = {"name": name, "params": p, "why": why, "score": sd + sh, "base": bd + bh,
@@ -322,7 +323,12 @@ class Learner(Agent):
         if cands and bars:
             best, table = await asyncio.to_thread(self.validate, p, cands, bars)
             report["tested"] = table
-            if best is not None:
+            if best is not None and not cfg.auto_apply:
+                changes = {k: list(v) for k, v in diff(p, best["params"]).items()}
+                report["proposed"] = {"name": best["name"], "changes": changes, "why": best["why"]}
+                report["lessons"].append("검증 통과 제안(자동 적용 꺼짐): " + best["name"] + " · " + ", ".join(
+                    f"{k} {a}→{b}" for k, (a, b) in changes.items()))
+            elif best is not None:
                 changes = {k: list(v) for k, v in diff(p, best["params"]).items()}
                 (d0, d1), (h0, h1) = best["design"], best["holdout"]
                 reason = (f"{best['name']} — {best['why']} "

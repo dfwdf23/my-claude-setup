@@ -46,6 +46,7 @@ class Executor(Agent):
         self._tasks: set = set()
         broker.on_fill = self.on_fill
         broker.on_reject = self.on_reject
+        broker.on_poke = self.poke
         engine.execute = self.submit
 
     # ------------------------------------------------------------------ 전송
@@ -160,6 +161,13 @@ class Executor(Agent):
                 self._finish(o, "FILLED")
             else:
                 self._changed()
+
+    def poke(self, broker_id: str) -> None:
+        """증권사가 '이 주문에 변화가 있다'고 알려 왔다 — 수량·가격은 조회로 확인한다(통보 내용을 그대로 믿지 않는다)."""
+        o = self.by_bid.get(broker_id)
+        if o is not None and o.status == "ACK" and self.can_poll:
+            self.polled[o.id] = time.monotonic()
+            self._spawn(self._poll(o))
 
     def on_reject(self, broker_id: str, msg: str) -> None:
         o = self.by_bid.get(broker_id)
