@@ -163,6 +163,7 @@ async def test_manual_ticket_confirm_skip_and_expiry(tmp_path):
 
     assert "확인" in br.confirm(t["id"], 11, 500.0)                      # 제안 수량보다 많게는 받지 않는다
     assert "확인" in br.confirm(t["id"], 6, -1)
+    assert "너무 다릅니다" in br.confirm(t["id"], 6, 4995.0) and not e.positions   # 자릿수를 잘못 넣은 가격은 거부
     msg = br.confirm(t["id"], 6, 499.5)
     assert "체결 반영" in msg and t["status"] == "FILLED"
     pos = e.positions["SPY"]
@@ -277,6 +278,9 @@ async def test_dashboard_ticket_chart_and_origin_guard(tmp_path, unused_tcp_port
             async with s.post(base + "/api/ticket", json={"id": "SPY", "action": "sold", "qty": "99", "price": "498"},
                               headers=h) as r:
                 assert "확인" in (await r.json())["message"] and e.positions["SPY"].qty == 10
+            async with s.post(base + "/api/ticket", json={"id": "SPY", "action": "sold", "qty": "4", "price": "49.8"},
+                              headers=h) as r:
+                assert "너무 다릅니다" in (await r.json())["message"] and e.positions["SPY"].qty == 10
             async with s.post(base + "/api/ticket", json={"id": "NOPE", "action": "sold", "qty": "1", "price": "5"},
                               headers=h) as r:
                 assert "없습니다" in (await r.json())["message"]

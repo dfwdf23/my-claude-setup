@@ -172,13 +172,20 @@ class ManualBroker(Broker):
             return "이미 처리됐거나 만료된 제안입니다"
         q = t["qty"] if qty is None else int(qty)
         px = float(price) if price else (t["price"] or self.last.get(t["symbol"], 0.0) or t["ref"])
-        if q <= 0 or q > t["qty"] or px <= 0:
+        if q <= 0 or q > t["qty"] or not px > 0:
             return "수량·가격을 확인하세요"
+        if not self.plausible(t["symbol"], px, t["price"] or t["ref"]):
+            return "입력한 가격이 현재가와 너무 다릅니다 — 가격을 확인하세요"
         t["status"], t["fill_qty"], t["fill_price"] = "FILLED", q, px
         self.on_fill(tid, q, px, time.time())
         if q < t["qty"]:
             self.on_cancel(tid)                                       # 남은 수량은 주문하지 않은 것으로 본다
         return f"{t['symbol']} {t['side']} {q}주 @ {self.m.px(px)} 체결 반영"
+
+    def plausible(self, symbol: str, px: float, ref: float = 0.0) -> bool:
+        """잘못 입력한 가격(자릿수 실수 등)이 장부에 들어가지 않게: 현재가(없으면 기준가)와 20% 넘게 다르면 거부."""
+        ref = self.last.get(symbol, 0.0) or ref
+        return not ref > 0 or abs(px / ref - 1.0) <= 0.2
 
     def skip(self, tid: str) -> str:
         t = self.tickets.get(tid)

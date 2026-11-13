@@ -520,6 +520,8 @@ class Supervisor(Agent):
         q = pos.qty if qty is None else int(qty)
         if q <= 0 or q > pos.qty or not price > 0:
             return "수량·가격을 확인하세요"
+        if hasattr(self.broker, "plausible") and not self.broker.plausible(symbol, float(price), e.sym[symbol].last):
+            return "입력한 가격이 현재가와 너무 다릅니다 — 가격을 확인하세요"
         e.on_fill(Fill(symbol, SELL, q, float(price), self.broker.now(), reason="manual_sell"))
         return f"{symbol} {q}주 @ {self.m.px(price)} 직접 매도 반영"
 
