@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from ..config import FeeCfg, RiskCfg, SessionCfg
-from ..indicators import round_tick, tick_size
+from ..market import KRX, Market
 from ..models import BUY, SELL, Features, OrderIntent, Position, Signal
 from ..params import StrategyParams
 from .base import Agent
@@ -17,15 +17,16 @@ class PositionSizer(Agent):
     name = "sizer"
     role = "비중조절"
 
-    def __init__(self, cfg: RiskCfg, fees: FeeCfg) -> None:
+    def __init__(self, cfg: RiskCfg, fees: FeeCfg, market: Market = KRX) -> None:
         super().__init__()
         self.cfg = cfg
         self.fees = fees
+        self.m = market
 
     def round_trip_cost(self, price: float, etf: bool, tax: float) -> float:
         """1주를 사고 팔 때 드는 비용(수수료 + 세금 + 호가 스프레드·슬리피지)."""
         return (price * (2 * self.fees.commission + tax)
-                + (2 * self.fees.slippage_ticks + 1) * tick_size(price, etf))
+                + (2 * self.fees.slippage_ticks + 1) * self.m.tick(price, etf))
 
     def size(self, price: float, atr: float, score: float, equity: float, cash: float,
              exposure: float, risk_mult: float, p: StrategyParams, etf: bool = False,
@@ -54,22 +55,25 @@ class BuyAgent(Agent):
     name = "buyer"
     role = "매수"
 
-    def __init__(self, fees: FeeCfg) -> None:
+    def __init__(self, fees: FeeCfg, market: Market = KRX) -> None:
         super().__init__()
         self.slip = fees.slippage_ticks
+        self.m = market
 
     def build(self, sig: Signal, f: Features, last: float, ask: float, qty: int,
               stop_dist: float, day_gain_pct: float, tod: float, regime_bias: str,
-              etf: bool = False) -> OrderIntent:
+              etf: bool = False, extra: dict | None = None) -> OrderIntent:
         self.calls += 1
         ref = ask if ask > 0 else last
-        limit = round_tick(ref + self.slip * tick_size(ref, etf), True, etf)
+        limit = self.m.round_tick(ref + self.slip * self.m.tick(ref, etf), True, etf)
         ctx = {"score": round(sig.score, 3), "stop_dist": stop_dist, "atr": f.atr,
                "rsi": round(f.rsi, 1), "ext_atr": round((f.close - f.ema_fast) / f.atr, 2) if f.atr else 0.0,
                "trend": sig.parts["trend"], "vol_ratio": round(f.vol_ratio, 2),
                "above_vwap": sig.parts["vwap"], "breakout": sig.parts["brk"],
                "day_gain": round(day_gain_pct, 2), "tod": int(tod), "regime": regime_bias,
                "signal_px": last}
+        if extra:
+            ctx.update(extra)
         return OrderIntent(sig.symbol, BUY, qty, limit, "entry", ctx)
 
 
@@ -78,13 +82,15 @@ class SellAgent(Agent):
     name = "seller"
     role = "매도"
 
-    def __init__(self, session: SessionCfg, fees: FeeCfg) -> None:
+    def __init__(self, session: SessionCfg, fees: FeeCfg, market: Market = KRX) -> None:
         super().__init__()
         self.flatten_tod = session.tod("flatten") if session.intraday_only else 10 ** 9
         self.slip = fees.slippage_ticks
+        self.m = market
 
     def on_tick(self, pos: Position, px: float, bid: float, tod: float,
-                flatten_all: bool, etf: bool = False) -> OrderIntent | None:
+                force: str = "", etf: bool = False) -> OrderIntent | None:
+        """force: 즉시 전량 청산 사유(risk_flatten, news_exit). 빈 문자열이면 평소 규칙."""
         self.calls += 1
         if px > pos.high:
             pos.high = px
@@ -96,12 +102,13 @@ class SellAgent(Agent):
                     pos.stop_kind = "trailing_stop"
         elif px < pos.low:
             pos.low = px
+        # limit_price 0 = 시장가(시장가가 없는 시장에서는 브로커가 '불리한 지정가'로 바꿔 낸다). 손절은 체결이 우선.
         if px <= pos.stop:
-            return OrderIntent(pos.symbol, SELL, pos.qty, 0.0, pos.stop_kind)     # 시장가: 손절은 체결이 우선
+            return OrderIntent(pos.symbol, SELL, pos.qty, 0.0, pos.stop_kind)
         if px >= pos.target:
             return self._limit(pos, px, bid, "take_profit", etf)
-        if flatten_all:
-            return OrderIntent(pos.symbol, SELL, pos.qty, 0.0, "risk_flatten")
+        if force:
+            return OrderIntent(pos.symbol, SELL, pos.qty, 0.0, force)
         if tod >= self.flatten_tod:
             return OrderIntent(pos.symbol, SELL, pos.qty, 0.0, "eod_flatten")
         return None
@@ -118,6 +125,6 @@ class SellAgent(Agent):
 
     def _limit(self, pos: Position, px: float, bid: float, reason: str, etf: bool) -> OrderIntent:
         ref = bid if bid > 0 else px
-        tk = tick_size(ref, etf)
-        limit = round_tick(max(ref - self.slip * tk, tk), False, etf)
+        tk = self.m.tick(ref, etf)
+        limit = self.m.round_tick(max(ref - self.slip * tk, tk), False, etf)
         return OrderIntent(pos.symbol, SELL, pos.qty, limit, reason)

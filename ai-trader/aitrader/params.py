@@ -19,7 +19,8 @@ class StrategyParams:
     rsi_overbought: float = 72.0    # 과매수 방지: 이 이상이면 매수 차단
     max_ext_atr: float = 2.5        # 과매수 방지: (종가-단기EMA)/ATR 상한 — 이격 과다
     max_day_gain_pct: float = 12.0  # 과매수 방지: 당일 급등 종목 추격 금지
-    vol_ratio_min: float = 1.2      # 거래량 확인 기준
+    vol_ratio_min: float = 1.2      # 거래량 확인 기준(봉 거래량 / 평균)
+    rvol_min: float = 0.7           # 상대 거래량 하한(평소 이 시각 대비 오늘 누적 거래량)
     stop_atr_mult: float = 2.0      # 손절폭 = ATR × 배수
     take_profit_r: float = 2.0      # 익절 = 손절폭의 몇 배(R)
     trail_start_r: float = 1.0      # 이만큼 수익 나면 추적손절 시작
@@ -37,6 +38,7 @@ BOUNDS: dict[str, tuple[float, float, float]] = {
     "max_ext_atr": (1.0, 4.0, 0.3),
     "max_day_gain_pct": (5.0, 25.0, 2.0),
     "vol_ratio_min": (0.8, 3.0, 0.2),
+    "rvol_min": (0.3, 3.0, 0.2),
     "stop_atr_mult": (1.0, 4.0, 0.3),
     "take_profit_r": (1.0, 5.0, 0.4),
     "trail_start_r": (0.5, 3.0, 0.3),
@@ -71,6 +73,12 @@ def diff(a: StrategyParams, b: StrategyParams) -> dict:
             for f in fields(a) if f.name != "version" and getattr(a, f.name) != getattr(b, f.name)}
 
 
+def _load(d: dict) -> StrategyParams:
+    """저장된 값에서 지금 버전이 아는 항목만 읽는다(버전이 달라도 깨지지 않게)."""
+    known = {f.name for f in fields(StrategyParams)}
+    return StrategyParams(**{k: v for k, v in d.items() if k in known})
+
+
 class ParamStore:
     """params.json 에 현재값과 변경 이력을 보관. 롤백 가능."""
 
@@ -80,7 +88,7 @@ class ParamStore:
         self.history: list[dict] = []
         if self.path and self.path.exists():
             data = json.loads(self.path.read_text(encoding="utf-8"))
-            self.current = StrategyParams(**data["current"])
+            self.current = _load(data["current"])
             self.history = data.get("history", [])
         if not self.history:
             self.history.append({"version": self.current.version, "params": asdict(self.current),
@@ -113,7 +121,7 @@ class ParamStore:
     def previous(self) -> StrategyParams | None:
         if len(self.history) < 2:
             return None
-        return StrategyParams(**self.history[-2]["params"])
+        return _load(self.history[-2]["params"])
 
     def rollback(self, reason: str) -> StrategyParams | None:
         prev = self.previous()

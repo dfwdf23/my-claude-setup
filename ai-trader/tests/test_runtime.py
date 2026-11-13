@@ -2,6 +2,7 @@
 import asyncio
 import json
 import sqlite3
+from datetime import date
 from types import SimpleNamespace
 
 import aiohttp
@@ -18,9 +19,13 @@ from aitrader.engine import Engine
 from aitrader.executor import Executor
 from aitrader.journal import Journal
 from aitrader.llm import LLM
+from aitrader.market import KRX
 from aitrader.models import BUY, Bar, OrderIntent, Tick
 from aitrader.params import ParamStore, StrategyParams
 from aitrader.supervisor import Supervisor
+
+
+T0 = KRX.epoch(date(2026, 1, 5), 10, 0)        # 월요일 10:00 KST (장중)
 
 
 def sim_cfg(tmp_path, days=2) -> Config:
@@ -129,7 +134,7 @@ def _exec_env():
     br = FakeBroker()
     e = Engine(cfg, StrategyParams(), 10_000_000)
     ex = Executor(br, e, timeout_sec=10.0)
-    e.on_tick(Tick("E", 1_000_000.0, 10_000, 1, 10_000, 10_005))
+    e.on_tick(Tick("E", T0, 10_000, 1, 10_000, 10_005))
     return br, e, ex
 
 
@@ -312,12 +317,17 @@ async def test_learner_review_validates_before_adopting(tmp_path):
 
 async def test_learner_needs_enough_samples(tmp_path):
     cfg = Config()
-    bars, trades = _recorded_days(cfg, n=2)
+    bars, trades = _recorded_days(cfg, n=4)
     store = ParamStore(None)
     ln = Learner(cfg, store, LLM(SimpleNamespace(enabled=False)), Journal(None))
     rep = await ln.review("d", trades[:3], trades[:3], bars, {}, 0.0)
     assert store.current.version == 1 and not rep["tested"]
     assert any("표본 부족" in x for x in rep["lessons"])
+    # 기록이 3거래일 미만이면 표본외 검증을 할 수 없으므로 아무것도 바꾸지 않는다
+    two_days = [b for b in bars if cfg.mkt.local_day(b.ts) <= cfg.mkt.local_day(bars[0].ts) + 1]
+    rep2 = await ln.review("d", trades, trades, two_days, {}, 0.0)
+    assert store.current.version == 1 and not rep2["tested"]
+    assert any("표본외 검증" in x for x in rep2["lessons"])
 
 
 def test_learner_throttle_and_rollback():

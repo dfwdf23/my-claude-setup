@@ -188,17 +188,23 @@ class Screener(Agent):
     role = "종목선정"
     kind = "slow"
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.bars: dict[str, list] = {}       # 종목별 일봉(장전 준비 때 일봉 맥락 계산에 재사용)
+
     async def select(self, broker: Broker, candidates: list[str], max_n: int, now: float) -> list[str]:
         self.calls += 1
         scored = []
         for sym in candidates:
             try:
-                bars = await broker.get_daily_bars(sym, 20)
+                bars = await broker.get_daily_bars(sym, 60)
             except Exception:
                 bars = []
+            self.bars[sym] = bars
             if len(bars) < 5:
                 scored.append((0.0, sym))               # 데이터가 없으면 설정 순서를 존중
                 continue
+            bars = bars[-20:]
             turnover = sum(b.close * b.volume for b in bars) / len(bars)
             rng = sum((b.high - b.low) / b.close for b in bars if b.close > 0) / len(bars)
             if rng < 0.004 or rng > 0.09:               # 너무 조용하거나 너무 거친 종목 제외

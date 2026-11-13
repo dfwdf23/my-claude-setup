@@ -1,4 +1,8 @@
-"""설정. config.toml(없으면 기본값) + 환경변수(비밀값)."""
+"""설정. config.toml(없으면 기본값) + 환경변수(비밀값).
+
+시장(market)에 따라 기본값이 달라진다: Config() 는 국내(KRX), Config.for_market("US") 는 미국.
+명령줄(load_config)은 config.toml 에 market 이 없으면 미국(US)을 기본으로 쓴다.
+"""
 from __future__ import annotations
 
 import os
@@ -6,14 +10,12 @@ import tomllib
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
 
-
-def _tod(hhmm: str) -> int:
-    h, m = hhmm.split(":")
-    return int(h) * 3600 + int(m) * 60
+from .market import Market, get_market, hhmm
 
 
 @dataclass
 class SessionCfg:
+    """모든 시각은 '거래소 현지 시각'(KRX=한국, US=뉴욕)."""
     open: str = "09:00"
     close: str = "15:30"
     entry_start: str = "09:05"     # 시초가 변동성 구간은 건너뜀
@@ -24,7 +26,7 @@ class SessionCfg:
     post: str = "15:40"            # 장후 복기
 
     def tod(self, name: str) -> int:
-        return _tod(getattr(self, name))
+        return hhmm(getattr(self, name))
 
 
 @dataclass
@@ -51,7 +53,7 @@ class RiskCfg:
 @dataclass
 class FeeCfg:
     commission: float = 0.00015        # 매수·매도 각각(증권사·계좌별로 다름 — 본인 요율로 수정)
-    sell_tax: float = 0.0020           # 매도 시 거래세+농특세(세법 개정 시 수정)
+    sell_tax: float = 0.0020           # 매도 시 세금·제비용(국내 주식 거래세 / 미국 SEC·TAF 수수료)
     slippage_ticks: int = 1
 
 
@@ -74,11 +76,15 @@ class LLMCfg:
     enabled: bool = True
     model_market: str = "claude-opus-5-5"
     model_review: str = "claude-opus-5-5"
+    model_news: str = "claude-opus-5-5"
     effort_market: str = "low"
     effort_review: str = "medium"
-    daily_token_budget: int = 60_000   # 하루 입력+출력 토큰 상한 — 넘으면 규칙 기반으로만 동작
+    effort_news: str = "low"
+    daily_token_budget: int = 150_000  # 하루 토큰 상한 — 넘으면 규칙 기반으로만 동작
     market_min_interval_min: int = 30  # 장중 시장분석 최소 호출 간격
     market_max_calls: int = 10
+    news_min_interval_min: int = 5     # 뉴스 일괄 분류 최소 간격
+    news_max_calls: int = 60
     timeout_sec: float = 60.0
 
 
@@ -86,11 +92,25 @@ class LLMCfg:
 class LearnCfg:
     enabled: bool = True
     lookback_days: int = 10            # 검증 재생에 쓰는 최근 거래일 수
+    holdout_frac: float = 0.35         # 그중 가장 최근 구간은 '후보를 만들 때 보지 않은' 표본외 검증용
     min_trades: int = 8                # 이보다 표본이 적으면 파라미터를 건드리지 않음
     min_improve: float = 0.05          # 후보가 기준 대비 이만큼 좋아야 채택
     rollback_min_trades: int = 20
     rollback_min_days: int = 2         # 새 버전을 최소 이틀은 지켜본 뒤 롤백 여부 판단
     min_days_between_changes: int = 3  # 파라미터를 매일 바꾸면 효과를 측정할 수 없다
+
+
+@dataclass
+class NewsCfg:
+    enabled: bool = True
+    poll_sec: float = 90.0             # 종목 전체를 한 바퀴 도는 주기
+    feeds: list = field(default_factory=list)   # RSS/Atom 주소. {symbol} 이 있으면 종목별로 호출
+    max_age_min: float = 90.0          # 이보다 오래된 소식은 매매 판단에 쓰지 않는다(화면에는 표시)
+    block_min: float = 30.0            # 악재 감지 후 해당 종목 신규 매수 차단 시간
+    half_life_min: float = 60.0        # 소식 점수가 절반으로 줄어드는 시간
+    exit_on_severe: bool = True        # Claude가 '심각한 악재'로 확인하면 보유분 청산
+    aliases: dict = field(default_factory=dict)  # 종목 → 회사명 목록(일반 뉴스에서 종목 찾기)
+    user_agent: str = "Mozilla/5.0 (compatible; aitrader-news)"
 
 
 @dataclass
@@ -108,7 +128,8 @@ class KISCfg:
     account: str = ""                  # 계좌번호 앞 8자리
     product: str = "01"
     hts_id: str = ""                   # 체결통보 수신용
-    exchange: str = "KRX"
+    exchange: str = "KRX"              # 국내 주문 거래소 구분
+    exchanges: dict = field(default_factory=dict)   # 해외: 종목 → 거래소(NAS/NYS/AMS). 없으면 자동 탐색
 
 
 @dataclass
@@ -117,15 +138,30 @@ class SimCfg:
     tick_sec: float = 5.0
     seed: int = 7
     days: int = 0                      # 0 = 무한
-    latency_ms: float = 2.0            # 모의 주문 왕복 지연
+    latency_ms: float = 2.0            # 모의 주문 왕복 지연(시뮬레이션 시간 기준)
+
+
+@dataclass
+class ManualCfg:
+    """주문 보조 모드: 봇이 주문 내용을 만들고 사람이 증권사 앱에서 직접 체결한다."""
+    feed: str = "yahoo"                # 시세 출처: yahoo(비공식·무료, 폴링) | kis
+    poll_sec: float = 20.0
+    ticket_ttl_min: float = 5.0        # 이 시간 안에 체결 입력이 없으면 주문 제안을 만료
+
+
+@dataclass
+class NotifyCfg:
+    telegram_token: str = ""
+    telegram_chat: str = ""
 
 
 @dataclass
 class Config:
-    mode: str = "sim"                  # sim | kis-mock | kis-live
+    mode: str = "sim"                  # sim | kis-mock | kis-live | manual
+    market: str = "KRX"                # KRX | US
     data_dir: str = "data"
-    capital: float = 50_000_000        # sim 시작 자본(원)
-    # 기본 종목: 유동성 큰 ETF 위주. ETF는 매도 시 거래세가 없고 호가단위(5원)가 작아
+    capital: float = 50_000_000        # sim 시작 자본 / 실매매: 봇이 쓸 수 있는 최대 금액
+    # 국내 기본 종목: 유동성 큰 ETF 위주. ETF는 매도 시 거래세가 없고 호가단위(5원)가 작아
     # 왕복 비용이 일반 주식의 1/4 수준이다 — 잦은 자동매매는 비용이 수익을 좌우한다.
     universe: list = field(default_factory=lambda: [
         "069500", "122630", "114800", "252670", "229200", "233740", "251340", "005930"])
@@ -139,9 +175,45 @@ class Config:
     strategy: StrategyCfg = field(default_factory=StrategyCfg)
     llm: LLMCfg = field(default_factory=LLMCfg)
     learn: LearnCfg = field(default_factory=LearnCfg)
+    news: NewsCfg = field(default_factory=NewsCfg)
     dashboard: DashCfg = field(default_factory=DashCfg)
     kis: KISCfg = field(default_factory=KISCfg)
     sim: SimCfg = field(default_factory=SimCfg)
+    manual: ManualCfg = field(default_factory=ManualCfg)
+    notify: NotifyCfg = field(default_factory=NotifyCfg)
+
+    @property
+    def mkt(self) -> Market:
+        return get_market(self.market)
+
+    @classmethod
+    def for_market(cls, code: str) -> "Config":
+        code = code.upper()
+        get_market(code)
+        if code == "KRX":
+            return cls()
+        cfg = cls(market="US", capital=30_000.0)
+        # 미국 기본 종목: 거래대금이 매우 크고 변동성이 충분한 ETF·대형주
+        cfg.universe = ["SPY", "QQQ", "TQQQ", "SQQQ", "SOXL", "SOXS", "NVDA", "TSLA", "AAPL", "MSFT", "AMD", "META"]
+        cfg.etfs = ["SPY", "QQQ", "TQQQ", "SQQQ", "SOXL", "SOXS"]
+        cfg.inverse = ["SQQQ", "SOXS"]
+        cfg.max_symbols = 12
+        cfg.session = SessionCfg(open="09:30", close="16:00", entry_start="09:40", entry_end="15:30",
+                                 flatten="15:50", intraday_only=True, pre_open="09:00", post="16:10")
+        cfg.risk.max_order_notional = 15_000.0
+        # 국내 증권사의 미국주식 온라인 수수료는 표준 0.25%(이벤트 적용 시 0.07~0.1%) — 본인 요율로 반드시 수정.
+        cfg.fees = FeeCfg(commission=0.0025, sell_tax=0.00003, slippage_ticks=2)
+        cfg.kis.exchange = "NASD"
+        cfg.kis.exchanges = {"SPY": "AMS", "QQQ": "NAS", "TQQQ": "NAS", "SQQQ": "NAS", "SOXL": "AMS",
+                             "SOXS": "AMS", "NVDA": "NAS", "TSLA": "NAS", "AAPL": "NAS", "MSFT": "NAS",
+                             "AMD": "NAS", "META": "NAS"}
+        cfg.news.feeds = [
+            "https://feeds.finance.yahoo.com/rss/2.0/headline?s={symbol}&region=US&lang=en-US",
+            "https://news.google.com/rss/search?q={symbol}+stock+when:1d&hl=en-US&gl=US&ceid=US:en",
+        ]
+        cfg.news.aliases = {"NVDA": ["Nvidia"], "TSLA": ["Tesla"], "AAPL": ["Apple"], "MSFT": ["Microsoft"],
+                            "AMD": ["Advanced Micro Devices"], "META": ["Meta Platforms"]}
+        return cfg
 
 
 def _merge(obj, data: dict) -> None:
@@ -152,8 +224,16 @@ def _merge(obj, data: dict) -> None:
         cur = getattr(obj, k)
         if is_dataclass(cur) and isinstance(v, dict):
             _merge(cur, v)
+        elif isinstance(cur, bool):
+            if not isinstance(v, bool):
+                raise ValueError(f"{k} 는 true/false 여야 합니다")
+            setattr(obj, k, v)
+        elif isinstance(cur, (int, float)) and isinstance(v, (int, float)) and not isinstance(v, bool):
+            setattr(obj, k, type(cur)(v))
+        elif type(v) is type(cur) or cur is None:
+            setattr(obj, k, v)
         else:
-            setattr(obj, k, type(cur)(v) if isinstance(cur, (int, float)) and not isinstance(cur, bool) else v)
+            raise ValueError(f"{k} 의 값 형식이 맞지 않습니다: {type(v).__name__} (필요: {type(cur).__name__})")
 
 
 def load_dotenv(path: str = ".env") -> None:
@@ -165,17 +245,22 @@ def load_dotenv(path: str = ".env") -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, v = line.split("=", 1)
-        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+        v = v.split(" #", 1)[0].strip().strip('"').strip("'")     # 값 뒤의 주석 제거
+        if v:
+            os.environ.setdefault(k.strip(), v)
 
 
-def load_config(path: str | None = None) -> Config:
+def load_config(path: str | None = None, market: str | None = None) -> Config:
     load_dotenv()
-    cfg = Config()
     p = Path(path or "config.toml")
+    data: dict = {}
     if p.exists():
-        _merge(cfg, tomllib.loads(p.read_text(encoding="utf-8")))
+        data = tomllib.loads(p.read_text(encoding="utf-8"))
     elif path:
         raise FileNotFoundError(path)
+    cfg = Config.for_market(market or data.get("market", "US"))
+    data.pop("market", None)
+    _merge(cfg, data)
     env = os.environ
     k = cfg.kis
     k.app_key = env.get("KIS_APP_KEY", k.app_key)
@@ -184,4 +269,6 @@ def load_config(path: str | None = None) -> Config:
     k.product = env.get("KIS_PRODUCT", k.product)
     k.hts_id = env.get("KIS_HTS_ID", k.hts_id)
     cfg.dashboard.token = env.get("DASHBOARD_TOKEN", cfg.dashboard.token)
+    cfg.notify.telegram_token = env.get("TELEGRAM_BOT_TOKEN", cfg.notify.telegram_token)
+    cfg.notify.telegram_chat = env.get("TELEGRAM_CHAT_ID", cfg.notify.telegram_chat)
     return cfg

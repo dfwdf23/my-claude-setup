@@ -15,6 +15,7 @@ class Tick:
     volume: int        # 이 틱의 체결량
     bid: float = 0.0
     ask: float = 0.0
+    cum_volume: int = 0     # 거래소가 주는 당일 누적 거래량(있으면 이 값을 신뢰)
 
 
 @dataclass(slots=True)
@@ -147,6 +148,15 @@ class Regime:
     source: str = "rule"         # rule | llm
     ts: float = 0.0
     avoid: frozenset = frozenset()
+
+
+@dataclass(slots=True)
+class NewsState:
+    """정보수집 에이전트가 종목별로 유지하는 소식 상태. 핫패스는 읽기만 한다."""
+    score: float = 0.0           # 최근 소식 점수(음수 = 악재). 시간이 지나면 0으로 감쇠
+    ts: float = 0.0
+    block_until: float = 0.0     # 이 시각까지 신규 매수 차단
+    headline: str = ""
 
 
 @dataclass(slots=True)

@@ -22,6 +22,8 @@ CREATE TABLE IF NOT EXISTS lessons(ts REAL, day TEXT, source TEXT, text TEXT, ch
 CREATE TABLE IF NOT EXISTS llm_usage(ts REAL, role TEXT, model TEXT, input INTEGER, output INTEGER,
   cache_read INTEGER, cache_write INTEGER, cost REAL);
 CREATE TABLE IF NOT EXISTS events(ts REAL, kind TEXT, text TEXT);
+CREATE TABLE IF NOT EXISTS news(id TEXT PRIMARY KEY, ts REAL, source TEXT, symbols TEXT, title TEXT, url TEXT,
+  rule REAL, impact INTEGER, kind TEXT);
 CREATE INDEX IF NOT EXISTS bars_ts ON bars(ts);
 """
 
@@ -33,6 +35,7 @@ _SQL = {
     "lessons": "INSERT INTO lessons VALUES(?,?,?,?,?)",
     "llm_usage": "INSERT INTO llm_usage VALUES(?,?,?,?,?,?,?,?)",
     "events": "INSERT INTO events VALUES(?,?,?)",
+    "news": "INSERT OR REPLACE INTO news VALUES(?,?,?,?,?,?,?,?,?)",
 }
 
 
@@ -78,6 +81,10 @@ class Journal:
 
     def event(self, ts: float, kind: str, text: str) -> None:
         self._put("events", (ts, kind, text))
+
+    def news(self, it) -> None:
+        self._put("news", (it.id, it.ts, it.source, ",".join(it.symbols), it.title, it.url, it.rule,
+                           it.impact, it.kind or ",".join(it.tags)))
 
     def _run(self) -> None:
         con = sqlite3.connect(self.path)

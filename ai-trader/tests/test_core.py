@@ -227,8 +227,8 @@ def test_backtest_deterministic_and_consistent():
 def test_bars_to_ticks_roundtrip():
     bars = [Bar("X", 0.0, 100, 110, 95, 105, 1000), Bar("X", 180.0, 105, 106, 90, 92, 500)]
     ticks = list(bars_to_ticks(bars, 180.0))
-    assert [t.price for t in ticks[:4]] == [100, 95, 110, 105]         # 양봉: 저가 먼저
-    assert [t.price for t in ticks[4:]] == [105, 106, 90, 92]          # 음봉: 고가 먼저
+    assert [t.price for t in ticks[:4]] == [100, 95, 110, 105]         # 항상 시가→저가→고가→종가
+    assert [t.price for t in ticks[4:]] == [105, 90, 106, 92]          # 음봉도 저가 먼저(매수 전용 전략에 불리한 쪽)
     assert sum(t.volume for t in ticks[:4]) == 1000
 
 

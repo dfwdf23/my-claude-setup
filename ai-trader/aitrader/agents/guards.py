@@ -79,13 +79,40 @@ class RiskManager(Agent):
         self.flatten_all = self.flatten_all or flatten
         self.status = "halt"
 
-    def resume(self) -> None:
+    def resume(self, equity: float = 0.0) -> None:
+        """수동 재개. 기준점을 현재 자산으로 다시 잡는다 — 그러지 않으면 낙폭·일일 손실이
+        여전히 한도를 넘은 상태라 재개하자마자 다시 정지된다."""
         self.halted = False
         self.halt_reason = ""
         self.flatten_all = False
         self.day_stop = False
         self.status = "ok"
         self.reject_ts.clear()
+        if equity > 0:
+            self.peak_equity = equity
+            self.start_equity = equity
+            self.drawdown = 0.0
+
+    def export(self) -> dict:
+        return {"halted": self.halted, "halt_reason": self.halt_reason, "day_stop": self.day_stop,
+                "flatten_all": self.flatten_all, "peak_equity": self.peak_equity,
+                "start_equity": self.start_equity, "trades_today": self.trades_today,
+                "consec_losses": self.consec_losses, "cooldown_until": self.cooldown_until}
+
+    def restore(self, d: dict, same_day: bool) -> None:
+        """재시작 후 복원. 정지 상태와 고점은 항상, 당일 한도 상태는 같은 거래일일 때만 되살린다."""
+        self.peak_equity = float(d.get("peak_equity", self.peak_equity))
+        if d.get("halted"):
+            self.halt(d.get("halt_reason") or "이전 실행에서 정지됨", flatten=bool(d.get("flatten_all")))
+        if same_day:
+            self.start_equity = float(d.get("start_equity", self.start_equity))
+            self.trades_today = int(d.get("trades_today", 0))
+            self.consec_losses = int(d.get("consec_losses", 0))
+            self.cooldown_until = float(d.get("cooldown_until", 0.0))
+            if d.get("day_stop"):
+                self.day_stop = True
+                self.flatten_all = True
+                self.status = "warn"
 
     def check_limits(self, equity: float) -> str:
         """주기적으로 호출. 한도 위반 시 사유를 돌려주고 내부 상태를 정지로 바꾼다."""

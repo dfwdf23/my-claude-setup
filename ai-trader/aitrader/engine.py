@@ -4,10 +4,13 @@
 
 에이전트 사이에 큐·네트워크·LLM 호출이 하나도 없다. 그래서 틱 수신부터 주문 결정까지
 수~수십 마이크로초에 끝난다. 실매매·모의·백테스트가 전부 이 같은 코드를 쓴다.
+시장(KRX/US)에 따라 달라지는 것은 cfg.mkt(시장 프로필)에서만 가져온다.
 """
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import asdict
+from math import pi, sin
 from time import perf_counter_ns
 from typing import Callable
 
@@ -16,11 +19,11 @@ from .agents.guards import OverboughtGuard, RiskManager
 from .agents.trade import BuyAgent, PositionSizer, SellAgent
 from .config import Config
 from .indicators import IndicatorSet
-from .models import BUY, Bar, Features, Fill, OrderIntent, Position, Regime, Tick, Trade
+from .models import BUY, Bar, Features, Fill, NewsState, OrderIntent, Position, Regime, Tick, Trade
 from .params import StrategyParams
 
-KST = 32400.0
 DAY = 86400.0
+TWO_PI = 2.0 * pi
 
 
 class LatencyStats:
@@ -48,11 +51,12 @@ class LatencyStats:
 
 class SymState:
     __slots__ = ("symbol", "last", "bid", "ask", "ind", "f", "bar_start", "o", "h", "l", "c", "v",
-                 "day_open", "bar_count", "last_loss_bar", "retry_after", "score", "etf", "tax")
+                 "day_open", "bar_count", "last_loss_bar", "retry_after", "score", "etf", "tax",
+                 "cum_vol", "prev_close", "prev_high", "avg_dvol", "dtrend", "rvol", "hist")
 
     def __init__(self, symbol: str, cfg, etf: bool = False, tax: float = 0.0) -> None:
         self.symbol = symbol
-        self.etf = etf            # ETF: 호가단위 5원, 매도 거래세 없음
+        self.etf = etf            # 국내 ETF: 호가단위 5원, 매도 거래세 없음
         self.tax = tax
         self.last = 0.0
         self.bid = 0.0
@@ -67,12 +71,21 @@ class SymState:
         self.last_loss_bar = -10 ** 9
         self.retry_after = 0.0
         self.score = 0.0
+        self.cum_vol = 0          # 당일 누적 거래량
+        # 일봉 맥락(장전 준비 때 채움). 없으면 0 → 해당 요소는 중립으로 처리
+        self.prev_close = 0.0
+        self.prev_high = 0.0
+        self.avg_dvol = 0.0       # 최근 20일 평균 일거래량
+        self.dtrend = 0.5         # 일봉 추세: 1 상승 정배열, 0 하락 역배열, 0.5 중립/모름
+        self.rvol = -1.0          # 상대 거래량(평소 같은 시각 대비). -1 = 모름
+        self.hist: deque = deque(maxlen=400)   # 차트 표시용 최근 봉(지표 포함)
 
 
 class Engine:
     def __init__(self, cfg: Config, params: StrategyParams, cash: float,
                  execute: Callable[[OrderIntent], None] | None = None, quiet: bool = False) -> None:
         self.cfg = cfg
+        self.m = cfg.mkt
         self.p = params
         self.cash = cash
         self.execute = execute or (lambda it: None)
@@ -80,21 +93,29 @@ class Engine:
         self.bar_sec = float(cfg.strategy.bar_sec)
         self.commission = cfg.fees.commission
         self.sell_tax = cfg.fees.sell_tax
-        self.etfs = frozenset(cfg.etfs)
-        self.close_tod = cfg.session.tod("close")
+        self.etfs = frozenset(cfg.etfs) if cfg.market == "KRX" else frozenset()
+        self.open_tod = float(cfg.session.tod("open"))
+        self.close_tod = float(cfg.session.tod("close"))
+        self.session_len = max(self.close_tod - self.open_tod, 1.0)
+        self.tz_off = 0.0             # (현지 − UTC) 초. 한 시간에 한 번만 다시 계산
+        self._tz_until = 0.0
         # 에이전트
         self.chart = ChartAnalyst()
         self.guard = OverboughtGuard()
-        self.sizer = PositionSizer(cfg.risk, cfg.fees)
-        self.buyer = BuyAgent(cfg.fees)
-        self.seller = SellAgent(cfg.session, cfg.fees)
+        self.sizer = PositionSizer(cfg.risk, cfg.fees, self.m)
+        self.buyer = BuyAgent(cfg.fees, self.m)
+        self.seller = SellAgent(cfg.session, cfg.fees, self.m)
         self.risk = RiskManager(cfg.risk, cfg.session)
         self.agents = [self.chart, self.guard, self.sizer, self.buyer, self.seller, self.risk]
         self.regime = Regime()
+        self.news: dict[str, NewsState] = {}   # 정보수집 에이전트가 갱신(종목별 소식 상태)
+        self.exit_now: set[str] = set()        # 심각한 악재로 즉시 청산할 종목
         # 상태
         self.sym: dict[str, SymState] = {}
         self.positions: dict[str, Position] = {}
         self.pending: dict[str, OrderIntent] = {}
+        self._resv: dict[str, float] = {}      # 진행 중 매수 주문이 잡아 둔 금액
+        self.reserved = 0.0
         self.now = 0.0
         self.day = -1
         self.equity = cash
@@ -109,10 +130,12 @@ class Engine:
         self._mark_ts = 0.0
         self._eq_pt_ts = 0.0
         self.ticks = 0
+        self.fill_seq = 0                      # 체결이 반영될 때마다 증가(계좌 대사의 '장부 버전')
+        self.hook_errors = 0
         self.lat = LatencyStats()
         self.events: deque = deque(maxlen=400)
         self._seq = 0
-        # 외부 훅(저널·학습) — 없으면 None
+        # 외부 훅(저널·상태 저장) — 없으면 None. 훅의 예외는 매매 경로를 끊지 않는다.
         self.on_bar_cb: Callable[[Bar], None] | None = None
         self.on_trade_cb: Callable[[Trade], None] | None = None
         self.on_fill_cb: Callable[[Fill], None] | None = None
@@ -127,6 +150,14 @@ class Engine:
         self.events.append({"seq": self._seq, "ts": self.now, "kind": kind, "symbol": symbol,
                             "text": text, **data})
 
+    def _hook(self, cb, arg) -> None:
+        try:
+            cb(arg)
+        except Exception as e:                     # 일지·상태 저장 실패가 주문 처리를 막으면 안 된다
+            self.hook_errors += 1
+            if self.hook_errors <= 20:
+                self.emit("system", "", f"기록 훅 오류(매매는 계속): {e!r}")
+
     def symbol_state(self, symbol: str) -> SymState:
         s = self.sym.get(symbol)
         if s is None:
@@ -137,13 +168,38 @@ class Engine:
     def set_params(self, p: StrategyParams) -> None:
         self.p = p                                # 참조 교체 한 번 — 핫패스는 잠금이 필요 없다
 
+    def set_daily(self, symbol: str, bars: list[Bar]) -> None:
+        """일봉 맥락(전일 종가·고가, 평균 거래량, 일봉 추세). bars 는 '어제까지'의 일봉, 오래된 순."""
+        s = self.symbol_state(symbol)
+        if len(bars) < 5:
+            return
+        closes = [b.close for b in bars]
+        s.prev_close = closes[-1]
+        s.prev_high = bars[-1].high
+        vols = [b.volume for b in bars[-20:]]
+        s.avg_dvol = sum(vols) / len(vols)
+        ma20 = sum(closes[-20:]) / len(closes[-20:])
+        ma50 = sum(closes[-50:]) / len(closes[-50:])
+        c = closes[-1]
+        s.dtrend = 1.0 if c > ma20 > ma50 else (0.0 if c < ma20 < ma50 else 0.5)
+
+    def _refresh_tz(self, ts: float) -> None:
+        self.tz_off = self.m.utc_offset(ts)
+        self._tz_until = ts + 3600.0
+
     # ------------------------------------------------------------------ 핫패스
     def on_tick(self, t: Tick) -> None:
         t0 = perf_counter_ns()
         ts = t.ts
-        self.now = ts
         self.ticks += 1
-        day = int((ts + KST) // DAY)
+        if ts >= self._tz_until:
+            self._refresh_tz(ts)
+        loc = ts + self.tz_off
+        tod = loc % DAY
+        if tod < self.open_tod or tod >= self.close_tod:
+            return                                 # 정규장 밖의 틱은 지표·판단에 쓰지 않는다
+        self.now = ts
+        day = int(loc // DAY)
         if day != self.day:
             self._new_day(day)
         s = self.sym.get(t.symbol)
@@ -156,12 +212,17 @@ class Engine:
             s.ask = t.ask
         if s.day_open == 0.0:
             s.day_open = px
-        tod = (ts + KST) % DAY
+        if t.cum_volume:
+            s.cum_vol = t.cum_volume
+        else:
+            s.cum_vol += t.volume
 
         # 1) 보유 종목이면 매도 조건부터(가장 급한 일)
         pos = self.positions.get(t.symbol)
         if pos is not None and t.symbol not in self.pending and ts >= s.retry_after:
-            it = self.seller.on_tick(pos, px, s.bid, tod, self.risk.flatten_all, s.etf)
+            force = "risk_flatten" if self.risk.flatten_all else (
+                "news_exit" if t.symbol in self.exit_now else "")
+            it = self.seller.on_tick(pos, px, s.bid, tod, force, s.etf)
             if it is not None:
                 self._send(it, s)
 
@@ -188,8 +249,16 @@ class Engine:
     def _bar_close(self, s: SymState, bar: Bar, tod: float) -> None:
         f = s.ind.update(bar)
         s.bar_count += 1
+        s.hist.append((bar.ts, bar.open, bar.high, bar.low, bar.close, bar.volume,
+                       f.ema_fast, f.ema_slow, f.vwap))
         if self.on_bar_cb is not None:
-            self.on_bar_cb(bar)
+            self._hook(self.on_bar_cb, bar)
+        # 상대 거래량: 평소 이 시각까지 쌓였을 거래량 대비 오늘 누적 거래량(장 초·마감에 몰리는 U자 분포 반영)
+        x = (tod - self.open_tod) / self.session_len
+        if s.avg_dvol > 0.0 and x > 0.02:
+            s.rvol = s.cum_vol / (s.avg_dvol * (x + 0.6 * sin(TWO_PI * x) / TWO_PI))
+        else:
+            s.rvol = -1.0
         sym = s.symbol
         if sym in self.pending or self.now < s.retry_after:
             return
@@ -203,25 +272,37 @@ class Engine:
             return
         if not f.ready:
             return
-        sig = self.chart.evaluate(sym, f, p)
+        prev_brk = 0.5 if s.prev_high <= 0.0 else (1.0 if f.close > s.prev_high else 0.0)
+        sig = self.chart.evaluate(sym, f, p, s.rvol, s.dtrend, prev_brk)
         if sig is None:
             s.score = 0.0
             return
         s.score = sig.score
-        day_gain = (f.close / s.day_open - 1.0) * 100.0 if s.day_open > 0 else 0.0
+        ns = self.news.get(sym)
+        if ns is not None and self.now < ns.block_until:
+            self.guard.blocks["악재 뉴스"] += 1
+            self.emit("block", sym, f"정보수집: 악재 뉴스로 매수 보류 — {ns.headline[:60]}", score=round(sig.score, 2))
+            return
+        ref = s.prev_close or s.day_open
+        day_gain = (f.close / ref - 1.0) * 100.0 if ref > 0 else 0.0
         why = self.guard.check(f, day_gain, s.bar_count - s.last_loss_bar, p)
         if why:
             self.guard.note(f"{sym} 차단: {why}", self.now)
             self.emit("block", sym, f"과매수 방지: {why}", score=round(sig.score, 2))
             return
         regime = self.regime
-        qty, stop_dist = self.sizer.size(f.close, f.atr, sig.score, self.equity, self.cash,
-                                         self.exposure, regime.risk_mult, p, s.etf, s.tax)
+        # 아직 체결되지 않은 매수 주문이 잡아 둔 금액도 이미 쓴 것으로 본다(동시 신호로 한도 초과 방지)
+        exposure = self.exposure + self.reserved
+        qty, stop_dist = self.sizer.size(f.close, f.atr, sig.score, self.equity, self.cash - self.reserved,
+                                         exposure, regime.risk_mult, p, s.etf, s.tax)
         if qty <= 0:
             return
-        it = self.buyer.build(sig, f, s.last, s.ask, qty, stop_dist, day_gain, tod, regime.bias, s.etf)
+        gap = (s.day_open / s.prev_close - 1.0) * 100.0 if s.prev_close > 0 and s.day_open > 0 else 0.0
+        it = self.buyer.build(sig, f, s.last, s.ask, qty, stop_dist, day_gain, tod, regime.bias, s.etf,
+                              {"rvol": round(s.rvol, 2), "gap": round(gap, 2), "dtrend": s.dtrend,
+                               "news": round(ns.score, 2) if ns is not None else 0.0})
         why = self.risk.pre_trade(it, s.last, self.now, tod, len(self.positions) + self._pending_buys(),
-                                  self.exposure, self.equity, regime)
+                                  exposure, self.equity, regime)
         if why:
             self.emit("block", sym, f"리스크: {why}", score=round(sig.score, 2))
             return
@@ -239,10 +320,14 @@ class Engine:
                 self.emit("block", it.symbol, f"리스크: {why}")
                 s.retry_after = self.now + 3.0
                 return
+        else:
+            amt = it.qty * (it.limit_price or s.last)
+            self._resv[it.symbol] = amt
+            self.reserved += amt
         self.pending[it.symbol] = it
         self.risk.note_order(self.now)
         (self.buyer if it.side == BUY else self.seller).note(
-            f"{it.symbol} {it.qty}주 {'시장가' if not it.limit_price else format(it.limit_price, ',.0f')}"
+            f"{it.symbol} {it.qty}주 {'시장가' if not it.limit_price else self.m.px(it.limit_price)}"
             f" ({it.reason})", self.now)
         self.execute(it)
 
@@ -252,6 +337,10 @@ class Engine:
         sym = fl.symbol
         pos = self.positions.get(sym)
         trade = None
+        self.fill_seq += 1
+        st = self.symbol_state(sym)                 # 시세를 한 번도 못 받은 종목의 체결(재시작 직후 등)도 평가 가능하게
+        if st.last == 0.0:
+            st.last = fl.price
         if fl.side == BUY:
             fee = notional * self.commission
             self.cash -= notional + fee
@@ -272,12 +361,12 @@ class Engine:
                 pos.avg_price = (pos.avg_price * pos.qty + notional) / (pos.qty + fl.qty)
                 pos.qty += fl.qty
                 pos.cost += notional + fee
-            self.emit("fill", sym, f"매수 체결 {fl.qty}주 @ {fl.price:,.0f}", side=BUY,
+            self.emit("fill", sym, f"매수 체결 {fl.qty}주 @ {self.m.px(fl.price)}", side=BUY,
                       qty=fl.qty, price=fl.price)
         elif pos is not None:
             qty = min(fl.qty, pos.qty)
-            fee = qty * fl.price * (self.commission + self.sym[sym].tax if sym in self.sym
-                                    else self.commission + self.sell_tax)
+            s = self.sym.get(sym)
+            fee = qty * fl.price * (self.commission + (s.tax if s is not None else self.sell_tax))
             proceeds = qty * fl.price - fee
             cost_part = pos.cost * qty / pos.qty
             pnl = proceeds - cost_part
@@ -290,17 +379,18 @@ class Engine:
             pos.exit_notional += qty * fl.price
             self.realized_day += pnl
             self.realized_total += pnl
-            self.emit("fill", sym, f"매도 체결 {qty}주 @ {fl.price:,.0f} ({fl.reason}) "
-                      f"손익 {pnl:+,.0f}", side="SELL", qty=qty, price=fl.price, pnl=round(pnl))
+            self.emit("fill", sym, f"매도 체결 {qty}주 @ {self.m.px(fl.price)} ({fl.reason}) "
+                      f"손익 {self.m.money(pnl)}", side="SELL", qty=qty, price=fl.price, pnl=round(pnl, 2))
             if pos.qty <= 0:
                 trade = self._close(pos, fl)
         if self.on_fill_cb is not None:
-            self.on_fill_cb(fl)
+            self._hook(self.on_fill_cb, fl)
         self.mark()
         return trade
 
     def _close(self, pos: Position, fl: Fill) -> Trade:
         del self.positions[pos.symbol]
+        self.exit_now.discard(pos.symbol)
         r = pos.risk_per_share or 1.0
         tq = pos.exit_qty
         orig_cost = pos.avg_price * tq * (1 + self.commission)
@@ -316,12 +406,15 @@ class Engine:
             s.last_loss_bar = s.bar_count
         self.risk.on_trade(tr, self.now)
         if self.on_trade_cb is not None:
-            self.on_trade_cb(tr)
+            self._hook(self.on_trade_cb, tr)
         return tr
 
     def on_order_done(self, symbol: str, ok: bool, reason: str = "", rejected: bool = False) -> None:
         """주문이 끝났을 때(전량 체결·취소·거부) 호출 — 해당 종목의 잠금을 푼다."""
         self.pending.pop(symbol, None)
+        self.reserved -= self._resv.pop(symbol, 0.0)
+        if not self._resv:
+            self.reserved = 0.0
         if not ok:
             s = self.sym.get(symbol)
             if s is not None:
@@ -356,7 +449,11 @@ class Engine:
             s.ind.reset_session()
             s.day_open = 0.0
             s.bar_start = -1.0
-        self.mark() if not first else None
+            s.cum_vol = 0
+            s.rvol = -1.0
+        self.exit_now.clear()
+        if not first:
+            self.mark()
         self.day_start_equity = self.equity
         self.realized_day = 0.0
         self.trades_day = []
@@ -364,18 +461,26 @@ class Engine:
         self._eq_pt_ts = 0.0
         self.risk.new_day(self.equity)
         if self.on_day_cb is not None and not first:
-            self.on_day_cb(day)
+            self._hook(self.on_day_cb, day)
 
     def flush_bars(self) -> None:
         """장 마감 시 진행 중인 마지막 봉을 닫는다(기록용)."""
         for s in self.sym.values():
             if s.bar_start >= 0.0:
                 bar = Bar(s.symbol, s.bar_start, s.o, s.h, s.l, s.c, s.v)
-                s.ind.update(bar)
+                f = s.ind.update(bar)
                 s.bar_count += 1
+                s.hist.append((bar.ts, bar.open, bar.high, bar.low, bar.close, bar.volume,
+                               f.ema_fast, f.ema_slow, f.vwap))
                 if self.on_bar_cb is not None:
-                    self.on_bar_cb(bar)
+                    self._hook(self.on_bar_cb, bar)
                 s.bar_start = -1.0
 
     def unrealized(self) -> float:
         return sum(p.qty * self.sym[p.symbol].last - p.cost for p in self.positions.values())
+
+    # ------------------------------------------------------------------ 재시작 대비 상태
+    def export_state(self) -> dict:
+        return {"cash": self.cash, "realized_total": self.realized_total, "fees_total": self.fees_total,
+                "day": self.day, "day_start_equity": self.day_start_equity, "realized_day": self.realized_day,
+                "positions": [asdict(p) for p in self.positions.values()], "risk": self.risk.export()}

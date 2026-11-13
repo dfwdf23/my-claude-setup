@@ -4,8 +4,9 @@
   1. 손실 거래마다 원인 태그를 붙인다(규칙 기반, 무료).
   2. 원인별 손실액을 집계해 '가장 비싼 실수'를 찾는다.
   3. 개선 후보를 만든다 — 규칙 기반 후보 + (가능하면) Claude가 통계를 보고 낸 후보.
-  4. 후보마다 최근 며칠의 실제 기록 봉으로 재생(백테스트)한다. 기간을 둘로 나눠
-     양쪽 모두에서 나빠지지 않고 전체로 개선될 때만 채택한다(과최적화 방지).
+     후보는 '설계 구간'(최근 기록 중 앞쪽)의 거래만 보고 만든다.
+  4. 후보마다 실제 기록 봉으로 재생(백테스트)한다. 설계 구간에서 뚜렷이 좋아지고,
+     후보를 만들 때 보지 않은 '표본외 구간'(가장 최근 며칠)에서도 좋아질 때만 채택한다(과최적화 방지).
   5. 채택된 값은 버전을 올려 저장한다. 새 버전의 실전 성과가 이전보다 나쁘면 자동 롤백한다.
 학습이 바꿀 수 있는 것은 params.BOUNDS 안의 전략 파라미터뿐이다. 위험 한도는 못 건드린다.
 """
@@ -14,6 +15,7 @@ from __future__ import annotations
 import asyncio
 from collections import defaultdict
 from dataclasses import asdict
+from math import ceil
 
 from ..backtest import Backtester
 from ..config import Config
@@ -30,30 +32,34 @@ NUDGES: dict[str, dict[str, float]] = {
     "수익 반납": {"trail_atr_mult": -0.25, "trail_start_r": -0.2},
     "약한 추세 진입": {"entry_score_min": 0.03},
     "거래량 미확인": {"vol_ratio_min": 0.15},
+    "상대 거래량 부족": {"rvol_min": 0.2},
     "돌파 없는 진입": {"entry_score_min": 0.02},
     "비용 손실": {"take_profit_r": 0.3},
     "시간 청산": {"time_stop_bars": -10.0},
     "추세 이탈": {"entry_score_min": 0.02, "rsi_min": 2.0},
     "시장 역행": {},
+    "일봉 역추세": {},
+    "악재 속 진입": {},
     "장 초반 진입": {},
     "장 후반 진입": {},
 }
 
-REVIEW_SYSTEM = """당신은 한국 주식 자동매매 시스템의 '복기' 담당이다. 오늘과 최근 거래 통계(JSON)를 보고
+REVIEW_SYSTEM = """당신은 주식 자동매매 시스템의 '복기' 담당이다. 최근 거래 통계(JSON)를 보고
 손실의 원인을 진단하고, 전략 파라미터 조정안을 제안한다.
 입력 필드: params(현재값), bounds(파라미터별 [최소,최대,1회 최대 변경폭]), summary(전체 성과),
 by_exit(청산사유별 [건수,손익,평균R]), by_cause(규칙 기반 손실원인별 [건수,손익]),
-by_hour(진입 시각별 [건수,손익]), win_avg/loss_avg(이긴/진 거래의 진입 시점 평균 지표),
-worst(가장 나쁜 거래들: [종목,R,청산사유,RSI,이격(ATR배수),추세강도,거래량비,진입시각,보유봉수,MAE(R),MFE(R)]),
+by_hour(진입 시각(거래소 현지 시)별 [건수,손익]), win_avg/loss_avg(이긴/진 거래의 진입 시점 평균 지표),
+worst(가장 나쁜 거래들: [종목,R,청산사유,RSI,이격(ATR배수),추세강도,봉거래량비,상대거래량,진입시각,보유봉수,MAE(R),MFE(R)]),
 blocks(과매수 방지·리스크 차단 사유별 횟수).
 파라미터 뜻: entry_score_min(매수 최소 점수), rsi_min/rsi_overbought(매수 허용 RSI 범위),
-max_ext_atr(단기 평균 대비 이격 상한), vol_ratio_min(거래량 확인 기준), stop_atr_mult(손절폭),
-take_profit_r(익절 배수), trail_start_r/trail_atr_mult(추적손절 시작·간격), time_stop_bars(시간 청산),
-cooldown_bars(손절 후 재진입 금지).
+max_ext_atr(단기 평균 대비 이격 상한), vol_ratio_min(봉 거래량 확인 기준), rvol_min(상대 거래량 하한:
+평소 같은 시각 대비 오늘 누적 거래량), stop_atr_mult(손절폭), take_profit_r(익절 배수),
+trail_start_r/trail_atr_mult(추적손절 시작·간격), time_stop_bars(시간 청산), cooldown_bars(손절 후 재진입 금지).
 규칙:
 - 제안은 최대 3개. 각 제안은 서로 다른 가설이어야 하고, 파라미터는 bounds 범위와 변경폭 안에서만.
 - 표본이 적으면(거래 10건 미만) 무리하게 바꾸지 말고 제안을 비워도 된다.
-- 제안은 시스템이 과거 기록으로 검증한 뒤 통과한 것만 적용하므로, 근거가 통계에 있는 것만 낸다.
+- 제안은 시스템이 '이 통계에 포함되지 않은 더 최근 기간'의 기록으로 검증한 뒤 통과한 것만 적용한다.
+  통계에 근거가 있는 것만 낸다.
 - lessons는 한국어로 최대 3줄, 각 70자 이내. 숫자 근거를 포함한다.
 JSON만 출력한다."""
 
@@ -88,8 +94,9 @@ REVIEW_SCHEMA = {
 }
 
 
-def tag_causes(t: Trade, p: StrategyParams) -> list[str]:
-    """손실 거래 1건의 원인 태그(여러 개 가능)."""
+def tag_causes(t: Trade, p: StrategyParams, open_tod: float = 9 * 3600.0,
+               close_tod: float = 15.5 * 3600.0) -> list[str]:
+    """손실 거래 1건의 원인 태그(여러 개 가능). open/close_tod 는 거래소 현지 장 시작·종료(초)."""
     if t.pnl >= 0:
         return []
     c = t.ctx
@@ -105,6 +112,8 @@ def tag_causes(t: Trade, p: StrategyParams) -> list[str]:
         out.append("약한 추세 진입")
     if c.get("vol_ratio", 9.9) < p.vol_ratio_min:
         out.append("거래량 미확인")
+    if 0.0 <= c.get("rvol", -1.0) < 1.0:
+        out.append("상대 거래량 부족")
     if c.get("breakout", 1.0) < 1.0:
         out.append("돌파 없는 진입")
     if (t.exit_price - t.entry_price) > 0:
@@ -115,10 +124,14 @@ def tag_causes(t: Trade, p: StrategyParams) -> list[str]:
         out.append("추세 이탈")
     if c.get("regime") == "risk_off":
         out.append("시장 역행")
+    if c.get("dtrend", 0.5) == 0.0:
+        out.append("일봉 역추세")
+    if c.get("news", 0.0) < -0.3:
+        out.append("악재 속 진입")
     tod = c.get("tod", 0)
-    if 0 < tod < 9 * 3600 + 1800:
+    if 0 < tod < open_tod + 1800:
         out.append("장 초반 진입")
-    elif tod >= 14 * 3600:
+    elif tod >= close_tod - 5400:
         out.append("장 후반 진입")
     return out or ["기타"]
 
@@ -136,12 +149,18 @@ class Learner(Agent):
     def __init__(self, cfg: Config, store: ParamStore, llm: LLM, journal=None) -> None:
         super().__init__()
         self.cfg = cfg
+        self.m = cfg.mkt
+        self.open_tod = float(cfg.session.tod("open"))
+        self.close_tod = float(cfg.session.tod("close"))
         self.store = store
         self.llm = llm
         self.journal = journal
         self.reports: list[dict] = []
         self.day_pnls: list[float] = []
         self.days_since_change = 10 ** 6
+
+    def tag(self, t: Trade, p: StrategyParams) -> list[str]:
+        return tag_causes(t, p, self.open_tod, self.close_tod)
 
     # ---------------------------------------------------------------- 통계
     def analyze(self, trades: list[Trade], p: StrategyParams) -> dict:
@@ -156,14 +175,14 @@ class Learner(Agent):
             h = by_hour[str(int(t.ctx.get("tod", 0)) // 3600)]
             h[0] += 1
             h[1] += t.pnl
-            t.causes = tag_causes(t, p)
+            t.causes = self.tag(t, p)
             for c in t.causes:
                 bc = by_cause[c]
                 bc[0] += 1
                 bc[1] += t.pnl
         wins = [t for t in trades if t.pnl > 0]
         losses = [t for t in trades if t.pnl <= 0]
-        keys = ("score", "rsi", "ext_atr", "trend", "vol_ratio")
+        keys = ("score", "rsi", "ext_atr", "trend", "vol_ratio", "rvol")
         worst = sorted(losses, key=lambda t: t.pnl)[:8]
         return {
             "summary": summarize(trades),
@@ -174,6 +193,7 @@ class Learner(Agent):
             "loss_avg": {k: _avg(losses, k) for k in keys},
             "worst": [[t.symbol, round(t.r_multiple, 2), t.exit_reason, t.ctx.get("rsi", 0),
                        t.ctx.get("ext_atr", 0), t.ctx.get("trend", 0), t.ctx.get("vol_ratio", 0),
+                       t.ctx.get("rvol", -1),
                        f"{int(t.ctx.get('tod', 0)) // 3600:02d}:{int(t.ctx.get('tod', 0)) % 3600 // 60:02d}",
                        t.bars_held, round(t.mae_r, 2), round(t.mfe_r, 2)] for t in worst],
         }
@@ -184,7 +204,7 @@ class Learner(Agent):
         ranked = [(c, v) for c, v in stats["by_cause"].items() if NUDGES.get(c)]
         for cause, (n, pnl) in ranked[:3]:
             ch = {k: getattr(p, k) + dv for k, dv in NUDGES[cause].items()}
-            out.append((f"규칙:{cause}", ch, f"{cause} {n}건 {pnl:+,.0f}원"))
+            out.append((f"규칙:{cause}", ch, f"{cause} {n}건 {self.m.money(pnl)}"))
         if len(ranked) >= 2:
             ch = {}
             for cause, _ in ranked[:2]:
@@ -197,40 +217,44 @@ class Learner(Agent):
         return out
 
     # ---------------------------------------------------------------- 검증
+    def split_days(self, bars: list[Bar]) -> tuple[list[int], int | None]:
+        """기록 봉의 거래일 목록과 '표본외 구간'의 첫 거래일. 3일 미만이면 표본외 검증 불가(None)."""
+        days = sorted({self.m.local_day(b.ts) for b in bars})
+        if len(days) < 3:
+            return days, None
+        k = max(1, ceil(len(days) * self.cfg.learn.holdout_frac))
+        return days, days[-k]
+
     def validate(self, base: StrategyParams, cands: list[tuple[str, StrategyParams, str]],
                  bars: list[Bar]) -> tuple[dict | None, list[dict]]:
         """기록된 봉을 재생해 후보를 비교한다. (채택안 또는 None, 비교표)"""
-        days = sorted({int((b.ts + 32400) // 86400) for b in bars})
-        if len(days) < 2 or not cands:
+        _, hold_start = self.split_days(bars)
+        if hold_start is None or not cands:
             return None, []
-        mid = days[len(days) // 2]
-        halves = [[b for b in bars if int((b.ts + 32400) // 86400) < mid],
-                  [b for b in bars if int((b.ts + 32400) // 86400) >= mid]]
+        day = self.m.local_day
+        design = [b for b in bars if day(b.ts) < hold_start]
+        hold = [b for b in bars if day(b.ts) >= hold_start]
         cap = self.cfg.capital
 
-        def run(p: StrategyParams) -> tuple[list[float], int, dict]:
-            scores, n, pnl, dd = [], 0, 0.0, 0.0
-            for h in halves:
-                m = Backtester(self.cfg, p, cap).run_bars(h).result()
-                scores.append(score(m, cap))
-                n += m["n"]
-                pnl += m["pnl"]
-                dd = max(dd, m["max_dd"])
-            return scores, n, {"n": n, "pnl": round(pnl), "max_dd": round(dd)}
+        def run(p: StrategyParams) -> tuple[float, float, int, dict]:
+            md = Backtester(self.cfg, p, cap).run_bars(design).result()
+            mh = Backtester(self.cfg, p, cap).run_bars(hold).result()
+            return (score(md, cap), score(mh, cap), md["n"] + mh["n"],
+                    {"n": md["n"] + mh["n"], "pnl": round(md["pnl"] + mh["pnl"]),
+                     "max_dd": round(max(md["max_dd"], mh["max_dd"]))})
 
-        b_scores, b_n, b_m = run(base)
-        b_total = sum(b_scores)
-        table = [{"name": "현재값", "score": round(b_total, 5), **b_m}]
-        need = b_total + max(self.cfg.learn.min_improve * abs(b_total), 0.0005)
+        bd, bh, b_n, b_m = run(base)
+        table = [{"name": "현재값", "design": round(bd, 5), "holdout": round(bh, 5), **b_m}]
+        need = bd + max(self.cfg.learn.min_improve * abs(bd), 0.0005)
         best = None
         for name, p, why in cands:
-            sc, n, m = run(p)
-            total = sum(sc)
-            ok = (total > need and all(s >= b - 0.002 for s, b in zip(sc, b_scores))
-                  and n >= 0.4 * b_n)
-            table.append({"name": name, "score": round(total, 5), **m, "ok": ok})
-            if ok and (best is None or total > best["score"]):
-                best = {"name": name, "params": p, "why": why, "score": total, "base": b_total, **m}
+            sd, sh, n, m = run(p)
+            # 설계 구간에서 뚜렷이 개선 + 표본외 구간에서도 개선 + 거래를 거의 안 하는 방식의 '개선'은 제외
+            ok = sd > need and sh > bh + 0.0002 and n >= 0.4 * b_n
+            table.append({"name": name, "design": round(sd, 5), "holdout": round(sh, 5), **m, "ok": ok})
+            if ok and (best is None or sd + sh > best["score"]):
+                best = {"name": name, "params": p, "why": why, "score": sd + sh, "base": bd + bh,
+                        "design": (bd, sd), "holdout": (bh, sh), **m}
         return best, table
 
     # ---------------------------------------------------------------- 장후 복기
@@ -253,9 +277,12 @@ class Learner(Agent):
             report["adopted"] = {"name": "롤백", "changes": {}, "why": rb}
             p = self.store.current
 
-        # 1) 후보 생성: 규칙 + Claude
+        # 1) 후보 생성: 규칙 + Claude — '설계 구간'의 거래만 본다(표본외 구간은 검증 전용)
+        _, hold_start = self.split_days(bars)
+        design_trades = recent if hold_start is None else [
+            t for t in recent if self.m.local_day(t.exit_ts) < hold_start]
         cands: list[tuple[str, StrategyParams, str]] = []
-        enough = len(recent) >= cfg.min_trades
+        enough = len(design_trades) >= cfg.min_trades and hold_start is not None
         self.days_since_change += 1
         settled = self.days_since_change >= cfg.min_days_between_changes
         if rb:
@@ -264,9 +291,10 @@ class Learner(Agent):
             report["lessons"].append(
                 f"v{p.version} 적용 {self.days_since_change}일째 — 효과 측정 중이라 오늘은 변경하지 않음")
         if enough and not rb and settled:
-            for name, ch, why in self.rule_candidates(stats, p):
+            dstats = self.analyze(design_trades, p)
+            for name, ch, why in self.rule_candidates(dstats, p):
                 cands.append((name, apply_changes(p, ch), why))
-            llm_out = await self._ask_llm(stats, p, blocks)
+            llm_out = await self._ask_llm(dstats, p, blocks)
             if llm_out:
                 report["source"] = "llm"
                 report["lessons"] += [str(x)[:90] for x in llm_out.get("lessons", [])[:3]]
@@ -275,7 +303,8 @@ class Learner(Agent):
                     if ch:
                         cands.append((f"Claude:{str(pr.get('name', ''))[:24]}", apply_changes(p, ch),
                                       str(pr.get("why", ""))[:90]))
-        report["lessons"] = self._rule_lessons(stats, today, enough) + report["lessons"]
+            self.analyze(recent, p)                     # 원인 태그를 전체 기준으로 되돌려 둔다
+        report["lessons"] = self._rule_lessons(stats, today, enough, hold_start is not None) + report["lessons"]
 
         # 2) 검증 → 채택
         cands = [c for c in cands if diff(p, c[1])]
@@ -284,14 +313,17 @@ class Learner(Agent):
             report["tested"] = table
             if best is not None:
                 changes = {k: list(v) for k, v in diff(p, best["params"]).items()}
-                reason = f"{best['name']} — {best['why']} (검증 점수 {best['base']:+.4f} → {best['score']:+.4f})"
+                (d0, d1), (h0, h1) = best["design"], best["holdout"]
+                reason = (f"{best['name']} — {best['why']} "
+                          f"(설계 구간 {d0:+.4f}→{d1:+.4f}, 표본외 {h0:+.4f}→{h1:+.4f})")
                 self.store.adopt(best["params"], reason, {"score": best["score"], "base": best["base"]})
                 self.days_since_change = 0
                 report["adopted"] = {"name": best["name"], "changes": changes, "why": best["why"]}
                 report["lessons"].append(f"채택: {best['name']} · " + ", ".join(
                     f"{k} {a}→{b}" for k, (a, b) in changes.items()))
             elif table:
-                report["lessons"].append(f"후보 {len(table) - 1}개 검증 — 현재값보다 확실히 나은 안이 없어 유지")
+                report["lessons"].append(
+                    f"후보 {len(table) - 1}개 검증 — 표본외 구간까지 통과한 안이 없어 현재값 유지")
 
         # 3) 성과 기반 크기 조절(연속 손실일이면 줄이고, 회복하면 되돌림)
         thr = self._throttle()
@@ -305,7 +337,7 @@ class Learner(Agent):
             if self.journal is not None:
                 self.journal.lesson(now, day, report["source"], line,
                                     report["adopted"]["changes"] if report["adopted"] else {})
-        self.note(f"{day} 복기: {today['n']}건 {today['pnl']:+,.0f}원 · v{report['version_after']}", now)
+        self.note(f"{day} 복기: {today['n']}건 {self.m.money(today['pnl'])} · v{report['version_after']}", now)
         return report
 
     def _maybe_rollback(self, recent: list[Trade]) -> str:
@@ -315,7 +347,7 @@ class Learner(Agent):
         prev_v = self.store.history[-2]["version"]
         cur_t = [t for t in recent if t.params_version == cur.version]
         prev_t = [t for t in recent if t.params_version == prev_v]
-        cur_days = {int((t.exit_ts + 32400) // 86400) for t in cur_t}
+        cur_days = {self.m.local_day(t.exit_ts) for t in cur_t}
         if (len(cur_t) < self.cfg.learn.rollback_min_trades or len(prev_t) < 5
                 or len(cur_days) < self.cfg.learn.rollback_min_days):
             return ""
@@ -341,15 +373,16 @@ class Learner(Agent):
         return (f"3일 연속 손실 — 거래 크기 {old:.2f}→{new:.2f}배로 축소" if new < old
                 else f"수익 회복 — 거래 크기 {old:.2f}→{new:.2f}배로 복원")
 
-    def _rule_lessons(self, stats: dict, today: dict, enough: bool) -> list[str]:
+    def _rule_lessons(self, stats: dict, today: dict, enough: bool, has_holdout: bool = True) -> list[str]:
         out = []
         if today["n"] == 0:
             out.append("오늘 거래 없음 — 조건에 맞는 신호가 없었거나 리스크 한도로 대기")
         if not enough:
-            out.append(f"표본 부족(최근 {stats['summary']['n']}건) — 파라미터는 건드리지 않음")
+            why = "표본외 검증에 필요한 기록(3거래일)이 아직 없음" if not has_holdout else "표본 부족"
+            out.append(f"{why}(최근 {stats['summary']['n']}건) — 파라미터는 건드리지 않음")
             return out
         for cause, (n, pnl) in list(stats["by_cause"].items())[:2]:
-            out.append(f"최대 손실 원인: {cause} {n}건 {pnl:+,.0f}원")
+            out.append(f"최대 손실 원인: {cause} {n}건 {self.m.money(pnl)}")
         return out
 
     async def _ask_llm(self, stats: dict, p: StrategyParams, blocks: dict) -> dict | None:

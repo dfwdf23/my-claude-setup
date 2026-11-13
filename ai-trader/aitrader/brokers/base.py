@@ -23,6 +23,8 @@ class Broker:
     name = "base"
     drives_clock = False      # True면 브로커(시뮬레이터)가 장 시작/종료 훅을 직접 호출
     has_account = True        # False면 계좌 대사(reconcile) 생략
+    supports_poll = False     # True면 poll_order 로 체결 여부를 다시 물어볼 수 있다
+    expect_data = False       # 총괄이 설정: 지금은 시세가 계속 들어와야 하는 시간(무응답이면 재연결)
 
     def __init__(self) -> None:
         # 속도를 위해 큐 없이 콜백을 직접 호출한다(수신 루프 → 엔진, 같은 스레드)
@@ -45,6 +47,15 @@ class Broker:
     async def cancel_order(self, order: Order) -> None:
         raise NotImplementedError
 
+    async def poll_order(self, order: Order) -> tuple[int, float, bool]:
+        """(누적 체결수량, 평균 체결가, 주문 종료 여부). supports_poll 이 True 인 브로커만 구현."""
+        raise NotImplementedError
+
+    async def lookup_order(self, order: Order) -> tuple[str, str]:
+        """주문 전송 중 오류가 나서 접수 여부를 모를 때 호출.
+        ("found", 주문번호) | ("absent", "") = 접수되지 않음이 확실 | ("unknown", "") = 알 수 없음."""
+        return "unknown", ""
+
     async def get_account(self) -> AccountSnapshot:
         raise NotImplementedError
 
@@ -59,6 +70,10 @@ class Broker:
         return {}
 
     async def get_headlines(self, n: int = 20) -> list[str]:
+        return []
+
+    async def get_news(self, n: int = 30) -> list[dict]:
+        """증권사가 주는 뉴스 제목. [{"ts": epoch, "title": str, "symbols": [..], "source": str}, ...]"""
         return []
 
     def now(self) -> float:

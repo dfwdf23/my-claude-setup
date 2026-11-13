@@ -101,6 +101,9 @@ class KISBroker(Broker):
         self._stop = False
         self.ws_connected = False
         self.supports_poll = True
+        self.idle_timeout = 45.0                         # 장중 이 시간 동안 아무 메시지도 없으면 죽은 연결로 본다
+        self._last_msg = time.monotonic()
+        self._approval_ts = 0.0
 
     # ------------------------------------------------------------------ 수명주기
     async def start(self) -> None:
@@ -202,7 +205,8 @@ class KISBroker(Broker):
         order.broker_org = self._raw[key][0]
 
     async def cancel_order(self, order: Order) -> None:
-        org, odno = self._raw.get(order.broker_id, (order.broker_org, order.broker_id))
+        # 재시작 후에는 원래 주문번호 표기를 모른다 → 10자리로 0을 채운다
+        org, odno = self._raw.get(order.broker_id, (order.broker_org, order.broker_id.zfill(10)))
         body = {**self._acct(), "KRX_FWDG_ORD_ORGNO": org, "ORGN_ODNO": odno, "ORD_DVSN": "00",
                 "RVSE_CNCL_DVSN_CD": "02", "ORD_QTY": "0", "ORD_UNPR": "0", "QTY_ALL_ORD_YN": "Y",
                 "EXCG_ID_DVSN_CD": self.cfg.kis.exchange}
@@ -211,7 +215,7 @@ class KISBroker(Broker):
     async def poll_order(self, order: Order) -> tuple[int, float, bool]:
         """체결통보 누락 대비: 주문의 (누적 체결수량, 평균가, 종료 여부)를 조회한다."""
         today = datetime.now(KST_TZ).strftime("%Y%m%d")
-        _, odno = self._raw.get(order.broker_id, ("", order.broker_id))
+        _, odno = self._raw.get(order.broker_id, ("", order.broker_id.zfill(10)))
         q = {**self._acct(), "INQR_STRT_DT": today, "INQR_END_DT": today, "SLL_BUY_DVSN_CD": "00",
              "PDNO": order.symbol, "CCLD_DVSN": "00", "INQR_DVSN": "00", "INQR_DVSN_3": "00",
              "ORD_GNO_BRNO": "", "ODNO": odno, "INQR_DVSN_1": "", "CTX_AREA_FK100": "", "CTX_AREA_NK100": ""}
@@ -223,6 +227,36 @@ class KISBroker(Broker):
                         or int(float(row.get("rjct_qty") or 0)) > 0)
                 return filled, float(row.get("avg_prvs") or 0.0), done
         return 0, 0.0, False
+
+    async def lookup_order(self, order: Order) -> tuple[str, str]:
+        """주문 응답을 못 받았을 때: 오늘 주문 내역에서 같은 종목·방향·수량의 '모르는' 주문을 찾는다."""
+        now = datetime.now(KST_TZ)
+        today = now.strftime("%Y%m%d")
+        sent = datetime.fromtimestamp(order.created_ts or time.time(), KST_TZ) - timedelta(seconds=10)
+        since = sent.strftime("%H%M%S") if sent.date() == now.date() else "000000"
+        q = {**self._acct(), "INQR_STRT_DT": today, "INQR_END_DT": today,
+             "SLL_BUY_DVSN_CD": "02" if order.side == BUY else "01", "PDNO": order.symbol, "CCLD_DVSN": "00",
+             "INQR_DVSN": "00", "INQR_DVSN_3": "00", "ORD_GNO_BRNO": "", "ODNO": "", "INQR_DVSN_1": "",
+             "CTX_AREA_FK100": "", "CTX_AREA_NK100": ""}
+        try:
+            d, _ = await self._call("GET", "/uapi/domestic-stock/v1/trading/inquire-daily-ccld", self.tr["ccld"], q)
+        except Exception:
+            return "unknown", ""
+        best = None
+        for row in d.get("output1") or []:
+            key = str(row.get("odno", "")).lstrip("0") or "0"
+            if key in self._raw or row.get("pdno") != order.symbol:
+                continue
+            if int(float(row.get("ord_qty") or 0)) != order.qty or str(row.get("ord_tmd", "")) < since:
+                continue
+            if best is None or str(row.get("ord_tmd", "")) > str(best.get("ord_tmd", "")):
+                best = row
+        if best is None:
+            return "absent", ""
+        key = str(best["odno"]).lstrip("0") or "0"
+        self._raw[key] = (str(best.get("ord_gno_brno", "")), str(best["odno"]))
+        order.broker_org = self._raw[key][0]
+        return "found", key
 
     # ------------------------------------------------------------------ 조회
     async def get_account(self) -> AccountSnapshot:
@@ -337,21 +371,27 @@ class KISBroker(Broker):
         backoff = 1.0
         while not self._stop:
             try:
-                self._approval = await self._approval_key()
+                if not self._approval or time.time() - self._approval_ts > 6 * 3600:
+                    self._approval = await self._approval_key()
+                    self._approval_ts = time.time()
                 async with self.session.ws_connect(self.ws_base + "/tryitout", heartbeat=None,
                                                    timeout=aiohttp.ClientWSTimeout(ws_close=5)) as ws:
                     self._ws = ws
-                    await self._send_sub(ws, self.tr["notice"], self.cfg.kis.hts_id, "1")
-                    for s in self._symbols:
-                        await self._send_sub(ws, "H0STCNT0", s, "1")
+                    await self._subscribe_all(ws)
                     self.ws_connected = True
                     self.on_status("실시간 시세 연결됨")
                     backoff = 1.0
-                    await self._recv(ws)
+                    self._last_msg = time.monotonic()
+                    wd = asyncio.create_task(self._watchdog(ws))
+                    try:
+                        await self._recv(ws)
+                    finally:
+                        wd.cancel()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 log.warning("웹소켓 오류: %r", e)
+                self._approval = ""                      # 접속키 문제일 수 있으니 다음에는 새로 받는다
             self.ws_connected = False
             if self._stop:
                 return
@@ -359,10 +399,27 @@ class KISBroker(Broker):
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30.0)
 
+    async def _subscribe_all(self, ws) -> None:
+        await self._send_sub(ws, self.tr["notice"], self.cfg.kis.hts_id, "1")
+        for s in self._symbols:
+            await self._send_sub(ws, "H0STCNT0", s, "1")
+
+    async def _watchdog(self, ws) -> None:
+        """끊겼는데 끊긴 줄 모르는 연결(half-open) 감시: 장중에 일정 시간 아무 메시지도 없으면 닫고 다시 붙는다.
+        손절·익절이 전부 틱에 달려 있으므로 조용히 멈춘 시세는 가장 위험한 고장이다."""
+        while not ws.closed:
+            await asyncio.sleep(5.0)
+            idle = time.monotonic() - self._last_msg
+            if self.expect_data and idle > self.idle_timeout:
+                self.on_status(f"실시간 시세 {idle:.0f}초 무응답 — 연결을 끊고 다시 접속합니다")
+                await ws.close()
+                return
+
     async def _recv(self, ws) -> None:
         on_tick = self.on_tick
         notice = self.tr["notice"]
         async for msg in ws:
+            self._last_msg = time.monotonic()
             if msg.type != aiohttp.WSMsgType.TEXT:
                 if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                     return

@@ -1,9 +1,12 @@
 """실행 진입점.
 
-  python -m aitrader run                      # 시뮬레이션(합성 시세) + 대시보드
-  python -m aitrader run --mode kis-mock      # 한국투자증권 모의투자
+  python -m aitrader run                      # 시뮬레이션(합성 시세, 미국 시장) + 대시보드
+  python -m aitrader run --mode kis-mock      # 한국투자증권 모의투자(해외주식)
   python -m aitrader run --mode kis-live      # 실전(명시적 확인 필요)
+  python -m aitrader run --mode manual        # 주문 보조: 봇이 주문을 제안하고 사람이 증권사 앱에서 체결
+  python -m aitrader run --market krx ...     # 국내 주식
   python -m aitrader backtest --days 20       # 합성 시세 백테스트
+  python -m aitrader research --dir <폴더>     # 실제 과거 시세(야후 형식 JSON)로 백테스트
   python -m aitrader bench                    # 판단 지연(틱→결정) 측정
 """
 from __future__ import annotations
@@ -27,14 +30,20 @@ def make_broker(cfg: Config):
         from .brokers.sim import PaperBroker
         return PaperBroker(cfg)
     if cfg.mode in ("kis-mock", "kis-live"):
-        from .brokers.kis import KISBroker
         cfg.kis.env = "real" if cfg.mode == "kis-live" else "mock"
+        if cfg.market == "US":
+            from .brokers.kis_overseas import KISOverseasBroker
+            return KISOverseasBroker(cfg)
+        from .brokers.kis import KISBroker
         return KISBroker(cfg)
+    if cfg.mode == "manual":
+        from .brokers.manual import ManualBroker
+        return ManualBroker(cfg)
     if cfg.mode.startswith("samsung"):
         raise SystemExit(
-            "삼성증권은 현재 개인 고객용 매매 Open API를 공개하지 않아 직접 연동할 수 없습니다.\n"
-            "API가 열리면 aitrader/brokers/base.py 의 Broker 를 구현해 붙이면 됩니다.\n"
-            "지금은 --mode kis-mock (한국투자증권 모의투자) 또는 --mode sim 을 사용하세요.")
+            "삼성증권은 현재 개인 고객용 매매 Open API를 공개하지 않아 자동 주문을 연결할 수 없습니다.\n"
+            "삼성증권 계좌로 쓰려면 --mode manual (주문 보조: 봇이 주문 내용을 알려주고 직접 체결)을,\n"
+            "무인 자동매매는 --mode kis-mock / kis-live (한국투자증권)를 사용하세요.")
     raise SystemExit(f"알 수 없는 mode: {cfg.mode}")
 
 
@@ -47,7 +56,7 @@ async def _run(cfg: Config, dashboard: bool) -> None:
         d = cfg.dashboard
         dash = Dashboard(sup, d.host, d.port, d.token)
         await dash.start()
-        print(f"대시보드: http://{d.host}:{d.port}/  (mode={cfg.mode})", flush=True)
+        print(f"대시보드: http://{d.host}:{d.port}/  (mode={cfg.mode}, market={cfg.market})", flush=True)
     # 지연 튐 방지: 시작 시점 객체는 GC 대상에서 빼고, 수집 주기를 늘리고,
     # 일지 스레드가 GIL을 오래 쥐지 못하게 전환 간격을 줄인다.
     gc.collect()
@@ -66,8 +75,9 @@ async def _run(cfg: Config, dashboard: bool) -> None:
         if dash:
             await dash.stop()
     e = sup.engine
-    print(f"종료 — 자산 {e.equity:,.0f}원, 누적 실현손익 {e.realized_total:+,.0f}원, 거래 {len(e.trades)}건, "
-          f"전략 v{e.p.version}", flush=True)
+    m = cfg.mkt
+    print(f"종료 — 자산 {m.money(e.equity, signed=False)}, 누적 실현손익 {m.money(e.realized_total)}, "
+          f"거래 {len(e.trades)}건, 전략 v{e.p.version}", flush=True)
 
 
 def _loop_run(coro) -> None:
@@ -78,8 +88,12 @@ def _loop_run(coro) -> None:
         asyncio.run(coro)
 
 
+def _cfg(a) -> Config:
+    return load_config(a.config, getattr(a, "market", None))
+
+
 def cmd_run(a) -> None:
-    cfg = load_config(a.config)
+    cfg = _cfg(a)
     if a.mode:
         cfg.mode = a.mode
     if a.speed is not None:
@@ -100,32 +114,46 @@ def cmd_run(a) -> None:
     _loop_run(_run(cfg, not a.no_dashboard))
 
 
+def _report(tag: str, r: dict, e, m, el: float) -> None:
+    print(tag)
+    print(f"거래 {r['n']}건 · 손익 {m.money(r['pnl'])} ({r['ret']:+.2%}) · 승률 {r['win_rate']:.0%} · "
+          f"손익비 {r['pf']} · 기대값 {r['exp_r']:+.2f}R · 최대낙폭 {m.money(r['max_dd'], signed=False)} · "
+          f"비용 {m.money(e.fees_total, signed=False)}")
+    print(f"틱 {e.ticks:,}개 처리 {el:.2f}초 · 판단 지연(µs) {e.lat.summary(1000.0)}")
+
+
 def cmd_backtest(a) -> None:
     from .backtest import Backtester
     from .brokers.sim import SimMarket
     from .params import ParamStore
-    cfg = load_config(a.config)
-    mk = SimMarket(cfg.universe[:cfg.max_symbols], a.seed, cfg.sim.tick_sec, etfs=frozenset(cfg.etfs))
+    cfg = _cfg(a)
+    mk = SimMarket(cfg.universe[:cfg.max_symbols], a.seed, cfg.sim.tick_sec, etfs=frozenset(cfg.etfs),
+                   market=cfg.mkt, open_hhmm=cfg.session.open, close_hhmm=cfg.session.close)
     bt = Backtester(cfg, ParamStore(None).current)
     t0 = time.perf_counter()
     for _ in range(a.days):
+        for sym in mk.symbols:
+            bt.engine.set_daily(sym, mk.history(sym, 60))
         bt.run_ticks(mk.day_ticks())
         bt.engine.flush_bars()
         mk.next_day()
-    r = bt.result()
-    e = bt.engine
-    print(f"[합성 시세 {a.days}일, seed={a.seed}] — 실전 수익성과 무관한 동작 검증용")
-    print(f"거래 {r['n']}건 · 손익 {r['pnl']:+,}원 ({r['ret']:+.2%}) · 승률 {r['win_rate']:.0%} · "
-          f"손익비 {r['pf']} · 기대값 {r['exp_r']:+.2f}R · 최대낙폭 {r['max_dd']:,}원 · 비용 {e.fees_total:,.0f}원")
-    print(f"틱 {e.ticks:,}개 처리 {time.perf_counter() - t0:.2f}초 · 판단 지연(µs) {e.lat.summary(1000.0)}")
+    _report(f"[합성 시세 {a.days}일, seed={a.seed}, {cfg.market}] — 실전 수익성과 무관한 동작 검증용",
+            bt.result(), bt.engine, cfg.mkt, time.perf_counter() - t0)
+
+
+def cmd_research(a) -> None:
+    from .research import run_research
+    cfg = _cfg(a)
+    run_research(cfg, a.dir, a.interval, commission=a.commission)
 
 
 def cmd_bench(a) -> None:
     from .backtest import Backtester
     from .brokers.sim import SimMarket
     from .params import ParamStore
-    cfg = load_config(a.config)
-    mk = SimMarket(cfg.universe[:cfg.max_symbols], 7, cfg.sim.tick_sec, etfs=frozenset(cfg.etfs))
+    cfg = _cfg(a)
+    mk = SimMarket(cfg.universe[:cfg.max_symbols], 7, cfg.sim.tick_sec, etfs=frozenset(cfg.etfs),
+                   market=cfg.mkt, open_hhmm=cfg.session.open, close_hhmm=cfg.session.close)
     ticks = []
     for _ in range(3):
         ticks += list(mk.day_ticks())
@@ -143,8 +171,13 @@ def main() -> None:
     ap = argparse.ArgumentParser(prog="aitrader", description="AI 자동매매 시스템")
     ap.add_argument("--config", default=None, help="config.toml 경로")
     sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def common(p):
+        p.add_argument("--market", choices=["us", "krx", "US", "KRX"], help="시장(기본: config.toml 또는 us)")
+
     r = sub.add_parser("run", help="매매 실행 + 대시보드")
-    r.add_argument("--mode", choices=["sim", "kis-mock", "kis-live", "samsung"])
+    common(r)
+    r.add_argument("--mode", choices=["sim", "kis-mock", "kis-live", "manual", "samsung"])
     r.add_argument("--speed", type=float, help="시뮬레이션 배속")
     r.add_argument("--days", type=int, help="시뮬레이션 일수(0=무한)")
     r.add_argument("--port", type=int)
@@ -153,10 +186,18 @@ def main() -> None:
     r.add_argument("--llm", action="store_true", help="시뮬레이션에서도 Claude 호출 사용")
     r.set_defaults(fn=cmd_run)
     b = sub.add_parser("backtest", help="합성 시세 백테스트")
+    common(b)
     b.add_argument("--days", type=int, default=20)
     b.add_argument("--seed", type=int, default=7)
     b.set_defaults(fn=cmd_backtest)
+    rs = sub.add_parser("research", help="실제 과거 시세로 백테스트")
+    common(rs)
+    rs.add_argument("--dir", required=True, help="<종목>_<간격>.json 파일이 있는 폴더(야후 차트 형식)")
+    rs.add_argument("--interval", default="5m_60d", help="파일 이름의 간격 부분(예: 5m_60d)")
+    rs.add_argument("--commission", type=float, default=None, help="수수료율 덮어쓰기(예: 0.0007)")
+    rs.set_defaults(fn=cmd_research)
     c = sub.add_parser("bench", help="판단 지연 측정")
+    common(c)
     c.set_defaults(fn=cmd_bench)
     a = ap.parse_args()
     a.fn(a)

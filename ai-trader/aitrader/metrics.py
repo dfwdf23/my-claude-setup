@@ -20,13 +20,13 @@ def summarize(trades: list, start_equity: float = 0.0) -> dict:
             dd = peak - cum
     return {
         "n": n,
-        "pnl": round(pnl),
+        "pnl": round(pnl, 2),
         "win_rate": round(len(wins) / n, 3),
         "pf": round(gw / gl, 2) if gl > 0 else (99.0 if gw > 0 else 0.0),   # 손익비(총이익/총손실)
         "exp_r": round(sum(t.r_multiple for t in trades) / n, 3),            # 거래당 기대값(R)
-        "avg_win": round(gw / len(wins)) if wins else 0,
-        "avg_loss": round(-gl / len(losses)) if losses else 0,
-        "max_dd": round(dd),
+        "avg_win": round(gw / len(wins), 2) if wins else 0,
+        "avg_loss": round(-gl / len(losses), 2) if losses else 0,
+        "max_dd": round(dd, 2),
         "ret": round(pnl / start_equity, 5) if start_equity else 0.0,
     }
 
