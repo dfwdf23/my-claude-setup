@@ -157,7 +157,7 @@ class PaperBroker(Broker):
         self._post = (s.tod("post") // 3600, s.tod("post") % 3600 // 60)
 
     def now(self) -> float:
-        return self.sim_now or time.time()
+        return self.sim_now or self.m.epoch(self.market.date, *self._pre)      # 시작 전에도 시뮬레이션 날짜 기준
 
     async def stop(self) -> None:
         self._stop = True

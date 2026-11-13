@@ -97,6 +97,8 @@ class Engine:
         self.cash = cash
         self.execute = execute or (lambda it: None)
         self.quiet = quiet
+        self.clock = None             # 이벤트 시각용 시계(총괄이 브로커 시계를 연결). 없으면 마지막 틱 시각
+        self.retry_sec = 3.0          # 주문이 미체결·거부로 끝난 뒤 같은 종목을 다시 시도하기까지의 간격
         self.bar_sec = float(cfg.strategy.bar_sec)
         self.commission = cfg.fees.commission
         self.sell_tax = cfg.fees.sell_tax
@@ -108,6 +110,7 @@ class Engine:
         self.decide_tod = float(cfg.session.tod("entry_start"))
         self.view_sec = float(cfg.strategy.view_sec)
         self.view_on = not quiet and self.bar_sec > self.view_sec
+        self.daily = self.bar_sec >= DAY               # 일봉: 봉 시각 = 그날 장 시작(현지 날짜가 밀리지 않게)
         self.tz_off = 0.0             # (현지 − UTC) 초. 한 시간에 한 번만 다시 계산
         self._tz_until = 0.0
         # 에이전트
@@ -158,7 +161,8 @@ class Engine:
         if self.quiet:
             return
         self._seq += 1
-        self.events.append({"seq": self._seq, "ts": self.now, "kind": kind, "symbol": symbol,
+        ts = self.clock() if self.clock is not None else self.now      # 장 밖(시작·복기·대사)의 기록도 제 시각으로
+        self.events.append({"seq": self._seq, "ts": ts, "kind": kind, "symbol": symbol,
                             "text": text, **data})
 
     def _hook(self, cb, arg) -> None:
@@ -193,6 +197,27 @@ class Engine:
         ma50 = sum(closes[-50:]) / len(closes[-50:])
         c = closes[-1]
         s.dtrend = 1.0 if c > ma20 > ma50 else (0.0 if c < ma20 < ma50 else 0.5)
+
+    def seed_bar(self, symbol: str, bar: Bar, now: float) -> None:
+        """일봉 방식에서 장중에 켜졌을 때: 오늘 봉의 이미 지나간 구간(시가·고가·저가·거래량)을 채워 넣는다.
+        이렇게 하지 않으면 오늘 봉이 '켠 뒤의 움직임'만 담아 변동폭(ATR)·거래량이 실제보다 작게 기록된다."""
+        if now >= self._tz_until:
+            self._refresh_tz(now)
+        loc = now + self.tz_off
+        if not self.open_tod <= loc % DAY < self.close_tod:
+            return
+        day = int(loc // DAY)
+        if day != self.day:
+            self._new_day(day)
+        s = self.symbol_state(symbol)
+        if s.bar_start >= 0.0 or bar.close <= 0:
+            return                                 # 이미 틱으로 만들고 있는 봉은 건드리지 않는다
+        s.bar_start = now - loc % DAY + self.open_tod if self.daily else now - now % self.bar_sec
+        s.o, s.h, s.l, s.c, s.v = bar.open, bar.high, bar.low, bar.close, bar.volume
+        s.day_open = bar.open
+        s.cum_vol = bar.volume
+        if not s.last:
+            s.last = bar.close
 
     def _refresh_tz(self, ts: float) -> None:
         self.tz_off = self.m.utc_offset(ts)
@@ -238,7 +263,7 @@ class Engine:
                 self._send(it, s)
 
         # 2) 봉 갱신 → 마감되면 매수 판단
-        b = ts - ts % self.bar_sec
+        b = ts - tod + self.open_tod if self.daily else ts - ts % self.bar_sec
         if b != s.bar_start:
             if s.bar_start >= 0.0:
                 self._bar_close(s, Bar(s.symbol, s.bar_start, s.o, s.h, s.l, s.c, s.v), tod)
@@ -459,7 +484,7 @@ class Engine:
         if not ok:
             s = self.sym.get(symbol)
             if s is not None:
-                s.retry_after = self.now + 3.0
+                s.retry_after = self.now + self.retry_sec
             self.emit("order", symbol, f"주문 미체결/거부: {reason}")
             if rejected and self.risk.note_reject(self.now):
                 self.emit("risk", "", self.risk.halt_reason)
@@ -514,6 +539,13 @@ class Engine:
 
     def unrealized(self) -> float:
         return sum(p.qty * self.sym[p.symbol].last - p.cost for p in self.positions.values())
+
+    def rvol_now(self, s: SymState) -> float:
+        """화면 표시용 실시간 상대 거래량. 매매 판단에는 봉 마감 때 계산한 s.rvol 을 쓴다(빠른 경로 밖에서만 호출)."""
+        x = min(((self.now + self.tz_off) % DAY - self.open_tod) / self.session_len, 1.0)
+        if s.avg_dvol > 0.0 and s.cum_vol > 0 and x > 0.02:
+            return s.cum_vol / (s.avg_dvol * (x + 0.6 * sin(TWO_PI * x) / TWO_PI))
+        return -1.0
 
     # ------------------------------------------------------------------ 재시작 대비 상태
     def export_state(self) -> dict:

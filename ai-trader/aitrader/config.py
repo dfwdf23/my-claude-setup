@@ -150,6 +150,7 @@ class ManualCfg:
     feed: str = "yahoo"                # 시세 출처: yahoo(비공식·무료, 폴링) | kis
     poll_sec: float = 20.0
     ticket_ttl_min: float = 5.0        # 이 시간 안에 체결 입력이 없으면 주문 제안을 만료
+    snooze_min: float = 30.0           # 건너뛰었거나 응답 없이 만료된 제안을 같은 종목에 다시 띄우기까지(분)
 
 
 @dataclass

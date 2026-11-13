@@ -27,11 +27,15 @@ class Executor(Agent):
     name = "executor"
     role = "주문 집행"
 
-    def __init__(self, broker: Broker, engine: Engine, timeout_sec: float = 10.0) -> None:
+    def __init__(self, broker: Broker, engine: Engine, timeout_sec: float = 10.0,
+                 clock: Callable[[], float] | None = None) -> None:
         super().__init__()
         self.broker = broker
         self.engine = engine
         self.timeout = timeout_sec
+        # 미체결 시간 초과를 재는 시계. 기본은 마지막 틱 시각이지만, 시세 시각이 실제 시각보다 늦을 수 있는
+        # 실시간 모드에서는 총괄이 벽시계를 넘겨 준다(주문 제안이 뜨자마자 만료되는 일을 막는다).
+        self.clock: Callable[[], float] = clock or (lambda: engine.now)
         self.orders: dict[int, Order] = {}            # 진행 중 주문
         self.by_bid: dict[str, Order] = {}
         self.early: dict[str, list] = {}              # 주문 응답보다 먼저 도착한 체결통보
@@ -47,6 +51,7 @@ class Executor(Agent):
         broker.on_fill = self.on_fill
         broker.on_reject = self.on_reject
         broker.on_poke = self.poke
+        broker.on_cancel = self.on_cancel
         engine.execute = self.submit
 
     # ------------------------------------------------------------------ 전송
@@ -54,7 +59,7 @@ class Executor(Agent):
         self.calls += 1
         self._n += 1
         o = Order(self._n, it.symbol, it.side, it.qty, it.limit_price, it.reason, it.ctx,
-                  self.engine.now, status="SENT", sent_ns=perf_counter_ns())
+                  self.clock(), status="SENT", sent_ns=perf_counter_ns())
         self.orders[o.id] = o
         self._spawn(self._place(o))
 
@@ -169,6 +174,12 @@ class Executor(Agent):
             self.polled[o.id] = time.monotonic()
             self._spawn(self._poll(o))
 
+    def on_cancel(self, broker_id: str) -> None:
+        """증권사·사람 쪽에서 취소된 주문(거부가 아니므로 '거부 반복' 정지 횟수에 넣지 않는다)."""
+        o = self.by_bid.get(broker_id)
+        if o is not None and o.status in ("SENT", "ACK", "CANCELING"):
+            self._finish(o, "CANCELED", "취소됨")
+
     def on_reject(self, broker_id: str, msg: str) -> None:
         o = self.by_bid.get(broker_id)
         if o is not None and o.status in ("SENT", "ACK"):
@@ -223,7 +234,7 @@ class Executor(Agent):
             # 이미 체결됐을 수 있다 — 통보/폴링으로 체결을 확인한다
             if o.id in self.orders:
                 o.status = "ACK"
-                o.created_ts = self.engine.now
+                o.created_ts = self.clock()
                 self.polled[o.id] = time.monotonic() - 3.0     # 다음 점검 때 바로 재확인
             return
         if o.id in self.orders:

@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import heapq
 import hashlib
 import re
 import time
@@ -358,7 +359,7 @@ class NewsAgent(Agent):
     # ---------------------------------------------------------------- 화면용
     def recent(self, n: int = 40) -> list[dict]:
         out = []
-        for it in list(self.items.values())[-n:][::-1]:
+        for it in heapq.nlargest(n, self.items.values(), key=lambda x: x.ts):       # 최신 소식이 위로
             out.append({"ts": it.ts, "source": it.source, "title": it.title, "url": it.url,
                         "symbols": list(it.symbols), "score": round(it.score(), 2),
                         "by": "claude" if it.impact is not None else "rule", "kind": it.kind or ",".join(it.tags),

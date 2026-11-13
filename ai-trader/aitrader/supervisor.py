@@ -57,7 +57,12 @@ class Supervisor(Agent):
         self.llm = LLM(cfg.llm, self.journal)
         self.engine = Engine(cfg, self.store.current, cfg.capital)
         timeout = cfg.manual.ticket_ttl_min * 60.0 if self.manual else cfg.risk.order_timeout_sec
-        self.executor = Executor(broker, self.engine, timeout)
+        e0 = self.engine
+        realtime = cfg.mode in ("kis-mock", "kis-live") or self.manual
+        self.executor = Executor(broker, e0, timeout,
+                                 clock=(lambda: max(e0.now, time.time())) if realtime else broker.now)
+        if self.manual:                                       # 건너뛰거나 만료된 제안은 한동안 다시 띄우지 않는다
+            e0.retry_sec = cfg.manual.snooze_min * 60.0
         self.market = MarketAnalyst(cfg, self.llm)
         self.daily = cfg.strategy.bar_sec >= 86_400          # 일봉 방식(스윙)
         self.screener = Screener(cfg.learn.lookback_days + 70 if self.daily else 60)
@@ -71,12 +76,16 @@ class Supervisor(Agent):
         e.on_bar_cb = self.journal.bar
         e.on_fill_cb = self._on_fill
         e.on_trade_cb = self._on_trade
-        if self.live:
+        self.keep_state = self.live or self.manual            # 재시작 후 이어받아야 하는 모드
+        if self.keep_state:
             self.executor.on_change = self._save_state
+        if self.manual and hasattr(broker, "on_ticket"):
+            broker.on_ticket = self._on_ticket
         broker.on_tick = e.on_tick                     # 큐 없이 직결: 수신 루프 → 엔진
         broker.on_day_start = self.day_start
         broker.on_day_end = self.day_end
         broker.on_status = lambda msg: e.emit("system", "", msg)
+        e.clock = broker.now
         self.phase = "INIT"
         self.today: date | None = None
         self.symbols: list[str] = []
@@ -102,6 +111,8 @@ class Supervisor(Agent):
         await self.broker.start()
         if self.broker.has_account:
             await self.reconcile(initial=True)
+        elif self.manual:
+            await self._restore(None)                   # 계좌 조회가 없으므로 저장된 장부를 그대로 이어받는다
         tasks = [asyncio.create_task(self.broker.run(), name="broker"),
                  asyncio.create_task(self._timer_loop(), name="timer"),
                  asyncio.create_task(self._stop.wait(), name="stop")]
@@ -150,8 +161,11 @@ class Supervisor(Agent):
         early = self.m.local(now).hour * 3600 + self.m.local(now).minute * 60 < ses.tod("open") + 1800
         for sym in syms:
             s = e.symbol_state(sym)
-            dbars = [b for b in self.screener.bars.get(sym, []) if b.ts < day0]      # 어제까지의 일봉
+            allb = self.screener.bars.get(sym, [])
+            dbars = [b for b in allb if b.ts < day0]                                 # 어제까지의 일봉
             e.set_daily(sym, dbars[-60:])
+            if self.daily and allb and allb[-1].ts >= day0:
+                e.seed_bar(sym, allb[-1], now)        # 장중에 켜졌다 → 오늘 봉의 지나간 구간을 채운다
             if s.ind.n == 0:                          # 지표 예열: 어제까지의 봉으로 미리 채운다
                 warm = dbars[-3 * self.cfg.strategy.warmup_bars:] if self.daily else \
                     self.journal.recent_bars(sym, 3 * self.cfg.strategy.warmup_bars)
@@ -161,6 +175,8 @@ class Supervisor(Agent):
                 s.ind.reset_session()
                 if self.daily and warm and early:
                     s.undecided = True                # 장 초반에 켜졌다면 어제 봉에 대한 판단을 오늘 한다
+        if e.view_on:
+            await self._backfill_view(syms, now)
         if self.news is not None:
             self.news.new_day()
             self.news.set_symbols(syms)
@@ -170,6 +186,24 @@ class Supervisor(Agent):
         self._last_tick_wall = time.monotonic()
         self.note(f"{d} 장 시작 — {len(syms)}종목 감시 · 전략 v{e.p.version}", now)
         e.emit("system", "", f"{d} 장 시작 — 감시 {len(syms)}종목, 전략 v{e.p.version}")
+
+    async def _backfill_view(self, syms: list[str], now: float) -> None:
+        """장중에 켜졌을 때 이미 지나간 분봉을 채워 실시간 차트가 비어 보이지 않게 한다(화면 전용, 매매 판단과 무관)."""
+        e = self.engine
+        sec = int(e.view_sec)
+        cur = now - now % sec                             # 진행 중인 봉은 틱으로 직접 만든다
+        for sym in syms:
+            s = e.symbol_state(sym)
+            if s.view:
+                continue
+            try:
+                bars = await self.broker.get_intraday_bars(sym, sec)
+            except Exception as ex:
+                log.debug("분봉 채우기 실패 %s: %r", sym, ex)
+                continue
+            for b in bars[-s.view.maxlen:]:
+                if b.ts < cur:
+                    s.view.append((b.ts, b.open, b.high, b.low, b.close, b.volume))
 
     async def day_end(self, d: date) -> None:
         if self._day_ended == d:
@@ -219,8 +253,11 @@ class Supervisor(Agent):
             oh, om = divmod(self.cfg.session.tod("open") // 60, 60)
             seen, out = set(), []
             today = self.journal.load_bars(now - 86400)
+            d0 = self.m.epoch(self.today) if self.today else now - 86400
             for src in (*self.screener.bars.values(), today):
                 for b in src:
+                    if src is not today and b.ts >= d0:
+                        continue                      # 장중에 받아 둔 오늘 일봉은 미완성 → 엔진이 마감까지 기록한 봉을 쓴다
                     loc = self.m.local(b.ts)
                     key = (b.symbol, loc.date())
                     if key in seen:
@@ -282,7 +319,7 @@ class Supervisor(Agent):
                     self._last_tick_wall = mono
                 self._tick_mark = (e.ticks, mono)
             realtime = self.live or self.manual
-            self.executor.on_timer(max(e.now, time.time()) if realtime else self.broker.now())
+            self.executor.on_timer(self.executor.clock())
             if self.phase != "OPEN":
                 self.broker.expect_data = False
                 continue
@@ -326,8 +363,18 @@ class Supervisor(Agent):
     # ------------------------------------------------------------------ 체결·상태 저장
     def _on_fill(self, fl) -> None:
         self.journal.fill(fl)
-        if self.live:
+        if self.keep_state:
             self._save_state()
+
+    def _on_ticket(self, t: dict) -> None:
+        """주문 보조 모드: 새 주문 제안을 로그와 알림으로 내보낸다."""
+        side = "매수" if t["side"] == "BUY" else "매도"
+        px = "시장가(급함)" if t["market"] else f"지정가 {self.m.px(t['price'])}"
+        msg = f"[주문 제안] {t['symbol']} {side} {t['qty']}주 · {px} · 사유 {t['reason']}"
+        if t.get("stop"):
+            msg += f" · 손절 예정가 {self.m.px(t['stop'])}"
+        self.engine.emit("ticket", t["symbol"], msg)
+        self.notifier.send(msg + f"\n{self.cfg.manual.ticket_ttl_min:.0f}분 안에 직접 주문한 뒤 대시보드에서 [체결됨]을 눌러 주세요.")
 
     def _on_trade(self, t: Trade) -> None:
         """거래가 끝나는 즉시 원인 태그를 붙여 일지에 남긴다(중간에 꺼져도 기록이 남게)."""
@@ -336,7 +383,7 @@ class Supervisor(Agent):
 
     def _save_state(self) -> None:
         """재시작 대비: 장부(현금·실현손익·당일 한도 상태·포지션)와 진행 중 주문을 디스크에 남긴다."""
-        if not (self.live and self.dir):
+        if not (self.keep_state and self.dir):
             return
         self._save_ts = time.monotonic()
         data = {"engine": self.engine.export_state(), "orders": self.executor.export(), "ts": time.time()}
@@ -388,6 +435,10 @@ class Supervisor(Agent):
             except ValueError:
                 e.emit("system", "", "저장된 상태 파일을 읽을 수 없어 새로 시작합니다")
         cap = self.cfg.capital
+        if acct is None:                                # 주문 보조 모드: 계좌를 조회할 수 없다 → 저장된 장부를 믿는다
+            from .models import AccountSnapshot
+            held = {pd["symbol"]: (int(pd["qty"]), 0.0) for pd in (st or {}).get("engine", {}).get("positions", [])}
+            acct = AccountSnapshot(float("inf"), held)
         if not st or "engine" not in st:
             e.cash = min(acct.cash, cap) if cap > 0 else acct.cash
             e.equity = e.cash
@@ -425,7 +476,7 @@ class Supervisor(Agent):
         e.risk.restore(es.get("risk", {}), same_day)
         e.risk.peak_equity = max(e.risk.peak_equity, eq)
         e.mark()
-        n = await self.executor.recover(st.get("orders", []))
+        n = await self.executor.recover(st.get("orders", [])) if self.live else 0
         e.emit("system", "", f"계좌 연결 — 장부 복원: 현금 {self.m.money(e.cash, signed=False)}, 포지션 "
                f"{len(e.positions)}개, 이어받은 체결 {n}건" + (" · 당일 한도 상태 유지" if same_day else ""))
         self._save_state()
@@ -478,7 +529,7 @@ class Supervisor(Agent):
             levels = {"avg": pos.avg_price, "stop": pos.stop, "target": pos.target}
         return {"symbol": symbol, "bar_sec": self.cfg.strategy.bar_sec, "bars": bars, "cur": cur,
                 "view_sec": self.cfg.strategy.view_sec, "view": view, "vcur": vcur, "marks": marks, "levels": levels, "last": s.last, "cum_vol": s.cum_vol,
-                "rvol": round(s.rvol, 2), "prev_close": s.prev_close}
+                "rvol": round(e.rvol_now(s), 2), "prev_close": s.prev_close}
 
     def snapshot(self, since_seq: int = 0) -> dict:
         e = self.engine
@@ -504,13 +555,14 @@ class Supervisor(Agent):
                           "chg": round((s.last / ref - 1) * 100, 2) if ref and s.last else 0.0,
                           "rsi": round(f.rsi), "score": round(s.score, 2), "trend": int(f.ema_fast > f.ema_slow),
                           "ready": f.ready, "held": sym in e.positions, "vol": s.cum_vol,
-                          "rvol": round(s.rvol, 2), "news": round(ns.score, 2) if ns else 0.0,
+                          "rvol": round(e.rvol_now(s), 2), "news": round(ns.score, 2) if ns else 0.0,
                           "blocked": bool(ns and e.now < ns.block_until)})
         rep = self.learner.reports[-1] if self.learner.reports else None
         ses = self.cfg.session
         tickets = self.broker.tickets_view() if hasattr(self.broker, "tickets_view") else []
         return {
             "mode": self.cfg.mode, "broker": self.broker.name, "phase": self.phase, "now": e.now,
+            "style": self.cfg.style, "bar_sec": self.cfg.strategy.bar_sec, "auto_apply": self.cfg.learn.auto_apply,
             "wall": time.time(), "day": str(self.today or ""), "uptime": round(time.time() - self.started),
             "market": {"code": self.m.code, "currency": self.m.currency, "decimals": self.m.decimals,
                        "tz": self.m.tz, "tz_off": e.tz_off if e.now else self.m.utc_offset(time.time()),

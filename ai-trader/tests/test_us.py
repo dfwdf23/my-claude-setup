@@ -209,7 +209,9 @@ def test_news_blocks_buys_on_bad_news_and_dedupes():
     na.ingest([(old, "Acme faces lawsuit over old product", "", "x", ())], now + 1)
     assert not next(reversed(na.items.values())).fresh                        # 오래된 소식은 판단에 쓰지 않는다
     view = na.recent(10)
-    assert view[0]["title"].startswith("Acme faces") and all(v["url"] == "" or v["url"].startswith("http") for v in view)
+    assert [v["ts"] for v in view] == sorted((v["ts"] for v in view), reverse=True)   # 화면에는 최신 소식이 위로
+    assert view[-1]["title"].startswith("Acme faces") and not view[-1]["fresh"]
+    assert all(v["url"] == "" or v["url"].startswith("http") for v in view)
 
 
 async def test_news_claude_classification_unblocks_and_forces_exit():
@@ -238,3 +240,71 @@ def test_engine_respects_news_block_and_news_exit():
     e.exit_now.add("X")
     e.on_tick(Tick("X", t + 5, 100.5, 100))
     assert sent and sent[-1].reason == "news_exit" and sent[-1].limit_price == 0
+
+
+def test_daily_bar_is_seeded_when_started_mid_session():
+    """일봉 방식에서 장중에 켜면 오늘 봉의 지나간 구간(시가·고가·저가·거래량)을 채운 뒤 틱으로 이어 간다."""
+    cfg = Config.for_market("US")
+    d = date(2026, 1, 5)
+    now = US.epoch(d, 11, 0)
+    part = Bar("SPY", US.epoch(d, 9, 30), 500.0, 505.0, 495.0, 501.0, 1_000_000)
+    e = Engine(cfg, StrategyParams(), 30_000)
+    e.seed_bar("SPY", part, US.epoch(d, 8, 0))                         # 장 시작 전에는 아무것도 하지 않는다
+    assert "SPY" not in e.sym or e.sym["SPY"].bar_start < 0
+    e.seed_bar("SPY", part, now)
+    s = e.sym["SPY"]
+    assert (s.o, s.h, s.l, s.c, s.v) == (500.0, 505.0, 495.0, 501.0, 1_000_000)
+    assert s.day_open == 500.0 and s.cum_vol == 1_000_000 and s.last == 501.0
+    e.on_tick(Tick("SPY", now + 20, 502.0, 0, 0.0, 0.0, 1_000_000))    # 첫 조회(증가분 0)
+    e.on_tick(Tick("SPY", now + 40, 506.0, 700, 0.0, 0.0, 1_000_700))
+    e.seed_bar("SPY", Bar("SPY", part.ts, 1.0, 2.0, 0.5, 1.5, 9), now + 60)   # 진행 중인 봉은 덮어쓰지 않는다
+    e.flush_bars()
+    assert s.hist[-1][1:6] == (500.0, 506.0, 495.0, 506.0, 1_000_700)  # 하루 전체 범위·거래량이 담긴 일봉
+    assert s.hist[-1][0] == US.epoch(d, 9, 30)                         # 일봉 시각 = 그날 장 시작(현지 날짜가 밀리지 않는다)
+    assert s.day_open == 500.0
+
+
+class DailyStub(Broker):
+    """고정된 시각과 일봉(오늘의 미완성 봉 포함)을 돌려주는 브로커."""
+
+    def __init__(self, now, bars):
+        super().__init__()
+        self._now, self._bars = now, bars
+
+    def now(self):
+        return self._now
+
+    async def get_daily_bars(self, symbol, n):
+        return [Bar(symbol, *b) for b in self._bars][-n:]
+
+
+async def test_supervisor_mid_session_start_uses_complete_daily_bars(tmp_path):
+    cfg = Config.for_market("US")
+    cfg.data_dir, cfg.universe, cfg.llm.enabled, cfg.news.enabled = str(tmp_path), ["SPY"], False, False
+    d = date(2026, 3, 13)                                              # 금요일
+    days = []
+    x = d
+    while len(days) < 80:
+        x = date.fromordinal(x.toordinal() - 1)
+        if x.weekday() < 5:
+            days.append(x)
+    hist = [(US.epoch(x, 9, 30), 100.0 + i * 0.1, 101.0 + i * 0.1, 99.0 + i * 0.1, 100.5 + i * 0.1, 1_000)
+            for i, x in enumerate(reversed(days))]
+    partial = (US.epoch(d, 9, 30), 108.0, 109.0, 107.0, 108.5, 400)   # 오늘 11시까지의 미완성 일봉
+    now = US.epoch(d, 11, 0)
+    br = DailyStub(now, hist + [partial])
+    sup = Supervisor(cfg, br)
+    await sup.day_start(d)
+    e, s = sup.engine, sup.engine.sym["SPY"]
+    assert s.prev_close == hist[-1][4] and s.avg_dvol == 1_000         # 일봉 맥락은 '어제까지'만(오늘 미완성 봉 제외)
+    assert (s.o, s.h, s.l, s.v) == (108.0, 109.0, 107.0, 400)          # 오늘 봉은 지나간 구간부터 이어 간다
+    assert s.hist[-1][0] == hist[-1][0]                                # 예열에도 오늘 미완성 봉은 넣지 않는다
+    e.on_tick(Tick("SPY", now + 30, 110.0, 250, 0.0, 0.0, 650))
+    e.on_tick(Tick("SPY", US.epoch(d, 15, 59), 109.5, 350, 0.0, 0.0, 1_000))
+    e.flush_bars()
+    sup.journal.flush()
+    bars = sup._recent_bars(US.epoch(d, 16, 10))
+    today = [b for b in bars if US.local(b.ts).date() == d]
+    assert len(today) == 1                                             # 미완성 봉과 마감 봉이 겹쳐 들어가지 않는다
+    assert (today[0].open, today[0].high, today[0].low, today[0].close, today[0].volume) == (108.0, 110.0, 107.0, 109.5, 1_000)
+    sup.journal.close()

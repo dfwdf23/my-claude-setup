@@ -32,6 +32,7 @@ class Broker:
         self.on_fill: Callable[[str, int, float, float], None] = lambda bid, qty, px, ts: None
         self.on_reject: Callable[[str, str], None] = lambda bid, msg: None
         self.on_poke: Callable[[str], None] = lambda bid: None   # "이 주문에 변화가 있다 — 지금 조회해 보라"
+        self.on_cancel: Callable[[str], None] = lambda bid: None  # 증권사(또는 사람) 쪽에서 주문이 취소됨
         self.on_day_start: Callable[[date], Awaitable[None]] = _noop
         self.on_day_end: Callable[[date], Awaitable[None]] = _noop
         self.on_status: Callable[[str], None] = lambda msg: None
@@ -75,6 +76,10 @@ class Broker:
 
     async def get_news(self, n: int = 30) -> list[dict]:
         """증권사가 주는 뉴스 제목. [{"ts": epoch, "title": str, "symbols": [..], "source": str}, ...]"""
+        return []
+
+    async def get_intraday_bars(self, symbol: str, sec: int) -> list[Bar]:
+        """가장 최근 거래일의 분봉(실시간 차트의 지나간 구간 채우기용). 지원하지 않으면 빈 목록."""
         return []
 
     def now(self) -> float:

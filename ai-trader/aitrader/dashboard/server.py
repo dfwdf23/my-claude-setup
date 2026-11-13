@@ -38,7 +38,8 @@ class Dashboard:
         self.host, self.port, self.token = host, port, token
         self.app = web.Application()
         self.app.add_routes([web.get("/", self.index), web.get("/ws", self.ws),
-                             web.get("/api/state", self.state), web.post("/api/control", self.control)])
+                             web.get("/api/state", self.state), web.get("/api/chart", self.chart),
+                             web.post("/api/control", self.control), web.post("/api/ticket", self.ticket)])
         self.runner: web.AppRunner | None = None
         self.clients: set[web.WebSocketResponse] = set()
 
@@ -47,6 +48,24 @@ class Dashboard:
             return True
         got = req.headers.get("X-Token") or req.query.get("token", "")
         return hmac.compare_digest(got, self.token)
+
+    @staticmethod
+    def _same_origin(req: web.Request) -> bool:
+        """다른 사이트가 사용자의 브라우저를 통해 이 서버에 명령을 보내는 것(CSRF, 웹소켓 가로채기)을 막는다.
+        브라우저는 교차 출처 요청에 Origin 을 붙이므로, Origin 이 있으면 이 서버 주소와 같아야 한다."""
+        origin = req.headers.get("Origin")
+        if not origin:
+            return True                                  # 브라우저가 아닌 클라이언트(curl 등)
+        return origin.split("://", 1)[-1] == req.headers.get("Host", "")
+
+    def _guard_post(self, req: web.Request) -> web.Response | None:
+        if not self._same_origin(req):
+            return web.json_response({"error": "cross-origin request refused"}, status=403)
+        if not self._ok(req):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        if req.content_type != "application/json":
+            return web.json_response({"error": "content-type must be application/json"}, status=415)
+        return None
 
     async def start(self) -> None:
         self.runner = web.AppRunner(self.app, access_log=None)
@@ -68,9 +87,18 @@ class Dashboard:
             return web.json_response({"error": "unauthorized"}, status=401)
         return web.Response(text=dumps(self.sup.snapshot()), content_type="application/json")
 
-    async def control(self, req: web.Request) -> web.Response:
+    async def chart(self, req: web.Request) -> web.Response:
         if not self._ok(req):
             return web.json_response({"error": "unauthorized"}, status=401)
+        c = self.sup.chart(req.query.get("symbol", ""))
+        if c is None:
+            return web.json_response({"error": "unknown symbol"}, status=404)
+        return web.Response(text=dumps(c), content_type="application/json")
+
+    async def control(self, req: web.Request) -> web.Response:
+        bad = self._guard_post(req)
+        if bad is not None:
+            return bad
         try:
             action = (await req.json()).get("action", "")
         except Exception:
@@ -79,22 +107,57 @@ class Dashboard:
             return web.json_response({"error": "unknown action"}, status=400)
         return web.json_response({"ok": True, "message": self.sup.control(action)})
 
+    async def ticket(self, req: web.Request) -> web.Response:
+        """주문 보조 모드: 사용자가 직접 낸 주문의 체결 결과를 알리거나(체결됨), 제안을 건너뛴다."""
+        bad = self._guard_post(req)
+        if bad is not None:
+            return bad
+        br = self.sup.broker
+        if not hasattr(br, "confirm"):
+            return web.json_response({"error": "manual mode only"}, status=400)
+        try:
+            d = await req.json()
+            tid, action = str(d["id"]), d["action"]
+            qty = int(d["qty"]) if d.get("qty") not in (None, "") else None
+            price = float(d["price"]) if d.get("price") not in (None, "") else None
+        except Exception:
+            return web.json_response({"error": "bad request"}, status=400)
+        if action == "fill":
+            msg = br.confirm(tid, qty, price)
+        elif action == "skip":
+            msg = br.skip(tid)
+        else:
+            return web.json_response({"error": "unknown action"}, status=400)
+        return web.json_response({"ok": True, "message": msg})
+
     async def ws(self, req: web.Request) -> web.StreamResponse:
+        if not self._same_origin(req):
+            return web.Response(status=403)
         if not self._ok(req):
             return web.Response(status=401)
+        if len(self.clients) >= 8:                       # 화면이 너무 많이 붙어 매매 루프를 방해하지 않게
+            return web.Response(status=503)
         ws = web.WebSocketResponse(heartbeat=20.0)
         await ws.prepare(req)
         self.clients.add(ws)
         seq = 0
+        sel = ""
         try:
             while not ws.closed:
                 snap = self.sup.snapshot(seq)
                 seq = snap["seq"]
+                if sel:
+                    snap["chart"] = self.sup.chart(sel)      # 선택한 종목의 실시간 차트
                 await ws.send_str(dumps(snap))
                 try:
                     msg = await ws.receive(timeout=0.5)
                     if msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED, WSMsgType.ERROR):
                         break
+                    if msg.type == WSMsgType.TEXT and len(msg.data) < 200:
+                        try:
+                            sel = str(json.loads(msg.data).get("sel", ""))[:16]
+                        except ValueError:
+                            pass
                 except asyncio.TimeoutError:
                     pass
         except (ConnectionResetError, asyncio.CancelledError):
