@@ -6,6 +6,15 @@ from dataclasses import dataclass, field
 BUY = "BUY"
 SELL = "SELL"
 
+# 주문·청산 사유 코드 → 화면·알림에 보여 줄 말(코드는 일지·통계에 그대로 남긴다)
+REASON_KO = {"entry": "매수 신호", "stop_loss": "손절", "trailing_stop": "추적 손절", "take_profit": "익절",
+             "time_stop": "시간 청산", "trend_exit": "추세 이탈", "eod_flatten": "장 마감 청산",
+             "news_exit": "악재 소식", "risk_flatten": "전량 청산", "reconcile": "계좌 대사"}
+
+
+def reason_ko(code: str) -> str:
+    return REASON_KO.get(code, code)
+
 
 @dataclass(slots=True)
 class Tick:

@@ -1,8 +1,8 @@
 """실제 과거 시세로 전략을 검증한다(합성 시세가 아니라).
 
-입력: 야후 파이낸스 차트 API 형식의 JSON 파일(<종목>_<간격>.json, 일봉은 <종목>_1d_1y.json).
-  예) curl "https://query1.finance.yahoo.com/v8/finance/chart/NVDA?interval=5m&range=60d" > NVDA_5m_60d.json
-야후 차트 API는 비공식이며 약관상 개인적 조사 용도로만 써야 한다. 실매매 시세로는 쓰지 않는다.
+입력: 야후 파이낸스 차트 API 형식의 JSON 파일(<종목>_<간격>_<기간>.json — 예: NVDA_1d_5y.json, NVDA_5m_60d.json).
+  `python -m aitrader fetch --dir <폴더>` 가 설정된 종목의 파일을 내려받는다(분봉 검증은 일봉 맥락용 _1d_1y 도 함께).
+야후 차트 API는 비공식이며 약관상 개인적 조사 용도로만 써야 한다. 자동 주문의 시세로는 쓰지 않는다.
 
 방식: 실매매와 같은 엔진에 분봉을 재생한다(봉 재생의 보수적 가정은 backtest.py 참고).
 날마다 '그 전날까지의' 일봉으로 일봉 맥락을 주므로 미래 정보는 쓰지 않는다.
@@ -20,12 +20,12 @@ from .config import Config
 from .journal import Journal
 from .llm import LLM
 from .metrics import summarize
-from .models import Bar
+from .models import Bar, reason_ko
 from .params import ParamStore
 
 
 def load_yahoo(path: Path, symbol: str) -> list[Bar]:
-    d = json.loads(path.read_text())
+    d = json.loads(path.read_text(encoding="utf-8"))
     r = d["chart"]["result"][0]
     q = r["indicators"]["quote"][0]
     out = []
@@ -53,6 +53,8 @@ def load_dir(folder: str, interval: str, symbols: list[str]) -> tuple[dict, dict
         raise SystemExit(f"{folder} 에 *_{interval}.json 파일이 없습니다")
     any_bars = next(iter(intraday.values()))
     step = min(b.ts - a.ts for a, b in zip(any_bars, any_bars[1:]) if b.ts > a.ts)
+    if step >= 86_400:
+        daily = intraday          # 일봉 검증: 일봉 맥락도 같은 일봉에서 만든다(실매매와 같은 조건, 별도 파일 유무와 무관)
     return intraday, daily, int(step)
 
 
@@ -138,7 +140,7 @@ def run_research(cfg: Config, folder: str, interval: str = "5m_60d", commission:
             avg = sum(hold.values()) / len(hold)
             print(f"  비교(같은 기간 단순 보유): 평균 {avg:+.0%} — " + " · ".join(f"{s} {v:+.0%}" for s, v in hold.items()))
         for k, s in out["by_exit"].items():
-            print(f"  청산 {k:14} {s['n']:4}건 {m.money(s['pnl']):>12} 평균 {s['exp_r']:+.2f}R")
+            print(f"  청산 사유 {reason_ko(k)}: {s['n']}건 · {m.money(s['pnl'])} · 평균 {s['exp_r']:+.2f}R")
         print("  종목별: " + " · ".join(f"{s} {v['n']}건 {m.money(v['pnl'])}" for s, v in out["by_symbol"].items()))
         if learn:
             print(f"  전략 v{e.p.version} · 변경 {len(out['history'])}회")
@@ -147,3 +149,46 @@ def run_research(cfg: Config, folder: str, interval: str = "5m_60d", commission:
 
 class _Off:
     enabled = False
+
+
+# ---------------------------------------------------------------------- 과거 시세 내려받기
+YAHOO = "https://query1.finance.yahoo.com"
+UA = "Mozilla/5.0 (compatible; aitrader-research)"
+
+
+async def _download(symbols: list[str], folder: Path, jobs: list[tuple[str, str]], base_url: str) -> list[str]:
+    import aiohttp
+    saved = []
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), headers={"User-Agent": UA}) as s:
+        for sym in symbols:
+            for interval, rng in jobs:
+                name = f"{sym}_{interval}_{rng}.json"
+                try:
+                    async with s.get(f"{base_url}/v8/finance/chart/{sym}",
+                                     params={"interval": interval, "range": rng}) as r:
+                        body = await r.read()
+                        if r.status != 200:
+                            raise ValueError(f"HTTP {r.status}")
+                    n = len(json.loads(body)["chart"]["result"][0]["timestamp"])      # 형식 확인
+                except Exception as e:
+                    print(f"  {name}: 실패 — {e!r}")
+                    continue
+                (folder / name).write_bytes(body)
+                saved.append(name)
+                print(f"  {name}: 봉 {n:,}개")
+                await asyncio.sleep(0.3)                                  # 서버에 부담을 주지 않게 천천히
+    return saved
+
+
+def fetch_history(cfg: Config, folder: str, interval: str | None = None, rng: str | None = None,
+                  symbols: list[str] | None = None, base_url: str = YAHOO) -> list[str]:
+    """설정된 종목의 과거 시세를 야후 차트 형식 그대로 저장한다(research 명령의 입력)."""
+    if cfg.market != "US":
+        raise SystemExit("과거 시세 내려받기는 현재 미국 종목만 지원합니다")
+    daily = cfg.strategy.bar_sec >= 86_400
+    jobs = [(interval or ("1d" if daily else "5m"), rng or ("5y" if daily else "60d"))]
+    if not jobs[0][0].endswith("d"):
+        jobs.append(("1d", "1y"))                                         # 분봉 검증에 쓰는 일봉 맥락
+    base = Path(folder)
+    base.mkdir(parents=True, exist_ok=True)
+    return asyncio.run(_download(symbols or cfg.universe, base, jobs, base_url))

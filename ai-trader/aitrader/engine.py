@@ -19,7 +19,7 @@ from .agents.guards import OverboughtGuard, RiskManager
 from .agents.trade import BuyAgent, PositionSizer, SellAgent
 from .config import Config
 from .indicators import IndicatorSet
-from .models import BUY, Bar, Features, Fill, NewsState, OrderIntent, Position, Regime, Tick, Trade
+from .models import BUY, Bar, Features, Fill, NewsState, OrderIntent, Position, Regime, Tick, Trade, reason_ko
 from .params import StrategyParams
 
 DAY = 86400.0
@@ -338,7 +338,16 @@ class Engine:
             return
         if not f.ready:
             return
-        prev_brk = 0.5 if s.prev_high <= 0.0 else (1.0 if f.close > s.prev_high else 0.0)
+        if self.daily:
+            # 일봉 방식: 판단 대상은 '방금 닫힌 일봉'이므로, 그 봉 기준의 전일 고가·종가는 한 봉 앞의 값이다.
+            # (set_daily 가 주는 prev_high·prev_close 는 판단 대상 봉 자신의 값이라 여기에 쓰면 항상 0이 된다)
+            pb = s.hist[-2] if len(s.hist) >= 2 else None
+            prev_high = pb[2] if pb is not None else 0.0
+            ref = pb[4] if pb is not None else 0.0
+        else:
+            prev_high = s.prev_high
+            ref = s.prev_close or s.day_open
+        prev_brk = 0.5 if prev_high <= 0.0 else (1.0 if f.close > prev_high else 0.0)
         sig = self.chart.evaluate(sym, f, p, s.rvol, s.dtrend, prev_brk)
         if sig is None:
             s.score = 0.0
@@ -349,7 +358,6 @@ class Engine:
             self.guard.blocks["악재 뉴스"] += 1
             self.emit("block", sym, f"정보수집: 악재 뉴스로 매수 보류 — {ns.headline[:60]}", score=round(sig.score, 2))
             return
-        ref = s.prev_close or s.day_open
         day_gain = (f.close / ref - 1.0) * 100.0 if ref > 0 else 0.0
         why = self.guard.check(f, day_gain, s.bar_count - s.last_loss_bar, p)
         if why:
@@ -394,7 +402,7 @@ class Engine:
         self.risk.note_order(self.now)
         (self.buyer if it.side == BUY else self.seller).note(
             f"{it.symbol} {it.qty}주 {'시장가' if not it.limit_price else self.m.px(it.limit_price)}"
-            f" ({it.reason})", self.now)
+            f" ({reason_ko(it.reason)})", self.now)
         self.execute(it)
 
     # ------------------------------------------------------------------ 체결 반영
@@ -445,7 +453,7 @@ class Engine:
             pos.exit_notional += qty * fl.price
             self.realized_day += pnl
             self.realized_total += pnl
-            self.emit("fill", sym, f"매도 체결 {qty}주 @ {self.m.px(fl.price)} ({fl.reason}) "
+            self.emit("fill", sym, f"매도 체결 {qty}주 @ {self.m.px(fl.price)} ({reason_ko(fl.reason)}) "
                       f"손익 {self.m.money(pnl)}", side="SELL", qty=qty, price=fl.price, pnl=round(pnl, 2))
             if pos.qty <= 0:
                 trade = self._close(pos, fl)

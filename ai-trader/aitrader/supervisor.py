@@ -26,7 +26,7 @@ from .executor import Executor
 from .journal import Journal
 from .llm import LLM
 from .metrics import summarize
-from .models import SELL, Fill, Position, Trade
+from .models import SELL, Fill, Position, Trade, reason_ko
 from .notify import Notifier
 from .params import ParamStore
 
@@ -170,6 +170,8 @@ class Supervisor(Agent):
                 warm = dbars[-3 * self.cfg.strategy.warmup_bars:] if self.daily else \
                     self.journal.recent_bars(sym, 3 * self.cfg.strategy.warmup_bars)
                 for b in warm:
+                    if self.daily:
+                        s.ind.reset_session()         # 일봉은 봉 하나가 하루(세션) — 매매·재생과 같은 기준으로 예열
                     f = s.ind.update(b)
                     s.hist.append((b.ts, b.open, b.high, b.low, b.close, b.volume, f.ema_fast, f.ema_slow, f.vwap))
                 s.ind.reset_session()
@@ -370,7 +372,7 @@ class Supervisor(Agent):
         """주문 보조 모드: 새 주문 제안을 로그와 알림으로 내보낸다."""
         side = "매수" if t["side"] == "BUY" else "매도"
         px = "시장가(급함)" if t["market"] else f"지정가 {self.m.px(t['price'])}"
-        msg = f"[주문 제안] {t['symbol']} {side} {t['qty']}주 · {px} · 사유 {t['reason']}"
+        msg = f"[주문 제안] {t['symbol']} {side} {t['qty']}주 · {px} · 사유 {reason_ko(t['reason'])}"
         if t.get("stop"):
             msg += f" · 손절 예정가 {self.m.px(t['stop'])}"
         self.engine.emit("ticket", t["symbol"], msg)

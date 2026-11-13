@@ -308,3 +308,123 @@ async def test_supervisor_mid_session_start_uses_complete_daily_bars(tmp_path):
     assert len(today) == 1                                             # 미완성 봉과 마감 봉이 겹쳐 들어가지 않는다
     assert (today[0].open, today[0].high, today[0].low, today[0].close, today[0].volume) == (108.0, 110.0, 107.0, 109.5, 1_000)
     sup.journal.close()
+
+
+def _weekdays(start: date, n: int) -> list[date]:
+    out, x = [], start
+    while len(out) < n:
+        if x.weekday() < 5:
+            out.append(x)
+        x = date.fromordinal(x.toordinal() + 1)
+    return out
+
+
+def test_daily_decision_compares_with_the_bar_before_the_decision_bar():
+    """일봉 방식: '전일 고가 돌파'와 '당일 급등'은 판단 대상 봉(어제)을 그 앞 봉(그제)과 비교해야 한다.
+    총괄이 주는 일봉 맥락(어제까지)은 판단 대상 봉 자신의 값이라, 그것과 비교하면 항상 0이 된다."""
+    cfg = Config.for_market("US")
+    e = Engine(cfg, StrategyParams(), 30_000)
+    seen, gains = [], []
+    ev, ck = e.chart.evaluate, e.guard.check
+
+    def spy_eval(sym, f, p, rvol=-1.0, dtrend=0.5, prev_brk=0.5):
+        seen.append((round(f.close, 2), prev_brk))
+        return ev(sym, f, p, rvol, dtrend, prev_brk)
+
+    def spy_check(f, day_gain, since, p):
+        gains.append(round(day_gain, 2))
+        return ck(f, day_gain, since, p)
+
+    e.chart.evaluate, e.guard.check = spy_eval, spy_check
+    hist = []
+    for i, d in enumerate(_weekdays(date(2026, 1, 5), 27)):
+        base = 100.0 + i
+        e.set_daily("X", hist[-60:])                                       # 실매매처럼 '어제까지'의 일봉 맥락
+        for hh, mm, px in ((9, 30, base), (11, 0, base + 0.6), (13, 0, base - 0.4), (15, 30, base + 0.5)):
+            e.on_tick(Tick("X", US.epoch(d, hh, mm), px, 1000))
+        e.flush_bars()
+        hist.append(Bar("X", US.epoch(d, 9, 30), base, base + 0.6, base - 0.4, base + 0.5, 4000))
+        if seen:
+            break
+    close, prev_brk = seen[0]
+    k = len(hist) - 2                                                      # 판단 대상 봉(어제)의 번호
+    assert close == 100.0 + k + 0.5
+    assert prev_brk == 1.0                                                 # 어제 종가 > 그제 고가 → 돌파
+    assert gains and gains[0] == round(((100.5 + k) / (99.5 + k) - 1) * 100, 2)   # 어제 종가 / 그제 종가
+
+
+def test_research_daily_result_does_not_depend_on_extra_daily_files(tmp_path):
+    """일봉 검증의 일봉 맥락은 같은 일봉에서 만든다 — 폴더에 _1d_1y 파일이 있든 없든 결과가 같아야 한다."""
+    days = _weekdays(date(2024, 1, 2), 260)
+    for k, sym in enumerate(("SPY", "QQQ", "NVDA")):
+        ts, o, h, l, c, v = [], [], [], [], [], []
+        px = 100.0 + 20 * k
+        for i, d in enumerate(days):
+            nxt = px * (1.004 if (i // (15 + 5 * k)) % 2 == 0 else 0.998)      # 오르는 구간과 쉬는 구간이 번갈아
+            ts.append(int(US.epoch(d, 9, 30)))
+            o.append(px), c.append(nxt), h.append(max(px, nxt) * 1.004), l.append(min(px, nxt) * 0.996)
+            v.append(1_000_000 + 50_000 * ((i * (k + 3)) % 7))
+            px = nxt
+        body = json.dumps({"chart": {"result": [{"timestamp": ts, "indicators": {"quote": [
+            {"open": o, "high": h, "low": l, "close": c, "volume": v}]}}]}})
+        (tmp_path / f"{sym}_1d_5y.json").write_text(body, encoding="utf-8")
+    a = run_research(Config.for_market("US"), str(tmp_path), "1d_5y", quiet=True)
+    for sym in ("SPY", "QQQ", "NVDA"):                                     # 맥락 파일(최근 1년분 흉내)을 추가
+        d = json.loads((tmp_path / f"{sym}_1d_5y.json").read_text(encoding="utf-8"))
+        r = d["chart"]["result"][0]
+        r["timestamp"] = r["timestamp"][-120:]
+        q = r["indicators"]["quote"][0]
+        for key in q:
+            q[key] = q[key][-120:]
+        (tmp_path / f"{sym}_1d_1y.json").write_text(json.dumps(d), encoding="utf-8")
+    b = run_research(Config.for_market("US"), str(tmp_path), "1d_5y", quiet=True)
+    assert a["result"]["n"] + a["open"] > 0                                # 매매가 실제로 일어난 자료여야 의미가 있다
+    assert a["ret"] == b["ret"] and a["result"]["n"] == b["result"]["n"] and a["open"] == b["open"]
+
+
+async def test_fetch_saves_yahoo_chart_files(tmp_path, unused_tcp_port):
+    from aiohttp import web
+    from aitrader.research import _download
+    agents = []
+
+    async def chart(req):
+        agents.append(req.headers.get("User-Agent", ""))
+        if req.match_info["symbol"] == "BAD":
+            return web.json_response({"chart": {"result": None}}, status=404)
+        assert req.query["interval"] == "1d" and req.query["range"] == "5y"
+        ts = [int(US.epoch(date(2026, 1, d), 9, 30)) for d in (5, 6, 7)]
+        q = {"open": [1.0, 2.0, 3.0], "high": [1.5, 2.5, 3.5], "low": [0.5, 1.5, 2.5], "close": [1.2, 2.2, 3.2],
+             "volume": [10, 20, 30]}
+        return web.json_response({"chart": {"result": [{"timestamp": ts, "indicators": {"quote": [q]}}]}})
+
+    app = web.Application()
+    app.router.add_get("/v8/finance/chart/{symbol}", chart)
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    await web.TCPSite(runner, "127.0.0.1", unused_tcp_port).start()
+    try:
+        saved = await _download(["SPY", "BAD"], tmp_path, [("1d", "5y")], f"http://127.0.0.1:{unused_tcp_port}")
+    finally:
+        await runner.cleanup()
+    assert saved == ["SPY_1d_5y.json"] and not (tmp_path / "BAD_1d_5y.json").exists()   # 실패한 종목은 저장하지 않는다
+    assert [b.close for b in load_yahoo(tmp_path / "SPY_1d_5y.json", "SPY")] == [1.2, 2.2, 3.2]
+    assert all("aitrader" in a and "@" not in a for a in agents)          # 개인 정보 없는 일반 식별자
+
+
+def test_fetch_history_picks_files_for_style(tmp_path, monkeypatch):
+    import pytest
+    import aitrader.research as R
+    calls = []
+
+    async def fake(symbols, folder, jobs, base_url):
+        calls.append((list(symbols), jobs))
+        return ["x"]
+
+    monkeypatch.setattr(R, "_download", fake)
+    R.fetch_history(Config.for_market("US"), str(tmp_path / "a"))
+    R.fetch_history(Config.for_market("US", "intraday"), str(tmp_path / "b"), symbols=["SPY"])
+    assert calls[0] == (Config.for_market("US").universe, [("1d", "5y")])
+    assert calls[1] == (["SPY"], [("5m", "60d"), ("1d", "1y")])           # 분봉 검증은 일봉 맥락 파일도 함께
+    assert (tmp_path / "a").is_dir()
+    with pytest.raises(SystemExit):
+        R.fetch_history(Config.for_market("KRX"), str(tmp_path / "c"))

@@ -6,7 +6,8 @@
   python -m aitrader run --mode manual        # 주문 보조: 봇이 주문을 제안하고 사람이 증권사 앱에서 체결
   python -m aitrader run --market krx ...     # 국내 주식
   python -m aitrader backtest --days 20       # 합성 시세 백테스트
-  python -m aitrader research --dir <폴더>     # 실제 과거 시세(야후 형식 JSON)로 백테스트
+  python -m aitrader fetch --dir <폴더>        # 과거 시세 내려받기(야후 파이낸스)
+  python -m aitrader research --dir <폴더>     # 내려받은 실제 과거 시세로 백테스트
   python -m aitrader bench                    # 판단 지연(틱→결정) 측정
 """
 from __future__ import annotations
@@ -148,6 +149,17 @@ def cmd_research(a) -> None:
                  commission=a.commission, learn=a.learn, no_halt=a.no_halt, start=a.start, end=a.end)
 
 
+def cmd_fetch(a) -> None:
+    from .research import fetch_history
+    cfg = _cfg(a)
+    syms = [x.strip().upper() for x in a.symbols.split(",") if x.strip()] if a.symbols else None
+    print(f"과거 시세를 내려받습니다 → {a.dir}  (야후 파이낸스 비공식 조회, 개인적 조사 용도)")
+    saved = fetch_history(cfg, a.dir, a.interval, a.rng, syms)
+    if not saved:
+        raise SystemExit("내려받은 파일이 없습니다 — 네트워크 연결이나 종목 코드를 확인하세요")
+    print(f"완료: 파일 {len(saved)}개. 이어서  python -m aitrader research --dir {a.dir}  로 검증할 수 있습니다.")
+
+
 def cmd_bench(a) -> None:
     from .backtest import Backtester
     from .brokers.sim import SimMarket
@@ -192,6 +204,13 @@ def main() -> None:
     b.add_argument("--days", type=int, default=20)
     b.add_argument("--seed", type=int, default=7)
     b.set_defaults(fn=cmd_backtest)
+    ft = sub.add_parser("fetch", help="과거 시세 내려받기(research 의 입력)")
+    common(ft)
+    ft.add_argument("--dir", required=True, help="저장할 폴더")
+    ft.add_argument("--interval", default=None, help="봉 간격(기본: 스윙 1d, 단타 5m)")
+    ft.add_argument("--range", dest="rng", default=None, help="기간(기본: 스윙 5y, 단타 60d)")
+    ft.add_argument("--symbols", default=None, help="쉼표로 구분한 종목(기본: 설정의 감시 후보)")
+    ft.set_defaults(fn=cmd_fetch)
     rs = sub.add_parser("research", help="실제 과거 시세로 백테스트")
     common(rs)
     rs.add_argument("--dir", required=True, help="<종목>_<간격>.json 파일이 있는 폴더(야후 차트 형식)")
@@ -205,6 +224,11 @@ def main() -> None:
     c = sub.add_parser("bench", help="판단 지연 측정")
     common(c)
     c.set_defaults(fn=cmd_bench)
+    for st in (sys.stdout, sys.stderr):             # 콘솔 글자 인코딩(윈도우 등) 때문에 출력이 죽지 않게
+        try:
+            st.reconfigure(errors="replace")
+        except Exception:
+            pass
     a = ap.parse_args()
     a.fn(a)
 
