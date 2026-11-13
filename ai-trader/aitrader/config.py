@@ -228,7 +228,7 @@ class Config:
                           "stop_atr_mult": 2.5, "time_stop_bars": 60, "cooldown_bars": 5,
                           "rsi_overbought": 85.0, "max_ext_atr": 4.0, "max_day_gain_pct": 25.0}
             cfg.learn.lookback_days = 250          # 일봉이라 1년치 기록으로 검증
-            # 실제 5년 데이터 검증에서 자동 적용은 낙폭을 줄였지만(7.0%→4.9%) 수익도 줄였다(+25.7%→+12.6%).
+            # 실제 5년 데이터 검증에서 자동 적용은 낙폭을 줄였지만(7.1%→4.9%) 수익도 줄였다(+24.6%→+13.7%).
             # 수익 개선 근거가 없으므로 기본은 '분석·제안만'. 켜려면 config.toml 의 [learn] auto_apply = true
             cfg.learn.auto_apply = False
             cfg.learn.min_days_between_changes = 20
