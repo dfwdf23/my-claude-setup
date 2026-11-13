@@ -158,6 +158,10 @@ class Learner(Agent):
         self.reports: list[dict] = []
         self.day_pnls: list[float] = []
         self.days_since_change = 10 ** 6
+        self.daily = cfg.strategy.bar_sec >= 86_400          # 일봉 방식(스윙)
+
+    def _bt(self, p: StrategyParams, bars: list[Bar]) -> Backtester:
+        return Backtester(self.cfg, p, self.cfg.capital).run_bars(bars, daily_ctx=self.daily)
 
     def tag(self, t: Trade, p: StrategyParams) -> list[str]:
         return tag_causes(t, p, self.open_tod, self.close_tod)
@@ -237,8 +241,8 @@ class Learner(Agent):
         cap = self.cfg.capital
 
         def run(p: StrategyParams) -> tuple[float, float, int, dict]:
-            md = Backtester(self.cfg, p, cap).run_bars(design).result()
-            mh = Backtester(self.cfg, p, cap).run_bars(hold).result()
+            md = self._bt(p, design).result()
+            mh = self._bt(p, hold).result()
             return (score(md, cap), score(mh, cap), md["n"] + mh["n"],
                     {"n": md["n"] + mh["n"], "pnl": round(md["pnl"] + mh["pnl"]),
                      "max_dd": round(max(md["max_dd"], mh["max_dd"]))})
@@ -282,6 +286,13 @@ class Learner(Agent):
         design_trades = recent if hold_start is None else [
             t for t in recent if self.m.local_day(t.exit_ts) < hold_start]
         cands: list[tuple[str, StrategyParams, str]] = []
+        if hold_start is not None and len(design_trades) < cfg.min_trades and bars and not rb:
+            # 실거래 표본이 아직 적다(스윙은 거래가 드물다) → 설계 구간의 기록을 현재 값으로 재생해 얻은 거래를 분석한다
+            dbars = [b for b in bars if self.m.local_day(b.ts) < hold_start]
+            sim = await asyncio.to_thread(lambda: self._bt(p, dbars).engine.trades)
+            if len(sim) >= cfg.min_trades:
+                design_trades = sim
+                report["sample"] = f"과거 기록 재생 {len(sim)}건"
         enough = len(design_trades) >= cfg.min_trades and hold_start is not None
         self.days_since_change += 1
         settled = self.days_since_change >= cfg.min_days_between_changes
@@ -325,8 +336,8 @@ class Learner(Agent):
                 report["lessons"].append(
                     f"후보 {len(table) - 1}개 검증 — 표본외 구간까지 통과한 안이 없어 현재값 유지")
 
-        # 3) 성과 기반 크기 조절(연속 손실일이면 줄이고, 회복하면 되돌림)
-        thr = self._throttle()
+        # 3) 성과 기반 크기 조절(연속 손실일이면 줄이고, 회복하면 되돌림). 일봉 방식은 하루 등락이 잦아 적용하지 않는다.
+        thr = "" if self.daily else self._throttle()
         if thr:
             report["lessons"].append(thr)
 

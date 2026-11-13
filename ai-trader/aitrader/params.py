@@ -82,9 +82,10 @@ def _load(d: dict) -> StrategyParams:
 class ParamStore:
     """params.json 에 현재값과 변경 이력을 보관. 롤백 가능."""
 
-    def __init__(self, path: str | Path | None):
+    def __init__(self, path: str | Path | None, defaults: dict | None = None):
+        """defaults: 매매 방식별 시작값(저장된 파일이 없을 때만 쓰인다)."""
         self.path = Path(path) if path else None
-        self.current = StrategyParams()
+        self.current = _load({**asdict(StrategyParams()), **(defaults or {})})
         self.history: list[dict] = []
         if self.path and self.path.exists():
             data = json.loads(self.path.read_text(encoding="utf-8"))

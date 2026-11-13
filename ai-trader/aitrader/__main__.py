@@ -89,7 +89,7 @@ def _loop_run(coro) -> None:
 
 
 def _cfg(a) -> Config:
-    return load_config(a.config, getattr(a, "market", None))
+    return load_config(a.config, getattr(a, "market", None), getattr(a, "style", None))
 
 
 def cmd_run(a) -> None:
@@ -129,7 +129,7 @@ def cmd_backtest(a) -> None:
     cfg = _cfg(a)
     mk = SimMarket(cfg.universe[:cfg.max_symbols], a.seed, cfg.sim.tick_sec, etfs=frozenset(cfg.etfs),
                    market=cfg.mkt, open_hhmm=cfg.session.open, close_hhmm=cfg.session.close)
-    bt = Backtester(cfg, ParamStore(None).current)
+    bt = Backtester(cfg, ParamStore(None, cfg.params).current)
     t0 = time.perf_counter()
     for _ in range(a.days):
         for sym in mk.symbols:
@@ -144,7 +144,8 @@ def cmd_backtest(a) -> None:
 def cmd_research(a) -> None:
     from .research import run_research
     cfg = _cfg(a)
-    run_research(cfg, a.dir, a.interval, commission=a.commission)
+    run_research(cfg, a.dir, a.interval or ("1d_5y" if cfg.style == "swing" else "5m_60d"),
+                 commission=a.commission, learn=a.learn, no_halt=a.no_halt, start=a.start, end=a.end)
 
 
 def cmd_bench(a) -> None:
@@ -158,7 +159,7 @@ def cmd_bench(a) -> None:
     for _ in range(3):
         ticks += list(mk.day_ticks())
         mk.next_day()
-    bt = Backtester(cfg, ParamStore(None).current)
+    bt = Backtester(cfg, ParamStore(None, cfg.params).current)
     t0 = time.perf_counter()
     bt.run_ticks(ticks)
     el = time.perf_counter() - t0
@@ -174,6 +175,7 @@ def main() -> None:
 
     def common(p):
         p.add_argument("--market", choices=["us", "krx", "US", "KRX"], help="시장(기본: config.toml 또는 us)")
+        p.add_argument("--style", choices=["swing", "intraday"], help="매매 방식(미국 기본: swing)")
 
     r = sub.add_parser("run", help="매매 실행 + 대시보드")
     common(r)
@@ -193,8 +195,12 @@ def main() -> None:
     rs = sub.add_parser("research", help="실제 과거 시세로 백테스트")
     common(rs)
     rs.add_argument("--dir", required=True, help="<종목>_<간격>.json 파일이 있는 폴더(야후 차트 형식)")
-    rs.add_argument("--interval", default="5m_60d", help="파일 이름의 간격 부분(예: 5m_60d)")
+    rs.add_argument("--interval", default=None, help="파일 이름의 간격 부분(예: 1d_5y, 5m_60d)")
     rs.add_argument("--commission", type=float, default=None, help="수수료율 덮어쓰기(예: 0.0007)")
+    rs.add_argument("--learn", action="store_true", help="날마다 복기·학습을 돌리며 검증(규칙 기반)")
+    rs.add_argument("--no-halt", action="store_true", help="손실 한도 정지를 끄고 전 기간을 본다")
+    rs.add_argument("--start", help="시작일 YYYY-MM-DD")
+    rs.add_argument("--end", help="종료일 YYYY-MM-DD(포함 안 함)")
     rs.set_defaults(fn=cmd_research)
     c = sub.add_parser("bench", help="판단 지연 측정")
     common(c)

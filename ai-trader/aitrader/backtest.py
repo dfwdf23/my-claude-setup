@@ -90,18 +90,42 @@ class Backtester:
             on_tick(t)
         return self
 
-    def run_bars(self, bars: Iterable[Bar]) -> "Backtester":
-        """시간순으로 정렬된 봉(여러 종목 섞여 있어도 됨)."""
+    def run_bars(self, bars: Iterable[Bar], daily_ctx: bool = False) -> "Backtester":
+        """시간순으로 정렬된 봉(여러 종목·여러 날이 섞여 있어도 됨).
+
+        날이 바뀔 때마다 그날의 마지막 봉을 닫는다(실매매에서 장 마감 때 하는 일과 같다).
+        daily_ctx: 일봉을 재생할 때, 각 날짜 이전의 봉으로 일봉 맥락(전일 종가·추세)을 채운다.
+        """
         self._bar_mode = True
-        q = float(self.cfg.strategy.bar_sec) / 4.0
-        on_tick = self.engine.on_tick
+        e = self.engine
+        # 봉 안의 네 점을 봉 시작 직후에 몰아 둔다(긴 봉·반쪽짜리 마지막 봉도 장 시간 안에 들어오게)
+        q = min(float(self.cfg.strategy.bar_sec) / 4.0, 450.0)
+        on_tick = e.on_tick
         kind = self._kind
+        offset = self.m.utc_offset
+        past: dict[str, list[Bar]] = {}
+        today: list[Bar] = []
+        day = None
         for b in bars:
+            d = int((b.ts + offset(b.ts)) // 86400.0)
+            if d != day:
+                if day is not None:
+                    e.flush_bars()
+                if daily_ctx:
+                    for x in today:
+                        past.setdefault(x.symbol, []).append(x)
+                    today = []
+                    for sym, hist in past.items():
+                        e.set_daily(sym, hist[-60:])
+                day = d
+            if daily_ctx:
+                today.append(b)
             v = b.volume // 4
             sym = b.symbol
             for i, px in enumerate((b.open, b.low, b.high, b.close)):
                 kind[sym] = i
                 on_tick(Tick(sym, b.ts + i * q, px, v if i < 3 else b.volume - 3 * v))
+        e.flush_bars()
         self._bar_mode = False
         return self
 

@@ -321,8 +321,10 @@ async def test_learner_needs_enough_samples(tmp_path):
     store = ParamStore(None)
     ln = Learner(cfg, store, LLM(SimpleNamespace(enabled=False)), Journal(None))
     rep = await ln.review("d", trades[:3], trades[:3], bars, {}, 0.0)
-    assert store.current.version == 1 and not rep["tested"]
-    assert any("표본 부족" in x for x in rep["lessons"])
+    # 실거래가 3건뿐이어도, 기록된 봉을 현재 값으로 재생해 얻은 거래를 표본으로 삼아 후보를 만들고 검증한다
+    assert "과거 기록 재생" in rep.get("sample", "") and rep["tested"] and rep["tested"][0]["name"] == "현재값"
+    store = ParamStore(None)
+    ln = Learner(cfg, store, LLM(SimpleNamespace(enabled=False)), Journal(None))
     # 기록이 3거래일 미만이면 표본외 검증을 할 수 없으므로 아무것도 바꾸지 않는다
     two_days = [b for b in bars if cfg.mkt.local_day(b.ts) <= cfg.mkt.local_day(bars[0].ts) + 1]
     rep2 = await ln.review("d", trades, trades, two_days, {}, 0.0)

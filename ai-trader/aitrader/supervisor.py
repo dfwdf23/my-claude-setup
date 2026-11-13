@@ -53,13 +53,14 @@ class Supervisor(Agent):
         d = store_dir(cfg) if persist else None
         self.dir = d
         self.journal = Journal(d / "journal.db" if d else None)
-        self.store = ParamStore(d / "params.json" if d else None)
+        self.store = ParamStore(d / "params.json" if d else None, cfg.params)
         self.llm = LLM(cfg.llm, self.journal)
         self.engine = Engine(cfg, self.store.current, cfg.capital)
         timeout = cfg.manual.ticket_ttl_min * 60.0 if self.manual else cfg.risk.order_timeout_sec
         self.executor = Executor(broker, self.engine, timeout)
         self.market = MarketAnalyst(cfg, self.llm)
-        self.screener = Screener()
+        self.daily = cfg.strategy.bar_sec >= 86_400          # 일봉 방식(스윙)
+        self.screener = Screener(cfg.learn.lookback_days + 70 if self.daily else 60)
         self.learner = Learner(cfg, self.store, self.llm, self.journal)
         self.news = (NewsAgent(cfg, self.llm, self.engine, broker, self.journal)
                      if cfg.news.enabled and cfg.mode != "sim" else None)
@@ -145,14 +146,21 @@ class Supervisor(Agent):
         syms = list(dict.fromkeys(syms + list(e.positions)))   # 보유 중인 종목은 반드시 시세를 받아야 한다
         self.symbols = syms
         day0 = self.m.epoch(d)
+        ses = self.cfg.session
+        early = self.m.local(now).hour * 3600 + self.m.local(now).minute * 60 < ses.tod("open") + 1800
         for sym in syms:
             s = e.symbol_state(sym)
-            e.set_daily(sym, [b for b in self.screener.bars.get(sym, []) if b.ts < day0])   # 일봉 맥락(어제까지)
-            if s.ind.n == 0:                          # 지표 예열: 어제까지 기록된 봉으로 미리 채운다
-                for b in self.journal.recent_bars(sym, 3 * self.cfg.strategy.warmup_bars):
+            dbars = [b for b in self.screener.bars.get(sym, []) if b.ts < day0]      # 어제까지의 일봉
+            e.set_daily(sym, dbars[-60:])
+            if s.ind.n == 0:                          # 지표 예열: 어제까지의 봉으로 미리 채운다
+                warm = dbars[-3 * self.cfg.strategy.warmup_bars:] if self.daily else \
+                    self.journal.recent_bars(sym, 3 * self.cfg.strategy.warmup_bars)
+                for b in warm:
                     f = s.ind.update(b)
                     s.hist.append((b.ts, b.open, b.high, b.low, b.close, b.volume, f.ema_fast, f.ema_slow, f.vwap))
                 s.ind.reset_session()
+                if self.daily and warm and early:
+                    s.undecided = True                # 장 초반에 켜졌다면 어제 봉에 대한 판단을 오늘 한다
         if self.news is not None:
             self.news.new_day()
             self.news.set_symbols(syms)
@@ -204,8 +212,25 @@ class Supervisor(Agent):
 
     def _recent_bars(self, now: float) -> list:
         n = self.cfg.learn.lookback_days
-        bars = self.journal.load_bars(now - n * 2 * 86400 - 86400)
         day = self.m.local_day
+        if self.daily:
+            # 일봉 방식: 증권사가 주는 과거 일봉 + 오늘 기록한 봉. 재생이 장 시간 안에서 돌도록 시각을 장 시작으로 맞춘다.
+            from .models import Bar
+            oh, om = divmod(self.cfg.session.tod("open") // 60, 60)
+            seen, out = set(), []
+            today = self.journal.load_bars(now - 86400)
+            for src in (*self.screener.bars.values(), today):
+                for b in src:
+                    loc = self.m.local(b.ts)
+                    key = (b.symbol, loc.date())
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append(Bar(b.symbol, self.m.epoch(loc.date(), oh, om), b.open, b.high, b.low, b.close, b.volume))
+            out.sort(key=lambda b: (b.ts, b.symbol))
+            days = sorted({day(b.ts) for b in out})[-n:]
+            return [b for b in out if days and day(b.ts) >= days[0]]
+        bars = self.journal.load_bars(now - n * 2 * 86400 - 86400)
         days = sorted({day(b.ts) for b in bars})[-n:]
         if not days:
             return []
@@ -438,6 +463,8 @@ class Supervisor(Agent):
             return None
         bars = [list(b) for b in s.hist if b[0] > since_ts]
         cur = [s.bar_start, s.o, s.h, s.l, s.c, s.v] if s.bar_start >= 0 else None
+        view = [list(b) for b in s.view if b[0] > since_ts]          # 화면용 분봉(전략 봉이 일봉일 때의 실시간 차트)
+        vcur = [s.v_start, s.vo, s.vh, s.vl, s.vc, s.vv] if s.v_start >= 0 else None
         marks = []
         for t in e.trades_day:
             if t.symbol == symbol:
@@ -450,7 +477,7 @@ class Supervisor(Agent):
             marks.append({"ts": pos.entry_ts, "price": pos.avg_price, "side": "BUY"})
             levels = {"avg": pos.avg_price, "stop": pos.stop, "target": pos.target}
         return {"symbol": symbol, "bar_sec": self.cfg.strategy.bar_sec, "bars": bars, "cur": cur,
-                "marks": marks, "levels": levels, "last": s.last, "cum_vol": s.cum_vol,
+                "view_sec": self.cfg.strategy.view_sec, "view": view, "vcur": vcur, "marks": marks, "levels": levels, "last": s.last, "cum_vol": s.cum_vol,
                 "rvol": round(s.rvol, 2), "prev_close": s.prev_close}
 
     def snapshot(self, since_seq: int = 0) -> dict:

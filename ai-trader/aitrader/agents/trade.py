@@ -114,13 +114,15 @@ class SellAgent(Agent):
         return None
 
     def on_bar(self, pos: Position, f: Features, bid: float, p: StrategyParams,
-               etf: bool = False) -> OrderIntent | None:
+               etf: bool = False, last: float = 0.0) -> OrderIntent | None:
+        """조건은 마감된 봉(f)으로 보고, 주문가는 지금 가격(last)을 기준으로 낸다."""
         self.calls += 1
         px = f.close
+        ref = last or px
         if f.ready and px < f.ema_slow and f.ema_fast < f.ema_slow:
-            return self._limit(pos, px, bid, "trend_exit", etf)
+            return self._limit(pos, ref, bid, "trend_exit", etf)
         if pos.bars_held >= p.time_stop_bars and px < pos.avg_price + 0.5 * pos.risk_per_share:
-            return self._limit(pos, px, bid, "time_stop", etf)
+            return self._limit(pos, ref, bid, "time_stop", etf)
         return None
 
     def _limit(self, pos: Position, px: float, bid: float, reason: str, etf: bool) -> OrderIntent:

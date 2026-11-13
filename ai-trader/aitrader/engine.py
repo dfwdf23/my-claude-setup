@@ -52,7 +52,8 @@ class LatencyStats:
 class SymState:
     __slots__ = ("symbol", "last", "bid", "ask", "ind", "f", "bar_start", "o", "h", "l", "c", "v",
                  "day_open", "bar_count", "last_loss_bar", "retry_after", "score", "etf", "tax",
-                 "cum_vol", "prev_close", "prev_high", "avg_dvol", "dtrend", "rvol", "hist")
+                 "cum_vol", "prev_close", "prev_high", "avg_dvol", "dtrend", "rvol", "hist", "undecided",
+                 "v_start", "vo", "vh", "vl", "vc", "vv", "view")
 
     def __init__(self, symbol: str, cfg, etf: bool = False, tax: float = 0.0) -> None:
         self.symbol = symbol
@@ -79,6 +80,12 @@ class SymState:
         self.dtrend = 0.5         # 일봉 추세: 1 상승 정배열, 0 하락 역배열, 0.5 중립/모름
         self.rvol = -1.0          # 상대 거래량(평소 같은 시각 대비). -1 = 모름
         self.hist: deque = deque(maxlen=400)   # 차트 표시용 최근 봉(지표 포함)
+        self.undecided = False    # 장 마감 때 닫은 봉에 대한 매매 판단이 아직 안 됨(다음 장 매수 시작 시각에 판단)
+        # 화면용 분봉(전략 봉이 일봉·시간봉일 때도 실시간 차트를 보여 주기 위한 별도 봉)
+        self.v_start = -1.0
+        self.vo = self.vh = self.vl = self.vc = 0.0
+        self.vv = 0
+        self.view: deque = deque(maxlen=420)
 
 
 class Engine:
@@ -97,6 +104,10 @@ class Engine:
         self.open_tod = float(cfg.session.tod("open"))
         self.close_tod = float(cfg.session.tod("close"))
         self.session_len = max(self.close_tod - self.open_tod, 1.0)
+        self.carry = not cfg.session.intraday_only     # 포지션을 다음 날로 넘기는 방식(스윙)
+        self.decide_tod = float(cfg.session.tod("entry_start"))
+        self.view_sec = float(cfg.strategy.view_sec)
+        self.view_on = not quiet and self.bar_sec > self.view_sec
         self.tz_off = 0.0             # (현지 − UTC) 초. 한 시간에 한 번만 다시 계산
         self._tz_until = 0.0
         # 에이전트
@@ -242,17 +253,47 @@ class Engine:
             s.c = px
             s.v += t.volume
 
+        if s.undecided and tod >= self.decide_tod:
+            # 어제 마감 때 닫힌 봉(일봉 방식에서는 하루 전체)에 대한 판단을 오늘 매수 시작 시각에 한다
+            s.undecided = False
+            if self.carry:
+                self._decide(s, s.f, tod)
+
+        if self.view_on:
+            vb = ts - ts % self.view_sec
+            if vb != s.v_start:
+                if s.v_start >= 0.0:
+                    s.view.append((s.v_start, s.vo, s.vh, s.vl, s.vc, s.vv))
+                s.v_start = vb
+                s.vo = s.vh = s.vl = s.vc = px
+                s.vv = t.volume
+            else:
+                if px > s.vh:
+                    s.vh = px
+                elif px < s.vl:
+                    s.vl = px
+                s.vc = px
+                s.vv += t.volume
+
         if ts - self._mark_ts >= 5.0:
             self.mark()
         self.lat.add(perf_counter_ns() - t0)
 
-    def _bar_close(self, s: SymState, bar: Bar, tod: float) -> None:
+    def _ingest(self, s: SymState, bar: Bar) -> Features:
+        """마감된 봉을 지표·차트 기록·일지에 반영한다(매매 판단은 하지 않는다)."""
         f = s.ind.update(bar)
         s.bar_count += 1
         s.hist.append((bar.ts, bar.open, bar.high, bar.low, bar.close, bar.volume,
                        f.ema_fast, f.ema_slow, f.vwap))
         if self.on_bar_cb is not None:
             self._hook(self.on_bar_cb, bar)
+        return f
+
+    def _bar_close(self, s: SymState, bar: Bar, tod: float) -> None:
+        self._decide(s, self._ingest(s, bar), tod)
+
+    def _decide(self, s: SymState, f: Features, tod: float) -> None:
+        """봉 마감 시점의 매매 판단: 보유 중이면 봉 단위 청산 조건, 아니면 매수 신호."""
         # 상대 거래량: 평소 이 시각까지 쌓였을 거래량 대비 오늘 누적 거래량(장 초·마감에 몰리는 U자 분포 반영)
         x = (tod - self.open_tod) / self.session_len
         if s.avg_dvol > 0.0 and x > 0.02:
@@ -266,7 +307,7 @@ class Engine:
         pos = self.positions.get(sym)
         if pos is not None:
             pos.bars_held += 1
-            it = self.seller.on_bar(pos, f, s.bid, p, s.etf)
+            it = self.seller.on_bar(pos, f, s.bid, p, s.etf, s.last)
             if it is not None:
                 self._send(it, s)
             return
@@ -467,13 +508,8 @@ class Engine:
         """장 마감 시 진행 중인 마지막 봉을 닫는다(기록용)."""
         for s in self.sym.values():
             if s.bar_start >= 0.0:
-                bar = Bar(s.symbol, s.bar_start, s.o, s.h, s.l, s.c, s.v)
-                f = s.ind.update(bar)
-                s.bar_count += 1
-                s.hist.append((bar.ts, bar.open, bar.high, bar.low, bar.close, bar.volume,
-                               f.ema_fast, f.ema_slow, f.vwap))
-                if self.on_bar_cb is not None:
-                    self._hook(self.on_bar_cb, bar)
+                self._ingest(s, Bar(s.symbol, s.bar_start, s.o, s.h, s.l, s.c, s.v))
+                s.undecided = True
                 s.bar_start = -1.0
 
     def unrealized(self) -> float:

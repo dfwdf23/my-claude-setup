@@ -188,8 +188,9 @@ class Screener(Agent):
     role = "종목선정"
     kind = "slow"
 
-    def __init__(self) -> None:
+    def __init__(self, n_daily: int = 60) -> None:
         super().__init__()
+        self.n_daily = n_daily
         self.bars: dict[str, list] = {}       # 종목별 일봉(장전 준비 때 일봉 맥락 계산에 재사용)
 
     async def select(self, broker: Broker, candidates: list[str], max_n: int, now: float) -> list[str]:
@@ -197,7 +198,7 @@ class Screener(Agent):
         scored = []
         for sym in candidates:
             try:
-                bars = await broker.get_daily_bars(sym, 60)
+                bars = await broker.get_daily_bars(sym, self.n_daily)
             except Exception:
                 bars = []
             self.bars[sym] = bars

@@ -69,6 +69,7 @@ class StrategyCfg:
     breakout: int = 20
     vol_avg: int = 20
     warmup_bars: int = 25
+    view_sec: int = 300                # 화면용 분봉 길이(전략 봉이 이보다 길 때만 따로 만든다)
 
 
 @dataclass
@@ -159,6 +160,8 @@ class NotifyCfg:
 class Config:
     mode: str = "sim"                  # sim | kis-mock | kis-live | manual
     market: str = "KRX"                # KRX | US
+    style: str = "intraday"            # swing(일봉, 며칠~몇 주 보유) | intraday(분봉, 당일 청산)
+    params: dict = field(default_factory=dict)   # 전략 파라미터 기본값 덮어쓰기(학습 시작점)
     data_dir: str = "data"
     capital: float = 50_000_000        # sim 시작 자본 / 실매매: 봇이 쓸 수 있는 최대 금액
     # 국내 기본 종목: 유동성 큰 ETF 위주. ETF는 매도 시 거래세가 없고 호가단위(5원)가 작아
@@ -187,29 +190,62 @@ class Config:
         return get_market(self.market)
 
     @classmethod
-    def for_market(cls, code: str) -> "Config":
+    def for_market(cls, code: str, style: str | None = None) -> "Config":
+        """시장·매매 방식별 기본 설정.
+
+        미국 기본은 swing 이다. 실제 과거 시세 검증(README '실제 데이터 검증')에서 분봉 단타는 수수료를
+        넣으면 손실이었고, 일봉 기준으로 몇 주 보유하는 방식만 수수료 후에도 이익이었기 때문이다.
+        """
         code = code.upper()
         get_market(code)
         if code == "KRX":
+            if style not in (None, "intraday"):
+                raise ValueError("국내(KRX)는 현재 intraday 방식만 기본값이 준비돼 있습니다")
             return cls()
-        cfg = cls(market="US", capital=30_000.0)
-        # 미국 기본 종목: 거래대금이 매우 크고 변동성이 충분한 ETF·대형주
-        cfg.universe = ["SPY", "QQQ", "TQQQ", "SQQQ", "SOXL", "SOXS", "NVDA", "TSLA", "AAPL", "MSFT", "AMD", "META"]
-        cfg.etfs = ["SPY", "QQQ", "TQQQ", "SQQQ", "SOXL", "SOXS"]
-        cfg.inverse = ["SQQQ", "SOXS"]
-        cfg.max_symbols = 12
-        cfg.session = SessionCfg(open="09:30", close="16:00", entry_start="09:40", entry_end="15:30",
-                                 flatten="15:50", intraday_only=True, pre_open="09:00", post="16:10")
+        style = style or "swing"
+        if style not in ("swing", "intraday"):
+            raise ValueError(f"알 수 없는 매매 방식: {style} (swing 또는 intraday)")
+        cfg = cls(market="US", capital=30_000.0, style=style)
         cfg.risk.max_order_notional = 15_000.0
+        if style == "swing":
+            # 인버스 ETF는 오래 들고 있으면 구조적으로 가치가 깎이므로 며칠~몇 주 보유하는 방식에서는 뺀다
+            cfg.universe = ["SPY", "QQQ", "TQQQ", "SOXL", "NVDA", "TSLA", "AAPL", "MSFT", "AMD", "META"]
+            cfg.etfs = ["SPY", "QQQ", "TQQQ", "SOXL"]
+            cfg.inverse = []
+            cfg.max_symbols = 10
+            cfg.strategy.bar_sec = 86_400          # 일봉: 전날 봉이 닫힌 뒤 다음 날 장 초반에 판단
+            cfg.session = SessionCfg(open="09:30", close="16:00", entry_start="09:35", entry_end="15:55",
+                                     flatten="15:50", intraday_only=False, pre_open="09:00", post="16:10")
+            cfg.risk.max_positions = 10
+            cfg.risk.max_weight = 0.10
+            cfg.risk.max_exposure = 0.95
+            cfg.risk.max_trades_per_day = 20
+            # 수익은 길게, 손절은 넉넉히: 익절 5R, 1.5R부터 추적손절(3 ATR), 손절 2.5 ATR
+            cfg.params = {"take_profit_r": 5.0, "trail_start_r": 1.5, "trail_atr_mult": 3.0,
+                          "stop_atr_mult": 2.5, "time_stop_bars": 60, "cooldown_bars": 5,
+                          "rsi_overbought": 85.0, "max_ext_atr": 4.0, "max_day_gain_pct": 25.0}
+            cfg.learn.lookback_days = 250          # 일봉이라 1년치 기록으로 검증
+            cfg.learn.min_days_between_changes = 20
+            cfg.learn.rollback_min_trades = 10
+            cfg.learn.rollback_min_days = 20
+        else:
+            # 분봉 단타(당일 청산). 실제 데이터 검증에서는 손실이었다 — 연구·실험용.
+            cfg.universe = ["SPY", "QQQ", "TQQQ", "SQQQ", "SOXL", "SOXS", "NVDA", "TSLA", "AAPL", "MSFT", "AMD", "META"]
+            cfg.etfs = ["SPY", "QQQ", "TQQQ", "SQQQ", "SOXL", "SOXS"]
+            cfg.inverse = ["SQQQ", "SOXS"]
+            cfg.max_symbols = 12
+            cfg.session = SessionCfg(open="09:30", close="16:00", entry_start="09:40", entry_end="15:30",
+                                     flatten="15:50", intraday_only=True, pre_open="09:00", post="16:10")
         # 국내 증권사의 미국주식 온라인 수수료는 표준 0.25%(이벤트 적용 시 0.07~0.1%) — 본인 요율로 반드시 수정.
         cfg.fees = FeeCfg(commission=0.0025, sell_tax=0.00003, slippage_ticks=2)
         cfg.kis.exchange = "NASD"
         cfg.kis.exchanges = {"SPY": "AMS", "QQQ": "NAS", "TQQQ": "NAS", "SQQQ": "NAS", "SOXL": "AMS",
                              "SOXS": "AMS", "NVDA": "NAS", "TSLA": "NAS", "AAPL": "NAS", "MSFT": "NAS",
                              "AMD": "NAS", "META": "NAS"}
+        # 종목별 뉴스 피드(개인적·비상업적 이용 조건의 공개 RSS). 피드 약관 준수는 사용자 책임 — 원하면 바꾸거나 비울 것.
         cfg.news.feeds = [
             "https://feeds.finance.yahoo.com/rss/2.0/headline?s={symbol}&region=US&lang=en-US",
-            "https://news.google.com/rss/search?q={symbol}+stock+when:1d&hl=en-US&gl=US&ceid=US:en",
+            "https://www.nasdaq.com/feed/rssoutbound?symbol={symbol}",
         ]
         cfg.news.aliases = {"NVDA": ["Nvidia"], "TSLA": ["Tesla"], "AAPL": ["Apple"], "MSFT": ["Microsoft"],
                             "AMD": ["Advanced Micro Devices"], "META": ["Meta Platforms"]}
@@ -250,7 +286,7 @@ def load_dotenv(path: str = ".env") -> None:
             os.environ.setdefault(k.strip(), v)
 
 
-def load_config(path: str | None = None, market: str | None = None) -> Config:
+def load_config(path: str | None = None, market: str | None = None, style: str | None = None) -> Config:
     load_dotenv()
     p = Path(path or "config.toml")
     data: dict = {}
@@ -258,8 +294,9 @@ def load_config(path: str | None = None, market: str | None = None) -> Config:
         data = tomllib.loads(p.read_text(encoding="utf-8"))
     elif path:
         raise FileNotFoundError(path)
-    cfg = Config.for_market(market or data.get("market", "US"))
+    cfg = Config.for_market(market or data.get("market", "US"), style or data.get("style"))
     data.pop("market", None)
+    data.pop("style", None)
     _merge(cfg, data)
     env = os.environ
     k = cfg.kis
