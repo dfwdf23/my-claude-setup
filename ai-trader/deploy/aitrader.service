@@ -1,7 +1,9 @@
 # systemd 서비스 — 서버가 재부팅되거나 프로그램이 죽어도 자동으로 다시 뜹니다.
+# (아래 예시는 /opt/ai-trader 에 설치하고 .venv 를 만든 경우입니다. 경로·사용자·모드는 환경에 맞게 고치세요.)
 #   sudo cp deploy/aitrader.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now aitrader
 #   journalctl -u aitrader -f      # 로그 보기
+# 키·토큰은 /opt/ai-trader/.env 에 넣습니다 — 프로그램이 작업 폴더의 .env 와 config.toml 을 직접 읽습니다.
 [Unit]
 Description=AI Auto Trader
 After=network-online.target
@@ -11,13 +13,14 @@ Wants=network-online.target
 Type=simple
 User=trader
 WorkingDirectory=/opt/ai-trader
-EnvironmentFile=/opt/ai-trader/.env
+# 로그 시각만 한국 시각으로 — 매매 일과는 거래소 현지 시각(미국은 뉴욕)으로 자동 계산합니다
 Environment=TZ=Asia/Seoul
+# 한국투자증권 모의투자로 자동 주문. 실전은 kis-live (+ .env 의 AITRADER_LIVE_CONFIRM)
 ExecStart=/opt/ai-trader/.venv/bin/python -m aitrader run --mode kis-mock
 Restart=always
 RestartSec=5
-# 종료 신호를 받으면 상태를 저장하고 끝낼 시간을 준다
-TimeoutStopSec=20
+# 종료 신호를 받으면 걸려 있는 주문을 정리하고 장부를 저장할 시간을 준다
+TimeoutStopSec=30
 NoNewPrivileges=true
 ProtectSystem=full
 PrivateTmp=true
