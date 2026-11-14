@@ -826,15 +826,19 @@ async def test_news_classifier_ignores_bad_indices_and_never_invents_verdicts_on
                          {"i": "x", "impact": -2, "kind": "legal"}]}
     assert await na.classify(NOW + 400) == 0 and not e.exit_now
     llm.raw, llm.fail = None, True                                       # 응답 없음(예산 소진·장애)
-    assert await na.classify(NOW + 800) == 0
+    calls0, day_calls0 = len(llm.calls), na.llm_calls_day
+    for k in range(9):
+        assert await na.classify(NOW + 800 + 400 * k) == 0
     assert all(not it.verdicts and it.impact is None for it in na.items.values())
     assert all(v["by"] == "rule" for v in na.recent(5))                  # 화면에도 '규칙 판정'으로 남는다
     assert na.llm_off and any("Claude 소식 분류 중단" in ev["text"] for ev in e.events)
-    n = len(llm.calls)
-    assert await na.classify(NOW + 1200) == 0 and len(llm.calls) == n    # 같은 묶음을 끝없이 다시 보내지 않는다(두 번까지)
+    assert len(llm.calls) == calls0 + na.MAX_FAILS                       # 끝없이 다시 보내지는 않는다
+    assert na.llm_calls_day == day_calls0                                # 응답 없는 시도는 하루 횟수를 쓰지 않는다
+    na.new_day()                                                         # 다음 날 장전: 예산이 새로 시작되면 다시 기회를 준다
     llm.fail = False
-    na.ingest([(NOW + 1300, "Microsoft cuts full-year guidance", "", "x", ())], NOW + 1300)
-    assert await na.classify(NOW + 1700) == 1 and na.llm_off == ""       # 다시 되면 정상으로 돌아온다
+    llm.by = {"MSFT": -2}
+    assert await na.classify(NOW + 5000) == 2 and na.llm_off == ""       # 보유 종목의 묵은 소식도 이제 판정받는다
+    assert e.exit_now == {"MSFT"}
 
 
 async def test_news_keeps_calls_for_held_symbols_and_judges_overnight_news():
@@ -1286,3 +1290,39 @@ def test_backtest_and_bench_warm_daily_indicators():
     bt = Backtester(cfg, ParamStore(None, cfg.params).current)
     _warm(bt, mk, cfg)
     assert all(bt.engine.sym[s].f.ready for s in mk.symbols)
+
+
+async def test_news_judges_held_symbols_after_a_weekend_and_orders_still_pending():
+    """금요일 장 마감 뒤의 악재는 월요일 아침에라도 판정한다. 매수 주문이 나가 있는 동안 온 악재도 놓치지 않는다.
+    같은 회사를 'NVIDIA'·'Nvidia' 로 달리 적어도 같은 종목으로 본다."""
+    llm = SymLLM({"NVDA": -2, "TSLA": -2})
+    cfg, e, na = news_env2(llm, held=("NVDA",))
+    cfg.llm.news_max_calls = 0                                           # 금요일: 오늘 횟수를 다 썼다
+    na.ingest([(NOW, "NVIDIA misses estimates and slashes guidance", "", "x", ())], NOW)
+    it = next(iter(na.items.values()))
+    assert it.symbols == ("NVDA",)                                       # 대문자로 적힌 회사 이름도 찾는다
+    assert await na.classify(NOW + 400) == 0 and not e.exit_now
+    cfg.llm.news_max_calls = 60
+    na.new_day()                                                         # 월요일 장전(65시간 뒤)
+    assert await na.classify(NOW + 65 * 3600) == 1 and e.exit_now == {"NVDA"}
+
+    # 매수 주문이 아직 체결되지 않은 종목에 심각한 악재 → 체결되면 곧바로 정리되도록 지시를 건다
+    t = NOW + 66 * 3600
+    e.pending["TSLA"] = OrderIntent("TSLA", BUY, 5, 100.0, "entry")
+    na.ingest([(t, "Tesla under investigation for accounting fraud", "", "x", ())], t)
+    assert await na.classify(t + 400) == 1 and "TSLA" in e.exit_now
+    assert na.find_symbols("Is meta the new normal for spy novels?") == ()     # 종목 코드는 대소문자를 구분한다
+
+
+async def test_symbol_attached_later_still_gets_its_own_verdict():
+    """제목에 종목 이름이 없는 소식이 여러 종목의 피드에서 차례로 올 때, 나중에 붙은 종목도 따로 판정받는다."""
+    llm = SymLLM({"MSFT": -2})
+    cfg, e, na = news_env2(llm, held=("MSFT",))
+    title = "Software giant faces lawsuit over defective product recall"
+    na.ingest([(NOW, title, "", "x", ("SPY",))], NOW)
+    assert await na.classify(NOW + 400) == 1
+    na.ingest([(NOW, title, "", "x", ("QQQ",))], NOW + 500)
+    assert await na.classify(NOW + 900) == 1
+    na.ingest([(NOW, title, "", "x", ("MSFT",))], NOW + 1000)            # 세 번째로 붙은 보유 종목
+    assert await na.classify(NOW + 1400) == 1
+    assert e.exit_now == {"MSFT"}

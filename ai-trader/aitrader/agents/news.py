@@ -21,7 +21,7 @@ from email.utils import parsedate_to_datetime
 
 from ..config import Config
 from ..llm import LLM
-from ..models import NewsState
+from ..models import BUY, NewsState
 from .base import Agent
 
 ATOM = "{http://www.w3.org/2005/Atom}"
@@ -101,7 +101,8 @@ class NewsItem:
     kind: str = ""
     fresh: bool = True      # 매매 판단에 쓸 만큼 새 소식인가
     verdicts: dict = field(default_factory=dict)   # 종목 → Claude 판정(−2~+2). 같은 제목이라도 종목마다 뜻이 다르다
-    tried: int = 0          # Claude 분류를 시도한 횟수(실패한 묶음을 끝없이 다시 보내지 않는다)
+    tries: dict = field(default_factory=dict)      # 종목 → Claude 가 응답했는데 이 쌍의 답이 빠진 횟수
+    fails: dict = field(default_factory=dict)      # 종목 → 응답 자체가 없었던(장애·예산 소진) 횟수 — 날이 바뀌면 다시 기회를 준다
 
     def score(self, sym: str | None = None) -> float:
         """매매에 쓰는 점수(−1~+1). 그 종목에 대한 Claude 판정이 있으면 그것을, 없으면 규칙 점수를 쓴다.
@@ -236,13 +237,17 @@ class NewsAgent(Agent):
         self.llm_calls_day = 0
         if self.llm_off.startswith("오늘"):
             self.llm_off = ""
+        for it in self.items.values():                # 어제 응답을 못 받은 소식에 다시 기회를 준다(예산·횟수가 새로 시작된다)
+            it.fails.clear()
 
     def set_symbols(self, symbols: list[str]) -> None:
         self.symbols = list(symbols)
         pats = []
         for s in self.symbols:
-            names = [re.escape(s)] + [re.escape(a) for a in self.nc.aliases.get(s, [])]
-            pats.append((re.compile(r"(?<![A-Za-z0-9])(" + "|".join(names) + r")(?![A-Za-z0-9])"), s))
+            # 종목 코드는 대소문자를 구분하고(META·SPY 같은 코드는 소문자면 보통 낱말이다), 회사 이름은 구분하지 않는다
+            # (같은 회사를 'Nvidia'·'NVIDIA' 로 섞어 쓴다).
+            alts = [re.escape(s)] + ["(?i:" + re.escape(a) + ")" for a in self.nc.aliases.get(s, [])]
+            pats.append((re.compile(r"(?<![A-Za-z0-9])(?:" + "|".join(alts) + r")(?![A-Za-z0-9])"), s))
         self._alias = pats
 
     def find_symbols(self, title: str) -> tuple:
@@ -376,8 +381,10 @@ class NewsAgent(Agent):
                 self.engine.emit("news", sym, f"악재 감지({it.source}): {it.title[:80]} — {self.nc.block_min:.0f}분간 매수 보류")
 
     # ---------------------------------------------------------------- Claude 정밀 분류
-    HELD_MAX_AGE = 20 * 3600.0     # 보유 종목의 소식은 이만큼 지나도 판정한다(장 마감 뒤 소식을 다음 날 아침에라도 본다)
+    HELD_MAX_AGE = 4 * 86400.0     # 보유 종목의 소식은 이만큼 지나도 판정한다(금요일 장 마감 뒤 소식을 연휴 뒤 아침에라도 본다)
     BATCH = 24
+    MAX_TRIES = 2                  # 모델이 답을 빼먹은 쌍을 다시 묻는 횟수
+    MAX_FAILS = 6                  # 응답 자체가 없었던(장애·예산 소진) 시도는 따로 센다 — 판정 기회를 태우지 않게
 
     def _pairs(self, now: float) -> list[tuple]:
         """아직 Claude 판정을 받지 않은 (소식, 종목) 쌍. 보유 종목 것을 앞에, 그다음은 최신순."""
@@ -385,11 +392,12 @@ class NewsAgent(Agent):
         fresh_sec = self.nc.max_age_min * 60.0
         out = []
         for it in self.items.values():
-            if not it.fresh or it.tried >= 2:
+            if not it.fresh:
                 continue
             age = now - it.ts
             for sym in it.symbols:
-                if sym in it.verdicts:
+                if (sym in it.verdicts or it.tries.get(sym, 0) >= self.MAX_TRIES
+                        or it.fails.get(sym, 0) >= self.MAX_FAILS):
                     continue
                 if age <= fresh_sec or (sym in held and age <= self.HELD_MAX_AGE):
                     out.append((it, sym))
@@ -423,14 +431,19 @@ class NewsAgent(Agent):
             return 0                                     # 잡다한 소식으로 남은 횟수를 태우지 않는다
         self.last_llm = now
         self.llm_calls_day += 1
-        for it in {id(it): it for it, _ in pairs}.values():
-            it.tried += 1
         payload = {"items": [[i, sym, it.title[:140]] for i, (it, sym) in enumerate(pairs)]}
         d = await self.llm.ask_json("news", c.model_news, c.effort_news, NEWS_SYSTEM, payload, NEWS_SCHEMA,
                                     max_tokens=4096)
-        if d is None:                                    # 실패: 판정을 지어내지 않는다(규칙 판정 그대로). 두 번까지만 다시 묻는다
+        if d is None:
+            # 응답 없음(예산 소진·장애): 판정을 지어내지 않는다(규칙 판정 그대로). 이 시도는 '물어본 횟수'에 넣지 않는다 —
+            # 저녁에 잠깐 안 됐다고 다음 날 아침의 판정 기회까지 사라지면 안 된다. 다만 끝없이 반복하지는 않는다.
+            self.llm_calls_day -= 1
+            for it, sym in pairs:
+                it.fails[sym] = it.fails.get(sym, 0) + 1
             self._llm_unavailable("Claude 응답 없음(예산 소진·장애)", now)
             return 0
+        for it, sym in pairs:
+            it.tries[sym] = it.tries.get(sym, 0) + 1
         if self.llm_off and not self.llm_off.startswith("오늘"):
             self.llm_off = ""
         n = 0
@@ -452,8 +465,10 @@ class NewsAgent(Agent):
             ns = self.engine.news.get(sym)
             if ns is not None and impact >= 0 and before <= -0.5 and not self._has_negative(sym, now):
                 ns.block_until = 0.0                     # 규칙이 잘못 막은 것을 푼다
-            if impact <= -2 and self.nc.exit_on_severe and sym in held:
-                self.engine.exit_now.add(sym)            # 보유 중인 종목만 청산 지시(보유하지 않은 종목은 매수 보류로 충분)
+            pend = self.engine.pending.get(sym)
+            if impact <= -2 and self.nc.exit_on_severe and (sym in held or (pend is not None and pend.side == BUY)):
+                # 보유 중이거나 매수 주문이 나가 있는 종목만 청산 지시(체결되면 곧바로 정리). 그 밖의 종목은 매수 보류로 충분하다.
+                self.engine.exit_now.add(sym)
                 self.engine.emit("news", sym, f"심각한 악재 확인(Claude): {it.title[:80]} — 보유분 청산")
             if self.journal is not None:
                 self.journal.news(it)
