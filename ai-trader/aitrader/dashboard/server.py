@@ -61,6 +61,10 @@ class Dashboard:
             name = host[:host.index("]") + 1] if host.startswith("[") and "]" in host else host.rsplit(":", 1)[0]
             if name.lower() not in ("127.0.0.1", "localhost", "[::1]"):
                 return web.Response(status=403, text="forbidden host")
+        # 다른 사이트의 화면이 사용자의 브라우저로 상태 조회를 반복시키는 것 차단(응답은 못 읽어도, 조회마다 매매 루프가
+        # 전체 상태를 만들어야 한다). 브라우저는 교차 사이트 요청에 Sec-Fetch-Site 를 붙인다. 화면(/) 자체를 여는 것은 허용.
+        if req.path != "/" and req.headers.get("Sec-Fetch-Site", "same-origin") not in ("same-origin", "none"):
+            return web.Response(status=403, text="cross-site request refused")
         return await handler(req)
 
     def _ok(self, req: web.Request) -> bool:
@@ -192,7 +196,9 @@ class Dashboard:
                         break
                     if msg.type == WSMsgType.TEXT and len(msg.data) < 200:
                         try:
-                            sel = str(json.loads(msg.data).get("sel", ""))[:16]
+                            d = json.loads(msg.data)
+                            if isinstance(d, dict):          # 객체가 아닌 JSON(배열·숫자)은 무시한다
+                                sel = str(d.get("sel", ""))[:16]
                         except ValueError:
                             pass
                 except asyncio.TimeoutError:

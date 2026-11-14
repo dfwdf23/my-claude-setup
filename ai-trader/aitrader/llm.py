@@ -60,12 +60,22 @@ class LLM:
             self.last_error = repr(e)
 
     def new_day(self, day: str) -> None:
+        """day: 'YYYY-MM-DD'(이 컴퓨터의 날짜). 날짜가 바뀌면 하루 예산을 새로 시작한다.
+        프로그램을 다시 켠 경우에는 일지에 남은 오늘 사용량을 이어받는다 — 그러지 않으면 재시작할 때마다
+        예산이 0부터 다시 시작돼, 반복 재시작(오류로 죽고 다시 뜨는 경우 등)에서 하루 한도가 무의미해진다."""
         if day != self.day:
+            first = self.day == ""
             self.day = day
             self.tokens_today = 0
             self.calls_today = 0
             self.cost_today = 0.0
             self.cache.clear()
+            if first and self.journal is not None:
+                try:
+                    t0 = time.mktime(time.strptime(day, "%Y-%m-%d"))
+                    self.tokens_today, self.calls_today, self.cost_today = self.journal.llm_since(t0)
+                except Exception as e:                # 사용량을 못 읽어도 매매에는 지장 없다
+                    log.debug("오늘 사용량 복원 실패: %r", e)
 
     def budget_left(self) -> int:
         return max(0, self.cfg.daily_token_budget - self.tokens_today)

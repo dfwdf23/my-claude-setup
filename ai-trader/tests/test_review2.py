@@ -1326,3 +1326,50 @@ async def test_symbol_attached_later_still_gets_its_own_verdict():
     na.ingest([(NOW, title, "", "x", ("MSFT",))], NOW + 1000)            # 세 번째로 붙은 보유 종목
     assert await na.classify(NOW + 1400) == 1
     assert e.exit_now == {"MSFT"}
+
+
+# ====================================================================== 그 밖에 관찰된 사항(세 번째 검토)
+async def test_cross_site_api_requests_and_odd_websocket_messages(tmp_path, unused_tcp_port):
+    """다른 사이트의 화면이 사용자의 브라우저로 상태 조회를 반복시키지 못한다(조회마다 매매 루프가 전체 상태를 만든다).
+    객체가 아닌 웹소켓 메시지에도 연결이 끊기지 않는다."""
+    cfg = live_cfg(tmp_path, "manual")
+    sup = Supervisor(cfg, ManualBroker(cfg, base_url="http://127.0.0.1:9"))
+    dash = Dashboard(sup, "127.0.0.1", unused_tcp_port)
+    await dash.start()
+    base = f"http://127.0.0.1:{unused_tcp_port}"
+    try:
+        async with aiohttp.ClientSession() as s:
+            for site in ("cross-site", "same-site"):
+                async with s.get(base + "/api/state", headers={"Sec-Fetch-Site": site}) as r:
+                    assert r.status == 403
+            async with s.get(base + "/api/state", headers={"Sec-Fetch-Site": "same-origin"}) as r:
+                assert r.status == 200
+            async with s.get(base + "/", headers={"Sec-Fetch-Site": "cross-site"}) as r:
+                assert r.status == 200                   # 다른 곳의 링크·즐겨찾기로 화면을 여는 것은 된다
+            async with s.ws_connect(base + "/ws") as ws:
+                await ws.receive_json(timeout=3)
+                await ws.send_str("[]")                  # 객체가 아닌 JSON
+                await ws.send_str("7")
+                await ws.send_json({"sel": "NVDA"})
+                msg = await ws.receive_json(timeout=3)   # 연결이 살아 있고 계속 온다
+                assert "equity" in msg
+    finally:
+        await dash.stop()
+        sup.journal.close()
+
+
+def test_llm_daily_budget_survives_a_restart(tmp_path):
+    """하루 토큰 예산은 재시작해도 이어진다(일지에 남은 오늘 사용량을 이어받는다).
+    (이전: 다시 켤 때마다 0부터 — 오류로 죽고 다시 뜨기를 반복하면 하루 한도가 무의미)"""
+    j = Journal(tmp_path / "journal.db")
+    j.llm_usage(time.time() - 3 * 86400, "news", "claude-opus-5-5", 9000, 900, 0, 0, 0.5)     # 사흘 전 것은 세지 않는다
+    j.llm_usage(time.time(), "news", "claude-opus-5-5", 1000, 200, 300, 0, 0.01)
+    j.llm_usage(time.time(), "market", "claude-opus-5-5", 500, 100, 0, 0, 0.004)
+    j.flush()
+    llm = LLM(SimpleNamespace(enabled=False, daily_token_budget=2500), j)
+    llm.new_day(time.strftime("%Y-%m-%d"))
+    assert llm.tokens_today == 2100 and llm.calls_today == 2 and abs(llm.cost_today - 0.014) < 1e-9
+    assert llm.budget_left() == 400
+    llm.new_day("2099-01-01")                            # 날짜가 바뀌면 새로 시작
+    assert llm.tokens_today == 0
+    j.close()

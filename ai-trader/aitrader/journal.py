@@ -152,6 +152,12 @@ class Journal:
             out.append(Trade(*r[:14], json.loads(r[14] or "{}"), json.loads(r[15] or "[]")))
         return out
 
+    def llm_since(self, ts: float) -> tuple[int, int, float]:
+        """ts 이후의 Claude 사용량(토큰 합계, 호출 수, 비용) — 재시작해도 하루 예산이 이어지게."""
+        rows = self._read("SELECT COALESCE(SUM(input + output + cache_read + cache_write), 0), COUNT(*), "
+                          "COALESCE(SUM(cost), 0) FROM llm_usage WHERE ts >= ?", (ts,))
+        return (int(rows[0][0]), int(rows[0][1]), float(rows[0][2])) if rows else (0, 0, 0.0)
+
     def load_daily(self, n: int = 60) -> list[dict]:
         rows = self._read("SELECT day, equity, pnl, n, wins, pv FROM daily ORDER BY day DESC LIMIT ?", (n,))
         return [dict(zip(("day", "equity", "pnl", "n", "wins", "pv"), r)) for r in reversed(rows)]
