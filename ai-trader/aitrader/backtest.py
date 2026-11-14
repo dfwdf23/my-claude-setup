@@ -123,8 +123,10 @@ class Backtester:
                 past[sym] = [b for b in hist if int((b.ts + offset(b.ts)) // 86400.0) < d0]
         today: dict[str, list] = {}               # 종목 → [시각, 시가, 고가, 저가, 종가, 거래량] (오늘치 묶음)
         day = None
+        open_tod = float(e.open_tod)
         for b in bars:
-            d = int((b.ts + offset(b.ts)) // 86400.0)
+            loc = b.ts + offset(b.ts)
+            d = int(loc // 86400.0)
             if d != day:
                 if day is not None:
                     e.flush_bars()
@@ -150,9 +152,17 @@ class Backtester:
             v = b.volume // 4
             # 시가 → 저가 → 고가 → 저가 → 종가. 저가를 고가 '앞뒤로' 모두 지나게 해, 고정 손절(고가 전의 저가)과
             # 봉 안에서 끌어올려진 추적 손절(고가 뒤의 저가) 양쪽에 불리한 순서로 본다.
+            # 봉의 시작이 장 시작보다 이르면(시각 단위로 끊은 봉 — 미국 1시간봉의 첫 봉은 09:00 에 시작하지만 거래는 09:30 부터,
+            # 날짜만 있는 일봉은 자정) 다섯 점을 장 시작 뒤로 옮긴다. 그대로 두면 다섯 점이 모두 장 시작 전이라
+            # 엔진이 버려서 그 봉이 통째로 사라진다.
+            t0, step = b.ts, q
+            tod = loc % 86400.0
+            if tod < open_tod < tod + bar_sec:
+                t0 += open_tod - tod
+                step = min(q, (b.ts + bar_sec - t0) / 5.0)
             for i, (px, vol) in enumerate(((b.open, v), (b.low, v), (b.high, v), (b.low, 0), (b.close, b.volume - 3 * v))):
                 kind[sym] = i
-                on_tick(Tick(sym, b.ts + i * q, px, vol))
+                on_tick(Tick(sym, t0 + i * step, px, vol))
         e.flush_bars()
         self._bar_mode = False
         return self

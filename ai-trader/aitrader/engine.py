@@ -191,6 +191,8 @@ class Engine:
         s.ind = IndicatorSet(self.cfg.strategy)
         s.f = s.ind.f
         s.hist.clear()
+        if self.daily and bars and s.bar_start >= 0.0 and self.m.local_day(s.bar_start) <= self.m.local_day(bars[-1].ts):
+            s.bar_start = -1.0                    # 닫지 못한 채 남은 지난 날의 봉은 버린다 — 그날은 예열 봉에 이미 들어 있다
         for b in bars:
             if self.daily:
                 s.ind.reset_session()             # 일봉은 봉 하나가 하루(세션) — 매매·재생과 같은 기준
@@ -597,4 +599,7 @@ class Engine:
                 "positions": [asdict(p) for p in self.positions.values()], "risk": self.risk.export(),
                 # 보유 종목의 마지막 가격 — 재시작 직후 취득가로 평가하면 평가손익이 통째로 사라져 한도가 잘못 발동한다
                 "last": {p.symbol: sym[p.symbol].last for p in self.positions.values() if p.symbol in sym},
-                "since_loss": since, "exit_now": sorted(self.exit_now)}
+                "since_loss": since, "exit_now": sorted(self.exit_now),
+                # 결정됐지만 아직 체결되지 않은 봉 기준 청산(추세 이탈·시간 청산) — 일봉 방식은 판단이 하루 한 번뿐이라
+                # 재시작으로 잊으면 청산이 통째로 사라진다
+                "bar_exit": {k: v for k, v in self.bar_exit.items() if k in self.positions}}

@@ -205,36 +205,51 @@ class Supervisor(Agent):
         day0 = self.m.epoch(d)
         ses = self.cfg.session
         early = self.m.local(now).hour * 3600 + self.m.local(now).minute * 60 < ses.tod("open") + 1800
-        fresh: dict[str, int] = {}                    # 오늘 아침에 일봉을 실제로 받은 종목 → 가장 최근 일봉의 날짜
+        # 오늘 아침에 일봉을 실제로 받은 종목 → (가장 최근 일봉의 날짜, 그 종가)
+        fresh: dict[str, tuple[int, float]] = {}
         n_warm = 3 * self.cfg.strategy.warmup_bars
-        for sym in syms:
-            s = e.symbol_state(sym)
+        hist: dict[str, list] = {}
+        for sym in syms:                              # 1) 일봉 맥락(전일 종가·고가, 평균 거래량, 일봉 추세)
+            e.symbol_state(sym)
             allb = self.screener.bars.get(sym, [])
-            dbars = [b for b in allb if b.ts < day0]                                 # 어제까지의 일봉
-            if dbars:
-                fresh[sym] = self.m.local_day(dbars[-1].ts)
+            dbars = hist[sym] = [b for b in allb if b.ts < day0]                     # 어제까지의 일봉
+            if dbars and dbars[-1].close > 0:
+                fresh[sym] = (self.m.local_day(dbars[-1].ts), dbars[-1].close)
             e.set_daily(sym, dbars[-60:])
-            if self.daily and allb and allb[-1].ts >= day0:
-                e.seed_bar(sym, allb[-1], now)        # 장중에 켜졌다 → 오늘 봉의 지나간 구간을 채운다
-            # 지표 예열: 어제까지의 봉으로 미리 채운다. 일봉 방식은 '이력으로 예열했는가'를 따로 기억한다 —
-            # 첫날 조회가 실패했다고 그 종목이 한 달 가까이 준비 안 된 채로 남지 않게, 받을 수 있게 된 날 다시 채운다.
+        # 2) 보유 종목을 전일 종가로 평가한다. 반드시 3)·4)보다 먼저 — 오늘 봉을 채우는 seed_bar 가 엔진의 날짜를
+        #    오늘로 넘기면서 '오늘 손익의 기준 자산'을 그 순간의 평가액으로 잡기 때문이다. 순서가 바뀌면 장중에 켰을 때
+        #    꺼져 있던 며칠의 가격 변화가 통째로 오늘 손익이 된다(일일 손실 한도 오발동, 반대 방향이면 한도 무력화).
+        self._mark_at_prev_close(now, fresh)
+        for sym in syms:                              # 3) 지표 예열: 어제까지의 봉으로 미리 채운다
+            s = e.sym[sym]
+            dbars = hist[sym]
             if self.daily:
-                if sym not in self._warmed and dbars:
+                # '이력으로 예열했는가'를 따로 기억한다 — 첫날 조회가 실패했다고 그 종목이 한 달 가까이 준비 안 된 채로
+                # 남지 않게, 받을 수 있게 된 날 채운다. 또 엔진이 가진 마지막 봉이 증권사의 최근 일봉보다 오래됐으면
+                # (감시 목록에서 빠졌다 돌아온 종목, 시세가 없던 날, 마감 처리를 못 하고 넘어간 날) 중간이 빈 채로
+                # 이어 붙이지 않고 처음부터 다시 채운다. 다시 채운 종목에 남아 있던 '판단 대기' 표시는 믿지 않는다.
+                have = self.m.local_day(s.hist[-1][0]) if s.hist else -1
+                if dbars and (sym not in self._warmed or (sym in fresh and have < fresh[sym][0])):
                     e.warm(sym, dbars[-n_warm:])
                     self._warmed.add(sym)
-                    if early:
-                        s.undecided = True            # 장 초반에 켜졌다면 어제 봉에 대한 판단을 오늘 한다
+                    s.undecided = early               # 장 초반에 켜졌다면 어제 봉에 대한 판단을 오늘 한다
             elif s.ind.n == 0:
                 e.warm(sym, self.journal.recent_bars(sym, n_warm))
+        if self.daily:                                # 4) 장중에 켜졌다 → 오늘 봉의 지나간 구간을 채운다
+            for sym in syms:
+                allb = self.screener.bars.get(sym, [])
+                if allb and allb[-1].ts >= day0:
+                    e.seed_bar(sym, allb[-1], now)
         lost = [x for x in syms if x in self.screener.failed]
         if lost and self.daily:
             held = [x for x in lost if x in e.positions]
-            msg = (f"일봉을 받지 못한 종목: {', '.join(lost)} — 이 종목은 오늘 새 매수 판단을 하지 않습니다"
+            cold = [x for x in lost if x not in self._warmed]
+            msg = (f"일봉을 받지 못한 종목: {', '.join(lost)} — 일봉 맥락(추세·평균 거래량)은 지난번 값 그대로 씁니다"
+                   + (f". {', '.join(cold)} 는 지표가 준비되지 않아 오늘 새 매수 판단을 하지 않습니다" if cold else "")
                    + (f". 보유 중인 {', '.join(held)} 는 전일 종가 기준 평가를 건너뛰고 손절·익절만 감시합니다" if held else ""))
             e.emit("risk" if held else "system", "", msg)
             if held:
                 self.notifier.send("⚠ " + msg)
-        self._mark_at_prev_close(now, fresh)
         if e.view_on:
             await self._backfill_view(syms, now)
         if self.news is not None:
@@ -247,26 +262,28 @@ class Supervisor(Agent):
         self.note(f"{d} 장 시작 — {len(syms)}종목 감시 · 전략 v{e.p.version}", now)
         e.emit("system", "", f"{d} 장 시작 — 감시 {len(syms)}종목, 전략 v{e.p.version}")
 
-    def _mark_at_prev_close(self, now: float, fresh: dict[str, int]) -> None:
+    def _mark_at_prev_close(self, now: float, fresh: dict[str, tuple[int, float]]) -> None:
         """오늘 시세를 아직 받지 않았다면 보유 종목을 '전일 종가'로 평가하고, 그 자산을 오늘 손익의 기준으로 삼는다.
 
         며칠 꺼져 있다가 켜지면 장부의 마지막 가격은 꺼지던 때의 값이다. 그대로 두면 그 사이의 가격 변화가
         전부 '오늘 하루의 손실'로 계산돼 일일 손실 한도(전량 청산)가 잘못 발동한다.
 
-        fresh: 오늘 아침 일봉 조회에 성공한 종목 → 그 가장 최근 일봉의 날짜. 조회에 실패한 종목의 prev_close 는
-        그 전날 것이 남아 있는 묵은 값이므로 쓰지 않는다. 또 엔진이 이미 그날의 시세를 본 종목(계속 켜져 있던 경우)은
-        마지막 틱이 곧 그날 종가이므로 건드리지 않는다."""
+        fresh: 오늘 아침 일봉 조회에 성공한 종목 → (그 가장 최근 일봉의 날짜, 종가). 조회에 실패한 종목은 묵은 값밖에
+        없으므로 건드리지 않는다. 또 엔진이 이미 그날의 시세를 본 종목(계속 켜져 있던 경우)은 마지막 틱이 곧 그날
+        종가이므로 건드리지 않는다.
+
+        엔진의 날짜(e.day)가 오늘로 넘어가기 전에 불러야 한다(day_start 의 순서 참고)."""
         e = self.engine
         if not e.positions or e.day == self.m.local_day(now):
             return                                    # 보유 없음, 또는 오늘 시세를 이미 받는 중(같은 날 재시작 포함)
         moved = False
         for sym in e.positions:
             s = e.sym[sym]
-            bar_day = fresh.get(sym)
+            bar_day, close = fresh.get(sym, (None, 0.0))
             if bar_day is None or bar_day <= e.day:
                 continue
-            if s.prev_close > 0 and s.prev_close != s.last:
-                s.last = s.prev_close
+            if close > 0 and close != s.last:
+                s.last = close
                 moved = True
         if moved:
             eq = e.cash + sum(p.qty * e.sym[p.symbol].last for p in e.positions.values())
@@ -302,8 +319,16 @@ class Supervisor(Agent):
         e.flush_bars()
         await self.executor.drain(3.0)
         e.mark()
-        td = list(e.trades_day)
-        pnl = e.equity - e.day_start_equity
+        dn = self.m.local_day(self.m.epoch(d, 12))
+        if e.day == dn:
+            td = list(e.trades_day)
+            pnl = e.equity - e.day_start_equity
+        else:
+            # 그날 시세를 한 번도 받지 못했다(시세 장애, 휴장일 표에 없는 휴장). 엔진의 '오늘' 값은 아직 앞 거래일의
+            # 것이므로 그대로 쓰면 전날의 손익·거래가 한 번 더 기록된다(복기도 같은 손실을 두 번 센다).
+            td = [t for t in e.trades_day if self.m.local_day(t.exit_ts) == dn]
+            pnl = sum(t.pnl for t in td)
+            e.emit("system", "", f"{d} 에는 시세를 한 번도 받지 못했습니다 — 손익 없는 날로 기록합니다")
         wins = sum(1 for t in td if t.pnl > 0)
         day = str(d)
         self.journal.daily(day, e.equity, pnl, len(td), wins, e.p.version)
@@ -571,6 +596,7 @@ class Supervisor(Agent):
             st_sym = e.symbol_state(sym)                # 손실 청산 뒤 재진입 금지 기간을 이어 간다
             st_sym.last_loss_bar = st_sym.bar_count - int(since)
         e.exit_now.update(x for x in (es.get("exit_now") or []) if x in e.positions)
+        e.bar_exit.update({k: str(v) for k, v in (es.get("bar_exit") or {}).items() if k in e.positions})
         eq = e.cash + sum(p.qty * e.sym[p.symbol].last for p in e.positions.values())
         same_day = int(es.get("day", -1)) == self.m.local_day(time.time())
         if same_day:                                    # 같은 거래일에 다시 켜졌다 → 당일 손익·한도 상태를 이어간다

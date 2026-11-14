@@ -99,7 +99,8 @@ class NewsItem:
     tags: tuple = ()
     impact: int | None = None   # Claude 판정 요약(가장 강한 것, −2~+2). None = 아직. 일지 기록·화면용
     kind: str = ""
-    fresh: bool = True      # 매매 판단에 쓸 만큼 새 소식인가
+    fresh: bool = True      # 처음 봤을 때 매매 판단에 쓸 만큼 새 소식이었는가(규칙 점수를 반영했는가)
+    stale: bool = False     # 발행 시각을 믿을 수 없는 묵은 목록(증권사가 시작 직후 준 것) — 화면에만 보이고 판정하지 않는다
     verdicts: dict = field(default_factory=dict)   # 종목 → Claude 판정(−2~+2). 같은 제목이라도 종목마다 뜻이 다르다
     tries: dict = field(default_factory=dict)      # 종목 → Claude 가 응답했는데 이 쌍의 답이 빠진 횟수
     fails: dict = field(default_factory=dict)      # 종목 → 응답 자체가 없었던(장애·예산 소진) 횟수 — 날이 바뀌면 다시 기회를 준다
@@ -229,6 +230,7 @@ class NewsAgent(Agent):
         self.fetched = 0
         self.last_ok = 0.0            # 마지막으로 피드를 정상 해석한 시각
         self.llm_off = ""             # Claude 분류를 못 쓰는 이유(화면 표시용). 빈 문자열 = 정상
+        self._prior: dict | None = None   # 이전 실행에서 이미 받은 Claude 판정(일지에서 한 번 읽는다): id → ({종목: 판정}, 분류)
         self._stop = False
         self._alias: list[tuple[re.Pattern, str]] = []
         self.set_symbols(self.symbols)
@@ -321,18 +323,31 @@ class NewsAgent(Agent):
             rows = await self.broker.get_news(40)
         except Exception:
             return
-        old = now - self.nc.max_age_min * 60.0 - 1.0     # '묵은 목록'으로 표시된 것은 화면에만 보이고 판단에는 안 쓴다
-        self.ingest([(old if r.get("stale") else float(r.get("ts") or now), str(r.get("title", "")), "",
-                      str(r.get("source") or self.broker.name), tuple(r.get("symbols") or ()))
+        # '묵은 목록'으로 표시된 것(시작 직후 받은 것 — 언제 나온 소식인지 믿을 수 없다)은 화면에만 보이고 판단에는 안 쓴다
+        self.ingest([(float(r.get("ts") or now), str(r.get("title", "")), "",
+                      str(r.get("source") or self.broker.name), tuple(r.get("symbols") or ()), bool(r.get("stale")))
                      for r in rows if r.get("title")], now)
 
+    def _prior_verdicts(self, now: float) -> dict:
+        if self._prior is None:
+            self._prior = {}
+            if self.journal is not None:
+                try:
+                    self._prior = self.journal.news_verdicts(now - self.HELD_MAX_AGE)
+                except Exception:                           # 일지를 못 읽어도 수집은 계속(다시 물으면 된다)
+                    self._prior = {}
+        return self._prior
+
     def ingest(self, rows: list[tuple], now: float) -> int:
-        """rows: (발행시각, 제목, 링크, 출처, 종목들). 새 소식 수를 돌려준다."""
+        """rows: (발행시각, 제목, 링크, 출처, 종목들[, 묵은 목록 여부]). 새 소식 수를 돌려준다."""
         self.calls += 1
         fresh_sec = self.nc.max_age_min * 60.0
         known = set(self.symbols)
+        prior = self._prior_verdicts(now)
         new = 0
-        for ts, title, link, src, syms in rows:
+        for row in rows:
+            ts, title, link, src, syms = row[:5]
+            stale = len(row) > 5 and bool(row[5])
             title = title.strip()[:300]
             iid = item_id(title)
             if not title:
@@ -351,11 +366,18 @@ class NewsAgent(Agent):
             if not syms:
                 continue                                    # 감시 종목과 무관한 소식은 버린다
             rule, tags = rule_score(title)
-            it = NewsItem(iid, ts, now, src, title, safe_url(link), syms, rule, tags, fresh=now - ts <= fresh_sec)
+            it = NewsItem(iid, ts, now, src, title, safe_url(link), syms, rule, tags,
+                          fresh=not stale and now - ts <= fresh_sec, stale=stale)
+            pv = prior.get(iid)
+            if pv is not None and not stale:                # 이전 실행에서 받은 판정을 이어 쓴다(같은 소식을 다시 묻지 않는다)
+                for sym, impact in pv[0].items():
+                    if sym in syms:
+                        it.judge(sym, impact, pv[1][:16])
             self.items[iid] = it
             new += 1
             if it.fresh:
-                self._apply(it, now, it.rule)
+                for sym in it.symbols:
+                    self._apply(it, now, it.score(sym), (sym,))
             if self.journal is not None:
                 self.journal.news(it)
         while len(self.items) > 3000:
@@ -382,25 +404,37 @@ class NewsAgent(Agent):
 
     # ---------------------------------------------------------------- Claude 정밀 분류
     HELD_MAX_AGE = 4 * 86400.0     # 보유 종목의 소식은 이만큼 지나도 판정한다(금요일 장 마감 뒤 소식을 연휴 뒤 아침에라도 본다)
+    LATE_PER_SYM = 8               # 처음 봤을 때 이미 묵어 있던 소식(꺼져 있던 사이에 나온 것)은 보유 종목마다 최신 몇 건만 묻는다
     BATCH = 24
     MAX_TRIES = 2                  # 모델이 답을 빼먹은 쌍을 다시 묻는 횟수
     MAX_FAILS = 6                  # 응답 자체가 없었던(장애·예산 소진) 시도는 따로 센다 — 판정 기회를 태우지 않게
 
     def _pairs(self, now: float) -> list[tuple]:
-        """아직 Claude 판정을 받지 않은 (소식, 종목) 쌍. 보유 종목 것을 앞에, 그다음은 최신순."""
+        """아직 Claude 판정을 받지 않은 (소식, 종목) 쌍. 보유 종목 것을 앞에, 그다음은 최신순.
+
+        보통은 처음 봤을 때 새 소식이던 것만 묻는다. 보유 종목은 예외다 — 프로그램이 꺼져 있던 사이(밤사이·주말)에
+        나와 처음 봤을 때 이미 묵어 있던 소식도 HELD_MAX_AGE 안이면 묻는다. 그러지 않으면 켤 때마다 밤사이 악재를
+        통째로 버리게 된다. 다만 토큰을 아끼려고 종목마다 최신 LATE_PER_SYM 건으로 제한한다."""
         held = self.engine.positions
         fresh_sec = self.nc.max_age_min * 60.0
-        out = []
+        cand = []
+        late: dict[str, list] = {}
         for it in self.items.values():
-            if not it.fresh:
+            if it.stale:
                 continue
             age = now - it.ts
             for sym in it.symbols:
-                if (sym in it.verdicts or it.tries.get(sym, 0) >= self.MAX_TRIES
-                        or it.fails.get(sym, 0) >= self.MAX_FAILS):
-                    continue
-                if age <= fresh_sec or (sym in held and age <= self.HELD_MAX_AGE):
-                    out.append((it, sym))
+                if it.fresh:
+                    if age <= fresh_sec or (sym in held and age <= self.HELD_MAX_AGE):
+                        cand.append((it, sym))
+                elif sym in held and age <= self.HELD_MAX_AGE:
+                    late.setdefault(sym, []).append(it)
+        for sym, lst in late.items():
+            lst.sort(key=lambda x: -x.ts)
+            cand.extend((it, sym) for it in lst[:self.LATE_PER_SYM])
+        out = [(it, sym) for it, sym in cand
+               if not (sym in it.verdicts or it.tries.get(sym, 0) >= self.MAX_TRIES
+                       or it.fails.get(sym, 0) >= self.MAX_FAILS)]
         out.sort(key=lambda p: (p[1] not in held, -p[0].ts))
         return out[:self.BATCH]
 
@@ -461,7 +495,8 @@ class NewsAgent(Agent):
             before = it.score(sym)
             it.judge(sym, impact, str(row.get("kind", ""))[:16])
             n += 1
-            self._apply(it, now, it.score(sym) - before, (sym,))      # 규칙 점수와의 차이만큼, 그 종목에만
+            # 규칙 점수와의 차이만큼, 그 종목에만. 처음 봤을 때 이미 묵어 있던 소식은 규칙 점수를 반영한 적이 없으므로 판정 전체를 반영한다.
+            self._apply(it, now, it.score(sym) - (before if it.fresh else 0.0), (sym,))
             ns = self.engine.news.get(sym)
             if ns is not None and impact >= 0 and before <= -0.5 and not self._has_negative(sym, now):
                 ns.block_until = 0.0                     # 규칙이 잘못 막은 것을 푼다

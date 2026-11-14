@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS llm_usage(ts REAL, role TEXT, model TEXT, input INTEG
   cache_read INTEGER, cache_write INTEGER, cost REAL);
 CREATE TABLE IF NOT EXISTS events(ts REAL, kind TEXT, text TEXT);
 CREATE TABLE IF NOT EXISTS news(id TEXT PRIMARY KEY, ts REAL, source TEXT, symbols TEXT, title TEXT, url TEXT,
-  rule REAL, impact INTEGER, kind TEXT);
+  rule REAL, impact INTEGER, kind TEXT, verdicts TEXT);
 CREATE INDEX IF NOT EXISTS bars_ts ON bars(ts);
 """
 
@@ -35,7 +35,8 @@ _SQL = {
     "lessons": "INSERT INTO lessons VALUES(?,?,?,?,?)",
     "llm_usage": "INSERT INTO llm_usage VALUES(?,?,?,?,?,?,?,?)",
     "events": "INSERT INTO events VALUES(?,?,?)",
-    "news": "INSERT OR REPLACE INTO news VALUES(?,?,?,?,?,?,?,?,?)",
+    "news": "INSERT OR REPLACE INTO news(id, ts, source, symbols, title, url, rule, impact, kind, verdicts) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
 }
 
 
@@ -48,6 +49,11 @@ class Journal:
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
             con = sqlite3.connect(self.path)
             con.executescript("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;" + SCHEMA)
+            try:                                    # 이전 버전이 만든 일지에는 이 열이 없다
+                con.execute("ALTER TABLE news ADD COLUMN verdicts TEXT")
+                con.commit()
+            except sqlite3.OperationalError:
+                pass                                # 이미 있다
             con.close()
             self.thread = threading.Thread(target=self._run, name="journal", daemon=True)
             self.thread.start()
@@ -84,7 +90,8 @@ class Journal:
 
     def news(self, it) -> None:
         self._put("news", (it.id, it.ts, it.source, ",".join(it.symbols), it.title, it.url, it.rule,
-                           it.impact, it.kind or ",".join(it.tags)))
+                           it.impact, it.kind or ",".join(it.tags),
+                           json.dumps(it.verdicts) if it.verdicts else None))
 
     def _run(self) -> None:
         con = sqlite3.connect(self.path)
@@ -150,6 +157,19 @@ class Journal:
                             "reason, bars, mae_r, mfe_r, pv, ctx, causes FROM trades "
                             "WHERE exit_ts >= ? ORDER BY exit_ts", (since_ts,)):
             out.append(Trade(*r[:14], json.loads(r[14] or "{}"), json.loads(r[15] or "[]")))
+        return out
+
+    def news_verdicts(self, since_ts: float) -> dict[str, tuple[dict, str]]:
+        """since_ts 이후 발행된 소식 가운데 Claude 판정이 기록된 것: id → ({종목: 판정}, 분류).
+        재시작한 뒤 같은 소식을 다시 묻지 않게 한다(토큰 절약)."""
+        out = {}
+        for iid, v, kind in self._read("SELECT id, verdicts, kind FROM news WHERE ts >= ? AND verdicts IS NOT NULL",
+                                       (since_ts,)):
+            try:
+                d = json.loads(v)
+                out[iid] = ({str(k): max(-2, min(2, int(x))) for k, x in d.items()}, str(kind or ""))
+            except (ValueError, TypeError, AttributeError):
+                continue
         return out
 
     def llm_since(self, ts: float) -> tuple[int, int, float]:
