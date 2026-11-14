@@ -17,6 +17,7 @@ import asyncio
 import gc
 import logging
 import os
+from pathlib import Path
 import signal
 import sys
 import time
@@ -107,10 +108,40 @@ def _warm(bt, mk, cfg: Config) -> None:
             bt.engine.warm(sym, mk.history(sym, 3 * cfg.strategy.warmup_bars))
 
 
+MODE_KO = {"sim": "연습(합성 시세 — 실제 계좌와 무관)", "manual": "주문 보조(실제 시세, 주문은 사람이 직접)",
+           "kis-mock": "한국투자증권 모의투자", "kis-live": "한국투자증권 실전(실제 돈)"}
+
+
+def startup_notes(config_arg: str | None, mode: str, cwd: Path | None = None) -> list[str]:
+    """시작할 때 '어느 설정 파일을 읽었고 어떤 모드로 켜지는지'를 알려 주는 안내문.
+    설정 파일이 없으면 조용히 연습 모드로 켜지므로, 실전으로 바꿨다고 생각했는데 연습 화면이 뜨는 일을 막는다."""
+    cwd = cwd or Path.cwd()
+    cfg_path = Path(config_arg) if config_arg else cwd / "config.toml"
+    out = [f"실행 폴더: {cwd}"]
+    if cfg_path.exists():
+        out.append(f"설정 파일: {cfg_path.name} 을 읽었습니다")
+    else:
+        out.append(f"설정 파일: {cfg_path.name} 이 이 폴더에 없습니다 → 기본값으로 시작합니다")
+        for wrong, why in (("config.toml.txt", "이름 끝에 .txt 가 붙어 있습니다. 탐색기 [보기 → 파일 확장명]을 켜고 .txt 를 지우세요"),
+                           ("config.example.toml", "이 파일은 견본입니다. 복사해서 이름을 config.toml 로 바꾼 뒤 그 파일을 고치세요")):
+            if (cwd / wrong).exists():
+                out.append(f"  ! {wrong} 은 있습니다 — {why}")
+    if (cwd / ".env").exists():
+        out.append("키 파일: .env 를 읽었습니다")
+    else:
+        out.append("키 파일: .env 가 이 폴더에 없습니다(증권사 키·알림 설정이 적용되지 않습니다)")
+        for wrong in (".env.txt", "env", "env.txt"):
+            if (cwd / wrong).exists():
+                out.append(f"  ! {wrong} 은 있습니다 — 파일 이름이 정확히 .env 여야 합니다(앞에 점, 뒤에 .txt 없음)")
+    out.append(f"모드: {mode} — {MODE_KO.get(mode, mode)}")
+    return out
+
+
 def cmd_run(a) -> None:
     cfg = _cfg(a)
     if a.mode:
         cfg.mode = a.mode
+    print("\n".join(startup_notes(a.config, cfg.mode)) + "\n", flush=True)
     if a.speed is not None:
         cfg.sim.speed = a.speed
     if a.days is not None:

@@ -421,3 +421,19 @@ async def test_state_save_survives_values_json_cannot_encode(tmp_path):
     st = json.loads((sup.dir / "state.json").read_text())
     assert len(st["engine"]["positions"]) == 9 and not sup._save_failed
     sup.journal.close()
+
+
+def test_startup_says_which_settings_were_read(tmp_path):
+    """시작할 때 어느 설정 파일을 읽었고 어떤 모드인지 알려 준다 — 설정 파일이 없으면 조용히 연습 모드가 되기 때문이다.
+    (실제 사례: 견본 파일만 고치거나 config.toml.txt 로 저장해 놓고 실전으로 바꿨다고 생각했는데 연습 화면이 뜸)"""
+    from aitrader.__main__ import startup_notes
+    (tmp_path / "config.toml.txt").write_text('mode = "kis-live"', encoding="utf-8")
+    (tmp_path / "config.example.toml").write_text("", encoding="utf-8")
+    (tmp_path / ".env.txt").write_text("", encoding="utf-8")
+    text = "\n".join(startup_notes(None, "sim", tmp_path))
+    assert "config.toml 이 이 폴더에 없습니다" in text and "config.toml.txt 은 있습니다" in text
+    assert "config.example.toml 은 있습니다" in text and ".env.txt 은 있습니다" in text and "연습(합성 시세" in text
+    (tmp_path / "config.toml").write_text('mode = "kis-mock"', encoding="utf-8")
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    text = "\n".join(startup_notes(None, "kis-mock", tmp_path))
+    assert "config.toml 을 읽었습니다" in text and ".env 를 읽었습니다" in text and "!" not in text and "모의투자" in text
