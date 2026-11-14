@@ -37,6 +37,8 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 
 윈도우에서는 `.venv/bin/` 대신 `.venv\Scripts\` 를 씁니다.
 
+**더블클릭으로 실행하기.** 윈도우는 `start-windows.bat`, 맥은 `start-mac.command` 를 더블클릭하면 됩니다(처음 한 번은 자동 설치 후 실행, 모드를 번호로 고름). 윈도우에서 `make-shortcut-windows.bat` 을 한 번 실행하면 바탕화면에 "AI 자동매매" 바로가기가 생깁니다. 실전(`kis-live`)은 실수로 켜지지 않게 바로가기에 넣지 않았습니다.
+
 | 명령 | 하는 일 |
 |---|---|
 | `run` (`--mode sim`) | 합성 시세로 전체 시스템을 돌려 보는 연습 모드. 돈이 들지 않음 |
