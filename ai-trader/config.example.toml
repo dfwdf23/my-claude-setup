@@ -30,6 +30,8 @@ auto_apply = false           # true 면 검증을 통과한 개선안을 자동 
 enabled = true               # 종목별 소식 수집(악재면 매수 보류)
 block_min = 30               # 악재 감지 후 그 종목 매수를 막는 시간(분)
 exit_on_severe = true        # Claude가 심각한 악재로 확인하면 보유분 청산
+exit_min_drop_pct = 1.5      # …단, 가격이 실제로 전일 종가보다 이만큼(%) 이상 내려 있을 때만(0 = 조건 없이 즉시)
+max_exits_per_day = 3        # 하루에 소식으로 거는 청산 지시 수의 상한(넘으면 알리기만 한다)
 
 [llm]
 enabled = true                      # ANTHROPIC_API_KEY 가 없으면 자동으로 규칙 기반으로만 동작

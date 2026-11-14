@@ -630,6 +630,9 @@ class Supervisor(Agent):
             st_sym = e.symbol_state(sym)                # 손실 청산 뒤 재진입 금지 기간을 이어 간다
             st_sym.last_loss_bar = st_sym.bar_count - int(since)
         e.exit_now.update(x for x in (es.get("exit_now") or []) if x in e.positions)
+        saved_day = es.get("exit_day") or {}
+        for x in e.exit_now:                            # 지시가 걸린 날(없으면 오늘로 본다)
+            e.exit_day[x] = int(saved_day.get(x, self.m.local_day(time.time())))
         e.bar_exit.update({k: str(v) for k, v in (es.get("bar_exit") or {}).items() if k in e.positions})
         eq = e.cash + sum(p.qty * e.sym[p.symbol].last for p in e.positions.values())
         same_day = int(es.get("day", -1)) == self.m.local_day(time.time())
@@ -776,7 +779,7 @@ class Supervisor(Agent):
             pos.append({"symbol": p.symbol, "qty": p.qty, "avg": p.avg_price, "last": last,
                         "pnl": round(p.qty * last - p.cost, 2), "pnl_pct": round((last / p.avg_price - 1) * 100, 2),
                         "stop": p.stop, "target": p.target, "stop_kind": p.stop_kind, "bars": p.bars_held,
-                        "entry_ts": p.entry_ts})
+                        "entry_ts": p.entry_ts, "exit_flag": p.symbol in e.exit_now})
         watch = []
         for sym in self.symbols or list(e.sym):
             s = e.sym.get(sym)

@@ -153,8 +153,11 @@ class KISBroker(Broker):
             self._tok_exp = time.time() + float(d.get("expires_in", 86400))
             try:
                 self._tok_file.parent.mkdir(parents=True, exist_ok=True)
-                self._tok_file.write_text(json.dumps({"env": self.env, "token": self._tok, "exp": self._tok_exp}))
-                os.chmod(self._tok_file, 0o600)
+                # 만들 때부터 본인만 읽을 수 있게(쓴 뒤에 권한을 줄이면 그 사이 잠깐 다른 사용자가 읽을 수 있다)
+                fd = os.open(self._tok_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w") as fh:
+                    fh.write(json.dumps({"env": self.env, "token": self._tok, "exp": self._tok_exp}))
+                os.chmod(self._tok_file, 0o600)          # 예전 버전이 넓은 권한으로 만들어 둔 파일도 좁힌다
             except OSError:
                 pass
             return self._tok

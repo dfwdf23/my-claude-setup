@@ -112,6 +112,10 @@ class NewsCfg:
     block_min: float = 30.0            # 악재 감지 후 해당 종목 신규 매수 차단 시간
     half_life_min: float = 60.0        # 소식 점수가 절반으로 줄어드는 시간
     exit_on_severe: bool = True        # Claude가 '심각한 악재'로 확인하면 보유분 청산
+    # 소식 제목은 바깥에서 온 글이다(틀릴 수도, 누가 일부러 흘린 것일 수도 있다). 제목 한 줄과 모델의 판정만으로
+    # 보유분을 던지지 않도록 두 가지 안전장치를 둔다.
+    exit_min_drop_pct: float = 1.5     # 실제로 가격이 전일 종가보다 이만큼(%) 이상 내려 있을 때만 청산(0 = 조건 없이 즉시)
+    max_exits_per_day: int = 3         # 하루에 소식으로 거는 청산 지시 수의 상한(넘으면 알리기만 한다)
     aliases: dict = field(default_factory=dict)  # 종목 → 회사명 목록(일반 뉴스에서 종목 찾기)
     user_agent: str = "Mozilla/5.0 (compatible; aitrader-news)"
 

@@ -123,7 +123,11 @@ class Engine:
         self.agents = [self.chart, self.guard, self.sizer, self.buyer, self.seller, self.risk]
         self.regime = Regime()
         self.news: dict[str, NewsState] = {}   # 정보수집 에이전트가 갱신(종목별 소식 상태)
-        self.exit_now: set[str] = set()        # 심각한 악재로 즉시 청산할 종목
+        self.exit_now: set[str] = set()        # 심각한 악재로 청산할 종목(정보수집이 건다)
+        self.exit_day: dict[str, int] = {}     # 그 지시가 걸린 날 — 며칠이 지나도록 가격이 반응하지 않으면 버린다
+        # 청산은 가격이 전일 종가의 이 배수 이하일 때만(시장이 실제로 반응했는지 확인). 조건을 끄면 항상 참
+        drop = cfg.news.exit_min_drop_pct
+        self.exit_k = 1.0 - drop / 100.0 if drop > 0 else float("inf")
         self.bar_exit: dict[str, str] = {}     # 봉 기준 청산(추세 이탈·시간 청산)이 결정됐지만 아직 체결되지 않은 종목 → 사유
         # 상태
         self.sym: dict[str, SymState] = {}
@@ -280,8 +284,12 @@ class Engine:
         if pos is not None and t.symbol not in self.pending and ts >= s.retry_after:
             # 봉 기준 청산이 결정됐는데 주문이 체결되지 않았으면(시간 초과·제안 만료) 체결될 때까지 다시 낸다.
             # 일봉 방식은 판단이 하루 한 번뿐이라, 그러지 않으면 청산이 다음 날로 밀린다.
-            force = "risk_flatten" if self.risk.flatten_all else (
-                "news_exit" if t.symbol in self.exit_now else self.bar_exit.get(t.symbol, ""))
+            if self.risk.flatten_all:
+                force = "risk_flatten"
+            elif t.symbol in self.exit_now and (s.prev_close <= 0.0 or px <= s.prev_close * self.exit_k):
+                force = "news_exit"                # 심각한 악재 + 가격도 실제로 내려 있다(전일 종가를 모르면 조건 없이)
+            else:
+                force = self.bar_exit.get(t.symbol, "")
             it = self.seller.on_tick(pos, px, s.bid, tod, force, s.etf)
             if it is not None:
                 self._send(it, s)
@@ -493,6 +501,7 @@ class Engine:
     def _close(self, pos: Position, fl: Fill) -> Trade:
         del self.positions[pos.symbol]
         self.exit_now.discard(pos.symbol)
+        self.exit_day.pop(pos.symbol, None)
         self.bar_exit.pop(pos.symbol, None)
         r = pos.risk_per_share or 1.0
         tq = pos.exit_qty
@@ -558,8 +567,11 @@ class Engine:
             s.bar_start = -1.0
             s.cum_vol = 0
             s.rvol = -1.0
-        # 장 마감 뒤에 확인된 심각한 악재의 청산 지시는 다음 장에서 실행돼야 한다 → 보유 중인 종목의 지시는 남긴다
-        self.exit_now.intersection_update(self.positions)
+        # 장 마감 뒤에 확인된 심각한 악재의 청산 지시는 다음 장에서 실행돼야 한다 → 보유 중인 종목의 지시는 남긴다.
+        # 다만 닷새가 지나도록 가격이 반응하지 않은 지시는 버린다(끝없이 매수를 막고 있지 않게).
+        for x in [x for x in self.exit_now if x not in self.positions or day - self.exit_day.get(x, day) > 4]:
+            self.exit_now.discard(x)
+            self.exit_day.pop(x, None)
         if not first:
             self.mark()
         self.day_start_equity = self.equity
@@ -600,6 +612,7 @@ class Engine:
                 # 보유 종목의 마지막 가격 — 재시작 직후 취득가로 평가하면 평가손익이 통째로 사라져 한도가 잘못 발동한다
                 "last": {p.symbol: sym[p.symbol].last for p in self.positions.values() if p.symbol in sym},
                 "since_loss": since, "exit_now": sorted(self.exit_now),
+                "exit_day": {k: v for k, v in self.exit_day.items() if k in self.exit_now},
                 # 결정됐지만 아직 체결되지 않은 봉 기준 청산(추세 이탈·시간 청산) — 일봉 방식은 판단이 하루 한 번뿐이라
                 # 재시작으로 잊으면 청산이 통째로 사라진다
                 "bar_exit": {k: v for k, v in self.bar_exit.items() if k in self.positions}}

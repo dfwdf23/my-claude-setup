@@ -993,3 +993,62 @@ async def test_recover_keeps_watching_an_order_it_cancelled_without_confirmation
     ex.on_fill("1", 1, 166.0, time.time())                  # 그다음 통보(누적 5주)는 새 체결이다
     assert e.positions["NVDA"].qty == 5
     ex.shutdown()
+
+
+# ====================================================================== 소식으로 거는 청산의 안전장치
+def test_news_exit_waits_until_the_price_has_actually_dropped():
+    """'심각한 악재' 청산 지시는 가격이 실제로 전일 종가보다 설정한 폭 이상 내려 있을 때만 실행한다.
+    (소식 제목은 바깥에서 온 글이다 — 틀렸거나 누가 일부러 흘린 제목 한 줄과 모델의 판정만으로 보유분을 던지지 않는다)
+    며칠이 지나도록 가격이 반응하지 않은 지시는 버린다."""
+    cfg = Config.for_market("US")
+    sent = []
+    e = Engine(cfg, StrategyParams(), 30_000, execute=sent.append)
+    d1 = date(2026, 1, 5)
+    e.on_tick(Tick("X", US.epoch(d1, 10, 0), 100.0, 100))
+    e.on_fill(Fill("X", BUY, 10, 100.0, US.epoch(d1, 10, 0), ctx={"stop_dist": 20.0, "atr": 5.0}))
+    e.sym["X"].prev_close = 100.0                           # 전일 종가(장전 준비 때 채워진다)
+    e.exit_now.add("X")
+    e.exit_day["X"] = e.day
+    e.on_tick(Tick("X", US.epoch(d1, 10, 1), 99.2, 100))    # −0.8%: 시장은 반응하지 않았다 → 아직 팔지 않는다
+    assert not sent and "X" in e.exit_now
+    e.on_tick(Tick("X", US.epoch(d1, 10, 2), 98.4, 100))    # −1.6%: 기준(1.5%)을 넘었다 → 청산
+    assert [(it.symbol, it.reason, it.limit_price) for it in sent] == [("X", "news_exit", 0)]
+
+    sent.clear()
+    e2 = Engine(cfg, StrategyParams(), 30_000, execute=sent.append)
+    e2.on_tick(Tick("X", US.epoch(d1, 10, 0), 100.0, 100))
+    e2.on_fill(Fill("X", BUY, 10, 100.0, US.epoch(d1, 10, 0), ctx={"stop_dist": 20.0, "atr": 5.0}))
+    e2.sym["X"].prev_close = 100.0
+    e2.exit_now.add("X")
+    e2.exit_day["X"] = e2.day
+    assert e2.export_state()["exit_day"] == {"X": e2.day}
+    for k in (1, 2, 3):                                     # 사흘 뒤까지는 지시가 살아 있다(주말을 넘겨도)
+        e2.on_tick(Tick("X", US.epoch(d1 + timedelta(days=k), 10, 0), 100.5, 100))
+        assert "X" in e2.exit_now and not sent
+    e2.on_tick(Tick("X", US.epoch(d1 + timedelta(days=7), 10, 0), 100.5, 100))
+    assert "X" not in e2.exit_now and not e2.exit_day and not sent          # 닷새 넘게 가격이 반응하지 않았다 → 버린다
+
+    cfg0 = Config.for_market("US")
+    cfg0.news.exit_min_drop_pct = 0.0                       # 조건을 끄면 예전처럼 즉시
+    e3 = Engine(cfg0, StrategyParams(), 30_000, execute=sent.append)
+    e3.on_tick(Tick("X", US.epoch(d1, 10, 0), 100.0, 100))
+    e3.on_fill(Fill("X", BUY, 10, 100.0, US.epoch(d1, 10, 0), ctx={"stop_dist": 20.0, "atr": 5.0}))
+    e3.sym["X"].prev_close = 100.0
+    e3.exit_now.add("X")
+    e3.on_tick(Tick("X", US.epoch(d1, 10, 1), 100.4, 100))
+    assert sent and sent[-1].reason == "news_exit"
+
+
+async def test_news_exit_orders_are_capped_per_day():
+    """하루에 소식으로 거는 청산 지시 수에는 상한이 있다 — 넘으면 알리기만 하고 팔지 않는다(제목 여러 개로 보유분 전체를 던지게 하는 일 방지)."""
+    held = ("AMD", "NVDA", "AAPL", "MSFT")
+    llm = SymLLM(default=-2)
+    cfg, e, na = news_env2(llm, held=held)
+    cfg.news.max_exits_per_day = 2
+    na.ingest([(NOW, f"{name} hit by accounting fraud probe", "", "x", ()) for name in ("AMD", "Nvidia", "Apple", "Microsoft")], NOW)
+    assert await na.classify(NOW + 400) == 4
+    assert len(e.exit_now) == 2 and set(e.exit_day) == e.exit_now
+    over = [ev for ev in e.events if ev.get("alert") and "한도" in ev["text"]]
+    assert len(over) == 2 and all(e.news[s].block_until > NOW for s in held)      # 나머지는 알림 + 매수 보류만
+    na.new_day()                                            # 날이 바뀌면 상한은 새로 센다
+    assert na.exits_day == 0

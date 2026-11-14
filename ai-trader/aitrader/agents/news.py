@@ -231,12 +231,14 @@ class NewsAgent(Agent):
         self.last_ok = 0.0            # 마지막으로 피드를 정상 해석한 시각
         self.llm_off = ""             # Claude 분류를 못 쓰는 이유(화면 표시용). 빈 문자열 = 정상
         self._prior: dict | None = None   # 이전 실행에서 이미 받은 Claude 판정(일지에서 한 번 읽는다): id → ({종목: 판정}, 분류)
+        self.exits_day = 0            # 오늘 소식으로 건 청산 지시 수
         self._stop = False
         self._alias: list[tuple[re.Pattern, str]] = []
         self.set_symbols(self.symbols)
 
     def new_day(self) -> None:
         self.llm_calls_day = 0
+        self.exits_day = 0
         if self.llm_off.startswith("오늘"):
             self.llm_off = ""
         for it in self.items.values():                # 어제 응답을 못 받은 소식에 다시 기회를 준다(예산·횟수가 새로 시작된다)
@@ -501,10 +503,20 @@ class NewsAgent(Agent):
             if ns is not None and impact >= 0 and before <= -0.5 and not self._has_negative(sym, now):
                 ns.block_until = 0.0                     # 규칙이 잘못 막은 것을 푼다
             pend = self.engine.pending.get(sym)
-            if impact <= -2 and self.nc.exit_on_severe and (sym in held or (pend is not None and pend.side == BUY)):
+            if (impact <= -2 and self.nc.exit_on_severe and sym not in self.engine.exit_now
+                    and (sym in held or (pend is not None and pend.side == BUY))):
                 # 보유 중이거나 매수 주문이 나가 있는 종목만 청산 지시(체결되면 곧바로 정리). 그 밖의 종목은 매수 보류로 충분하다.
-                self.engine.exit_now.add(sym)
-                self.engine.emit("news", sym, f"심각한 악재 확인(Claude): {it.title[:80]} — 보유분 청산", alert=1)
+                # 제목은 바깥에서 온 글이므로 (1) 하루 지시 수에 상한을 두고 (2) 실제 청산은 가격이 내려 있을 때만 한다(엔진).
+                if self.exits_day >= self.nc.max_exits_per_day:
+                    self.engine.emit("news", sym, f"심각한 악재 확인(Claude): {it.title[:80]} — 오늘의 자동 청산 지시 한도"
+                                     f"({self.nc.max_exits_per_day}건)를 넘어 청산하지 않습니다. 직접 확인하세요", alert=1)
+                else:
+                    self.exits_day += 1
+                    self.engine.exit_now.add(sym)
+                    self.engine.exit_day[sym] = self.engine.m.local_day(now)
+                    drop = self.nc.exit_min_drop_pct
+                    cond = f"가격이 전일 종가보다 {drop:g}% 이상 내려 있으면 " if drop > 0 else ""
+                    self.engine.emit("news", sym, f"심각한 악재 확인(Claude): {it.title[:80]} — {cond}보유분 청산", alert=1)
             if self.journal is not None:
                 self.journal.news(it)
         return n

@@ -86,6 +86,7 @@ tr.pick { cursor: pointer; } tr.pick:hover td { background: var(--hover); } tr.s
 .agent .last { color: var(--ink2); font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .agent .n { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
 .tag { font-size: 10.5px; padding: 1px 5px; border-radius: 4px; border: 1px solid var(--border); color: var(--ink2); font-weight: 500; white-space: nowrap; }
+.tag.flag { border-color: var(--crit); color: var(--crit); }
 .flexcol { display: flex; flex-direction: column; }
 .list { flex: 1 1 0; min-height: 280px; height: 0; overflow-y: auto; font-size: 12.5px; }
 .log div { display: grid; grid-template-columns: 62px 58px 1fr; gap: 8px; padding: 3px 0; border-bottom: 1px solid var(--grid); }
@@ -333,7 +334,8 @@ function render(s) {
   });
 
   table($("positions"), [
-    ["종목", p => p.symbol], ["수량", p => num(p.qty, 0)], ["평균가", p => px(p.avg)], ["현재가", p => px(p.last)],
+    ["종목", p => p.exit_flag ? el("span", {}, document.createTextNode(p.symbol + " "), el("span", {class: "tag flag", text: "악재 청산 대기", title: "심각한 악재가 확인됐습니다. 가격이 전일 종가보다 설정한 폭 이상 내려 있으면 청산합니다"})) : p.symbol],
+    ["수량", p => num(p.qty, 0)], ["평균가", p => px(p.avg)], ["현재가", p => px(p.last)],
     ["평가손익", p => span(arrow(p.pnl) + signed(p.pnl), cls(p.pnl))], ["수익률", p => span((p.pnl_pct >= 0 ? "+" : "") + p.pnl_pct.toFixed(2) + "%", cls(p.pnl_pct))],
     ["손절가", p => px(p.stop) + " (" + (STOPK[p.stop_kind] || p.stop_kind) + ")"], ["익절가", p => px(p.target)], ["보유", p => p.bars + "봉"],
   ].concat(s.mode === "manual" ? [["", p => { const b = el("button", {class: "sm", text: "직접 팔았음", title: "봇의 제안 없이 증권사 앱에서 직접 판 경우 장부에 반영"}); b.addEventListener("click", () => soldMyself(p)); return b; }]] : []),
