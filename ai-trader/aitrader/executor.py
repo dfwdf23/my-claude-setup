@@ -6,8 +6,10 @@ submit() 은 동기 함수다: 엔진(핫패스)은 네트워크 왕복을 기�
   SENT → ACK → FILLED | CANCELED | REJECTED
   SENT → UNKNOWN(전송 중 오류로 접수 여부 불명) → ACK | REJECTED | STUCK(끝내 확인 불가: 잠금 유지 + 정지)
   ACK → CANCELING(취소 요청 → 최종 체결 수량 확정 중) → CANCELED | FILLED | STUCK
-  취소 요청이 거듭 실패하는데 체결도 종료도 확인되지 않으면 STUCK(끝없이 되풀이하지 않는다).
-  STUCK 주문은 가끔 다시 조회한다: 일시 장애였다면 조회가 되는 대로 체결을 반영하고, 끝난 주문이면 잠금을 푼다
+  취소 요청이 실패하면(거부든 응답 없음이든) '끝난 주문'이라고 단정하지 않는다. 조회로 끝남 표시나 전량 체결이
+  확인되면 거기서 끝내고, 아니면 다시 시도하다가 세 번 연달아 실패하면 STUCK(끝없이 되풀이하지 않는다).
+  STUCK 주문은 가끔 다시 조회한다: 일시 장애였다면 조회가 되는 대로 체결을 반영하고, 끝난 주문이면 잠금을 푼다.
+  아직 살아 있으면 취소를 다시 시도하고, 그 주문의 장이 끝났으면(당일 주문은 소멸) 끝난 것으로 정리한다
   (신규 매수 정지는 사람이 [재개]를 누를 때까지 그대로다).
 엔진의 종목 잠금(pending)은 주문이 '확실히 끝났을 때'만 풀린다. 접수 여부를 모르는 주문의 잠금을
 풀면 같은 주문이 두 번 나가거나 체결분이 장부에서 빠지기 때문이다.
@@ -45,6 +47,7 @@ class Executor(Agent):
         # 미체결 시간 초과를 재는 시계. 기본은 마지막 틱 시각이지만, 시세 시각이 실제 시각보다 늦을 수 있는
         # 실시간 모드에서는 총괄이 벽시계를 넘겨 준다(주문 제안이 뜨자마자 만료되는 일을 막는다).
         self.clock: Callable[[], float] = clock or (lambda: engine.now)
+        self.wall: Callable[[], float] = time.time    # 실제 시각(주문 내역의 접수 시각·장 마감 여부를 따질 때. 시세 시각과 무관)
         self.orders: dict[int, Order] = {}            # 진행 중 주문
         self.by_bid: dict[str, Order] = {}
         self.early: dict[str, list] = {}              # 주문 응답보다 먼저 도착한 체결통보
@@ -77,7 +80,7 @@ class Executor(Agent):
         self.calls += 1
         self._n += 1
         o = Order(self._n, it.symbol, it.side, it.qty, it.limit_price, it.reason, it.ctx,
-                  self.clock(), status="SENT", sent_ns=perf_counter_ns(), wall_ts=time.time())
+                  self.clock(), status="SENT", sent_ns=perf_counter_ns(), wall_ts=self.wall())
         self.orders[o.id] = o
         self._spawn(self._place(o))
 
@@ -329,35 +332,57 @@ class Executor(Agent):
             return
         finally:
             self._polling.discard(o.id)
-        if o.id not in self.orders or o.status != "STUCK":
+        if o.id not in self.orders or o.status != "STUCK" or cum < o.filled:
             return
         if cum > o.filled and avg > 0:
             self._apply(o, cum, avg, self.clock(), avg=True)
-        if done and o.id in self.orders:
-            self._finish(o, "CANCELED", "뒤늦게 종료 확인")
+        if o.id not in self.orders:
+            return                                    # 전량 체결로 끝났다
+        if done or self._session_over(o):
+            # 증권사가 끝난 주문이라고 했거나, 그 주문을 낸 날의 장이 끝났다(당일 주문은 장 마감과 함께 소멸한다)
+            self._finish(o, "CANCELED", "뒤늦게 종료 확인" if done else "장 마감으로 소멸")
             self.engine.emit("order", o.symbol, f"확인 불가였던 {o.symbol} 주문이 끝난 것을 확인했습니다 — 종목 잠금 해제")
+            return
+        # 조회는 되는데 아직 살아 있는 주문이다 → 원래 하려던 취소를 다시 보낸다(호출 한도 등 일시적 사유로 막혔던 경우)
+        try:
+            await self.broker.cancel_order(o)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return                                    # 여전히 안 된다 — 확인 불가 상태로 둔다(다음 주기에 다시)
+        if o.id in self.orders and o.status == "STUCK":
+            o.status = "CANCELING"
+            self.engine.emit("order", o.symbol, f"확인 불가였던 {o.symbol} 주문의 취소가 접수됐습니다")
+            await self._settle(o, "시간 초과 취소")
+
+    def _session_over(self, o: Order) -> bool:
+        """그 주문을 낸 날의 정규장이 끝났는가(실제 시각 기준). 당일 주문만 쓰므로, 끝났다면 주문은 더 체결될 수 없다."""
+        if o.wall_ts <= 0:
+            return False
+        e = self.engine
+        now = self.wall()
+        if e.m.local_day(now) > e.m.local_day(o.wall_ts):
+            return True
+        return (now + e.m.utc_offset(now)) % 86400.0 >= e.close_tod
 
     async def _cancel(self, o: Order) -> None:
         try:
             await self.broker.cancel_order(o)
         except asyncio.CancelledError:
             raise
-        except BrokerError as ex:
-            # 증권사가 취소를 명시적으로 거부했다 = 취소할 것이 없다(취소보다 먼저 전량 체결됐거나, 앞서 보낸 취소가
-            # 이미 처리됐거나, 장 마감으로 소멸). 정말 끝났는지는 조회로 확정한다: 체결이 보이면 반영하고, 수량이 한동안
-            # 그대로면 끝난 것으로 본다. 전량 체결이 조회에 늦게 나타날 수 있으므로 보통의 취소보다 오래 지켜본다.
+        except Exception as ex:
             if o.id not in self.orders:
                 return
-            if self.can_poll:
-                o.error = str(ex)
-                await self._settle(o, "취소 거부(이미 끝난 주문)", SETTLE_SAME + 1)
-                return
+            if isinstance(ex, BrokerError) and self.can_poll:
+                # 증권사가 취소를 명시적으로 거부했다. 이미 끝난 주문일 수 있다(취소보다 먼저 전량 체결됐거나, 앞서 보낸
+                # 취소가 이미 처리됨) — 조회로 확인해 끝남 표시나 전량 체결이 보이면 거기서 끝낸다. 하지만 거부 사유는
+                # 그것만이 아니다(호출 한도, 주문이 아직 거래소로 가는 중 등). 조회에 아직 열려 있다고 나오면 '끝났다'고
+                # 단정하지 않는다 — 잠금을 풀면 살아 있는 주문 위에 새 주문이 나가 수량이 두 배가 된다.
+                if await self._confirm_ended(o, "취소 거부(이미 끝난 주문)"):
+                    return
+                if o.id not in self.orders:
+                    return
             self._cancel_failed(o, ex)
-            return
-        except Exception as ex:
-            # 취소 요청이 닿았는지 알 수 없다(시간 초과 등) — 통보/폴링으로 체결을 확인하면서 다시 시도한다
-            if o.id in self.orders:
-                self._cancel_failed(o, ex)
             return
         if o.id not in self.orders:
             return
@@ -366,13 +391,40 @@ class Executor(Agent):
             return
         await self._settle(o, "시간 초과 취소")
 
+    async def _confirm_ended(self, o: Order, reason: str) -> bool:
+        """취소가 거부된 주문이 이미 끝난 것인지 조회로 확인한다. 체결이 보이면 반영하고, 증권사가 끝난 주문이라고 하면
+        끝낸다. 끝났으면(전량 체결 포함) True. 아직 열려 있거나 조회가 안 되면 False — 호출한 쪽이 취소 실패로 센다."""
+        for delay in self.settle_delays[:4]:
+            if delay:
+                await asyncio.sleep(delay)
+            if o.id not in self.orders:
+                return True
+            try:
+                cum, avg, done = await self.broker.poll_order(o)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                continue
+            if o.id not in self.orders:
+                return True
+            if cum < o.filled:
+                continue
+            if cum > o.filled and avg > 0:
+                self._apply(o, cum, avg, self.engine.now, avg=True)
+                if o.id not in self.orders:
+                    return True                        # 전량 체결로 끝났다
+            if done:
+                self._finish(o, "CANCELED", reason)
+                return True
+        return False
+
     def _cancel_failed(self, o: Order, ex: Exception) -> None:
+        """취소 요청이 실패했고 주문이 끝났다는 확인도 없다 → 다음 시간 초과 때 다시 시도한다. 체결도 종료도 확인되지 않은 채
+        세 번 연달아 실패하면 끝없이 되풀이하지 않고(종목 잠금·계좌 대사 중단이 조용히 계속된다) 사람을 부른다."""
         n, at = self._cfail.get(o.id, (0, -1))
         n = n + 1 if at == o.filled else 1             # 그 사이 체결이 늘었으면 처음부터 다시 센다
         self._cfail[o.id] = (n, o.filled)
         if n >= MAX_CANCEL_FAILS:
-            # 취소가 거듭 실패하는데 체결도 종료도 확인되지 않는다 → 끝없이 되풀이하지 않고(종목 잠금·계좌 대사 중단이
-            # 조용히 계속된다) 사람을 부른다.
             o.status = "STUCK"
             msg = (f"{o.symbol} 주문의 취소가 계속 실패합니다({ex!r}) — 이미 끝난 주문일 수 있습니다. "
                    f"계좌를 직접 확인한 뒤 [재개]를 누르세요")[:240]
@@ -471,6 +523,12 @@ class Executor(Agent):
     def busy(self) -> bool:
         return bool(self.orders)
 
+    def unsettled(self) -> set[str]:
+        """체결 수량이 아직 확정되지 않은 주문이 걸린 종목: 진행 중·확인 불가 주문, 그리고 취소로 끝냈지만 뒤늦은 체결을
+        지켜보는 중인 주문. 이 종목의 장부·계좌 차이는 그 주문의 체결일 수 있으므로 계좌 대사는 확정될 때까지 미룬다
+        (먼저 '판 것'으로 정리해 버리면, 나중에 그 주문의 체결이 확인될 때 같은 수량을 한 번 더 반영하게 된다)."""
+        return {o.symbol for o in self.orders.values()} | {o.symbol for o in self._following.values()}
+
     def drop_stuck(self) -> list[str]:
         """사람이 계좌를 확인하고 [재개]를 눌렀을 때: 확인 불가 주문의 잠금을 푼다."""
         out = []
@@ -526,18 +584,18 @@ class Executor(Agent):
                 return "absent", ""
         return "unknown", ""
 
-    def _keep_stuck(self, o: Order, why: str, base: int) -> None:
+    def _keep_stuck(self, o: Order, why: str) -> None:
         """이전 실행의 주문이 끝났는지 확인하지 못했다 → 잊지 않는다. 확인 불가 주문으로 남겨 종목을 잠그고
         신규 매수를 멈춘다(저장도 계속된다 → 다음 시작 때 다시 확인, 사람이 [재개]를 누르면 해제).
 
-        base: 이전 실행이 저장해 둔 체결 수량. 다시 켠 뒤에 오는 체결 통보(건별)는 그 수량 다음부터 센다 —
-        꺼져 있던 동안의 통보는 다시 오지 않고, 방금 조회로 넣은 체결의 통보가 뒤따라 와도 두 번 넣지 않게."""
+        이후에 오는 체결 통보(건별)는 '지금까지 장부에 넣은 수량' 다음부터 센다. 재시작 정리는 실시간 통보 연결보다
+        먼저 끝나고, 꺼져 있던 동안의 통보는 다시 오지 않는다 — 여기서 조회로 넣은 체결의 통보가 뒤따라 올 일이 없다."""
         e = self.engine
         self._n += 1
         o.id = self._n
         o.status = "STUCK"
         self.orders[o.id] = o
-        self.ws_cum[o.id] = base
+        self.ws_cum[o.id] = o.filled
         if o.broker_id:
             self.by_bid[o.broker_id] = o               # 뒤늦게 오는 체결 통보는 이 주문으로 반영된다
         e.pending.setdefault(o.symbol, OrderIntent(o.symbol, o.side, o.qty, o.limit_price, o.reason, o.ctx))
@@ -545,14 +603,14 @@ class Executor(Agent):
         e.risk.halt(msg, flatten=False)
         e.emit("risk", o.symbol, msg)
 
-    def _remember(self, o: Order, follow: bool, base: int) -> None:
+    def _remember(self, o: Order, follow: bool) -> None:
         """재시작 정리에서 끝낸 주문을 '방금 끝난 주문'처럼 기억한다 — 뒤늦게 오는 체결 통보를 받고,
-        follow 면 얼마간 더 조회한다(취소 접수와 실제 취소 사이에 체결된 수량). base 는 _keep_stuck 과 같다."""
+        follow 면 얼마간 더 조회한다(취소 접수와 실제 취소 사이에 체결된 수량). 통보는 _keep_stuck 과 같은 기준으로 센다."""
         if not o.broker_id or o.filled >= o.qty:
             return
         o.status = "CANCELED"
         self.recent[o.broker_id] = o
-        self.late_cum[o.broker_id] = base
+        self.late_cum[o.broker_id] = o.filled
         if follow and self.can_poll:
             self._follow_up(o)
 
@@ -563,54 +621,58 @@ class Executor(Agent):
         나중에 체결됐을 때 계좌에는 있고 장부에는 없는 주식이 생기고 아무도 알려 주지 않는다."""
         n = 0
         e = self.engine
-        today = e.m.local_day(time.time())
         for d in saved:
             o = Order(0, d["symbol"], d["side"], int(d["qty"]), float(d.get("limit_price", 0.0)),
                       d.get("reason", ""), d.get("ctx") or {}, float(d.get("created_ts", 0.0)),
                       status="ACK", broker_id=str(d.get("broker_id", "")), broker_org=str(d.get("broker_org", "")),
                       filled=int(d.get("filled", 0)), avg_price=float(d.get("avg_price", 0.0)),
                       wall_ts=float(d.get("wall_ts") or d.get("created_ts") or 0.0))
-            base = o.filled
             if d.get("status") == "CANCELED":
-                # 취소로 끝낸 뒤 뒤늦은 체결을 지켜보던 주문 — 한 번 더 조회해 그 사이 체결이 있었으면 반영한다
+                # 취소로 끝낸 뒤 뒤늦은 체결을 지켜보던 주문 — 다시 조회해 그 사이 체결이 있었으면 반영한다.
                 got = await self._poll_retry(o) if o.broker_id else None
                 if got is None:
                     e.emit("risk", o.symbol, f"이전 실행에서 취소한 {o.symbol} 주문의 최종 체결 수량을 다시 확인하지 못했습니다 — 계좌 확인 필요")
-                else:
-                    n += self._recovered(o, got[0], got[1])
-                self._remember(o, got is None, base)       # 못 봤으면 조금 더 지켜본다
-                continue
-            if not o.broker_id:
-                state, bid = await self._lookup_retry(o)
-                if state == "absent":
-                    continue                           # 증권사에 닿지 않은 주문
-                if state != "found":
-                    self._keep_stuck(o, "접수 여부를 확인할 수 없습니다", base)
+                    self._remember(o, True)                # 얼마간 더 조회해 본다(그동안 이 종목의 계좌 대사는 미룬다)
                     continue
-                o.broker_id = bid
-            got = await self._poll_retry(o)
-            if got is None:
-                self._keep_stuck(o, f"상태를 조회할 수 없습니다({o.error})"[:120], base)
-                continue
-            cum, avg, done = got
-            n += self._recovered(o, cum, avg)
-            if done or o.filled >= o.qty:
-                continue
-            # 지난 거래일에 낸 주문은 당일 주문이라 이미 소멸했을 것이다. 그래도 취소는 한 번 보내 보고(살아 있다면 꼭 필요하다),
-            # 취소가 거부되고 끝났다는 표시가 없어도 '확인 불가'로 멈추지는 않는다.
-            expired = 0 < o.wall_ts and e.m.local_day(o.wall_ts) < today
+                n += self._recovered(o, got[0], got[1])
+                if got[2] or o.filled >= o.qty:
+                    continue                               # 증권사가 끝난 주문이라고 확인했다
+                # 끝났다는 표시가 없다 → 아직 살아 있을 수 있다. 아래에서 살아 있는 주문과 똑같이 취소·확인한다.
+                cum, avg, done = got
+            else:
+                cum = avg = done = None
+            if cum is None:
+                if not o.broker_id:
+                    state, bid = await self._lookup_retry(o)
+                    if state == "absent":
+                        continue                       # 증권사에 닿지 않은 주문
+                    if state != "found":
+                        self._keep_stuck(o, "접수 여부를 확인할 수 없습니다")
+                        continue
+                    o.broker_id = bid
+                got = await self._poll_retry(o)
+                if got is None:
+                    self._keep_stuck(o, f"상태를 조회할 수 없습니다({o.error})"[:120])
+                    continue
+                cum, avg, done = got
+                n += self._recovered(o, cum, avg)
+                if done or o.filled >= o.qty:
+                    continue
+            # 그 주문을 낸 날의 장이 이미 끝났다면 당일 주문이라 소멸했을 것이다. 그래도 취소는 한 번 보내 보고(살아 있다면
+            # 꼭 필요하다), 취소가 안 되고 끝났다는 표시가 없어도 '확인 불가'로 멈추지는 않는다.
+            expired = self._session_over(o) if o.wall_ts > 0 else False
             canceled = True
             try:
                 await self.broker.cancel_order(o)
                 e.emit("order", o.symbol, f"이전 실행의 미체결 {o.side} 주문 취소")
             except asyncio.CancelledError:
                 raise
-            except BrokerError as ex:
-                # 명시적 거부 = 취소할 것이 없다(꺼지기 전에 보낸 취소가 처리됐거나 이미 끝난 주문). 아래 조회로 확정한다.
-                e.emit("order", o.symbol, f"이전 실행의 {o.side} 주문은 취소할 것이 없습니다({ex})"[:160])
             except Exception as ex:
+                # 거부든 응답 없음이든 '취소됐다'는 증거가 아니다(거부 사유가 '취소할 것이 없음'이 아닐 수도 있다).
+                # 아래 조회에서 증권사가 끝난 주문이라고 해야 끝낸다(지난 날의 주문은 예외 — 이미 소멸했다).
                 canceled = False
-                e.emit("risk", o.symbol, f"이전 실행의 미체결 주문 취소 실패: {ex!r}")
+                e.emit("order" if isinstance(ex, BrokerError) else "risk", o.symbol,
+                       f"이전 실행의 미체결 {o.side} 주문 취소가 되지 않았습니다: {ex!r}"[:180])
             ended = confirmed = False
             same = 0
             last = -1
@@ -634,9 +696,9 @@ class Executor(Agent):
                     ended = True                       # 취소는 접수됐고 체결 수량이 더 변하지 않는다 / 이미 소멸한 지난 날의 주문
                     break
             if not ended:
-                self._keep_stuck(o, "취소됐는지 확인할 수 없습니다", base)
+                self._keep_stuck(o, "취소됐는지 확인할 수 없습니다")
             elif not confirmed:
-                self._remember(o, True, base)          # '끝남' 표시는 못 받았다 → 뒤늦은 체결을 얼마간 더 지켜본다
+                self._remember(o, True)                # '끝남' 표시는 못 받았다 → 뒤늦은 체결을 얼마간 더 지켜본다
         return n
 
     def _recovered(self, o: Order, cum: int, avg: float) -> int:

@@ -15,6 +15,7 @@ from ..models import AccountSnapshot, Bar, Order, Tick
 
 class BrokerError(Exception):
     """증권사가 명시적으로 거부했다 — 주문이라면 '접수되지 않은 것이 확실'하다는 뜻으로 쓴다."""
+    code = ""        # 증권사 오류 코드(있으면). 어댑터가 채운다
 
 
 class BrokerUnknown(Exception):

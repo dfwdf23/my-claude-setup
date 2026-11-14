@@ -45,7 +45,18 @@ TR = {
 }
 MAX_SUBS = 40
 SKEW = 300.0        # 이 컴퓨터의 시계와 증권사 시계가 어긋나도 되는 폭(초). 주문 시각을 비교할 때 이만큼 여유를 둔다
+SKEW_AFTER = 900.0  # 주문을 보낸 뒤 증권사에 접수 시각이 찍히기까지 허용하는 폭(초)
 KNOWN_KEEP = 3 * 86400.0
+
+
+def _is_change_row(row: dict) -> bool:
+    """주문 내역의 행이 정정·취소 주문 자체인가(원주문과 같은 종목·수량으로 별도 행이 남는다)."""
+    if str(row.get("rvse_cncl_dvsn_cd") or row.get("rvse_cncl_dvsn") or "").strip() not in ("", "00"):
+        return True
+    if str(row.get("orgn_odno") or "").strip().strip("0"):
+        return True
+    name = str(row.get("sll_buy_dvsn_cd_name") or "") + str(row.get("rvse_cncl_dvsn_name") or "")
+    return "취소" in name or "정정" in name
 
 
 class RateLimiter:
@@ -198,7 +209,23 @@ class KISBroker(Broker):
         if retry and code == "EGW00201":                 # 초당 거래건수 초과 → 접수되지 않았으므로 재시도 안전
             await asyncio.sleep(0.6 if self.env == "mock" else 0.1)
             return await self._call(method, path, tr_id, payload, cont, retry=False)
-        raise BrokerError(f"{d.get('msg1', '').strip() or 'API 오류'} [{code or status}]")
+        err = BrokerError(f"{d.get('msg1', '').strip() or 'API 오류'} [{code or status}]")
+        err.code = str(code)
+        raise err
+
+    async def _cancel_call(self, path: str, body: dict) -> None:
+        """취소 요청. 게이트웨이 단계의 거절(코드 EGW…: 호출 한도 초과, 인증 문제 등)은 '취소 요청이 처리되지 않았다'는
+        뜻이지 '취소할 것이 없다'가 아니므로, 명시적 거부(BrokerError)가 아니라 결과 모름(BrokerUnknown)으로 올린다.
+        성공하면 취소 주문 자체의 주문번호도 '아는 주문'에 넣는다(주문 내역에 별도 행으로 남는다)."""
+        try:
+            d, _ = await self._call("POST", path, self.tr["cancel"], body)
+        except BrokerError as ex:
+            if ex.code.startswith("EGW"):
+                raise BrokerUnknown(str(ex)) from None
+            raise
+        odno = str((d.get("output") or {}).get("ODNO", "")).strip()
+        if odno:
+            self._known[odno.lstrip("0") or "0"] = self._now()
 
     # ------------------------------------------------------------------ 주문
     def _acct(self) -> dict:
@@ -261,7 +288,7 @@ class KISBroker(Broker):
         body = {**self._acct(), "KRX_FWDG_ORD_ORGNO": org, "ORGN_ODNO": odno, "ORD_DVSN": "00",
                 "RVSE_CNCL_DVSN_CD": "02", "ORD_QTY": "0", "ORD_UNPR": "0", "QTY_ALL_ORD_YN": "Y",
                 "EXCG_ID_DVSN_CD": self.cfg.kis.exchange}
-        await self._call("POST", "/uapi/domestic-stock/v1/trading/order-rvsecncl", self.tr["cancel"], body)
+        await self._cancel_call("/uapi/domestic-stock/v1/trading/order-rvsecncl", body)
 
     async def poll_order(self, order: Order) -> tuple[int, float, bool]:
         """체결통보 누락 대비: 주문의 (누적 체결수량, 평균가, 종료 여부)를 조회한다.
@@ -296,13 +323,20 @@ class KISBroker(Broker):
         return filled, float(hit.get("avg_prvs") or 0.0), done
 
     async def lookup_order(self, order: Order) -> tuple[str, str]:
-        """주문 응답을 못 받았을 때: 오늘 주문 내역에서 같은 종목·방향·수량의 '모르는' 주문을 찾는다.
-        후보가 둘 이상이면 고르지 않고 'unknown' 을 돌려준다(잘못 고르면 남의 주문의 체결을 장부에 넣게 된다)."""
+        """주문 응답을 못 받았을 때: 그 주문을 낸 날의 주문 내역에서 같은 종목·방향·수량의 '모르는' 주문을 찾는다.
+
+        · 주문을 낸 날부터 조회한다(재시작이 다음 날이어도 그날의 주문을 찾을 수 있게). 조회 범위 밖이면 'unknown'.
+        · 접수 시각이 '주문을 낸 시각' 앞뒤의 좁은 구간에 드는 행만 후보다(그 전의 주문도, 한참 뒤의 주문도 아니다).
+        · 정정·취소 주문의 행은 후보가 아니다(같은 종목·수량으로 별도 행이 남는다).
+        · 후보가 둘 이상이면 고르지 않고 'unknown' 을 돌려준다(잘못 고르면 남의 주문의 체결을 장부에 넣게 된다)."""
         now = datetime.fromtimestamp(self._now(), KST_TZ)
         today = now.strftime("%Y%m%d")
-        sent = datetime.fromtimestamp(self._order_ts(order) or self._now(), KST_TZ) - timedelta(seconds=SKEW)
-        since = sent.strftime("%H%M%S") if sent.date() == now.date() else "000000"
-        q = {**self._acct(), "INQR_STRT_DT": today, "INQR_END_DT": today,
+        sent = datetime.fromtimestamp(self._order_ts(order) or self._now(), KST_TZ)
+        if sent > now + timedelta(seconds=SKEW) or now - sent > timedelta(days=30):
+            return "unknown", ""                       # 조회로 확인할 수 없는 날짜의 주문 — '없다'고 단정하지 않는다
+        lo = (sent - timedelta(seconds=SKEW)).strftime("%Y%m%d%H%M%S")
+        hi = (sent + timedelta(seconds=SKEW_AFTER)).strftime("%Y%m%d%H%M%S")
+        q = {**self._acct(), "INQR_STRT_DT": lo[:8], "INQR_END_DT": min(hi[:8], today),
              "SLL_BUY_DVSN_CD": "02" if order.side == BUY else "01", "PDNO": order.symbol, "CCLD_DVSN": "00",
              "INQR_DVSN": "00", "INQR_DVSN_3": "00", "ORD_GNO_BRNO": "", "ODNO": "", "INQR_DVSN_1": "",
              "CTX_AREA_FK100": "", "CTX_AREA_NK100": ""}
@@ -313,9 +347,17 @@ class KISBroker(Broker):
         cands = {}
         for row in d.get("output1") or []:
             key = str(row.get("odno", "")).lstrip("0") or "0"
-            if self._is_known(key, str(row.get("ord_dt") or "")) or row.get("pdno") != order.symbol:
+            rd = str(row.get("ord_dt") or "").strip() or today
+            if self._is_known(key, rd) or row.get("pdno") != order.symbol:
                 continue
-            if int(float(row.get("ord_qty") or 0)) != order.qty or str(row.get("ord_tmd", "")) < since:
+            if int(float(row.get("ord_qty") or 0)) != order.qty or _is_change_row(row):
+                continue
+            tm = str(row.get("ord_tmd") or "").strip()
+            if tm.isdigit() and len(tm) <= 6:
+                at = rd + tm.zfill(6)
+                if not lo <= at <= hi:
+                    continue
+            elif not lo[:8] <= rd <= hi[:8]:           # 시각이 없으면 날짜로만 가린다
                 continue
             cands[key] = row
         if not cands:

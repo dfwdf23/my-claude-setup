@@ -407,10 +407,15 @@ async def test_late_confirmed_buy_gets_its_exit_ticket_without_waiting_for_the_s
 
 
 # ---------------------------------------------------------------------- 재시작 정리(recover)
+WALL = US.epoch(date(2026, 3, 11), 11, 0)       # 집행기가 보는 '실제 시각'을 장중(수요일 11:00 뉴욕)으로 고정한다
+AFTER_CLOSE = US.epoch(date(2026, 3, 11), 17, 0)
+
+
 async def _crash_with_live_buy(tmp_path):
     """매수 주문 1건이 증권사에 살아 있는 채로 프로세스가 죽은 상태를 만든다. (설정, 이전 증권사 흉내)"""
     cfg = live_cfg(tmp_path)
     sup, br = await fresh(cfg)
+    sup.executor.wall = lambda: WALL
     e = sup.engine
     e.on_tick(Tick(SYMS[0], US.epoch(US.now().date(), 10, 0), 100.0, 10, 99.9, 100.1))
     e._send(OrderIntent(SYMS[0], BUY, 10, 100.0, "entry", {"stop_dist": 3.0, "atr": 1.5}), e.sym[SYMS[0]])
@@ -428,6 +433,7 @@ def _reborn(cfg, old, poll=None):
         br.poll_order = poll(br.poll_order)
     sup = Supervisor(cfg, br)
     sup.executor.settle_delays = (0.0, 0.01, 0.01, 0.01, 0.01, 0.01)
+    sup.executor.wall = lambda: WALL + 60
     return sup, br
 
 
@@ -488,26 +494,31 @@ async def test_recover_keeps_an_unverifiable_order_locked_and_halts(tmp_path):
 
 
 class _Stale(Broker):
-    """조회는 '체결 없음·진행 중'만 돌려주고(끝났다는 표시가 없다), 취소 요청은 실패하는 증권사.
-    cancel_exc=BrokerError: 명시적 거부('취소할 주문이 없습니다' — 장 마감으로 소멸했거나 앞선 취소가 이미 처리됨).
-    cancel_exc=TimeoutError: 취소 요청이 닿았는지조차 알 수 없음."""
+    """취소 요청이 실패하는 증권사. 조회는 되고, 기본은 '체결 없음·진행 중'(끝났다는 표시가 없다)을 돌려준다.
+    cancel_exc=BrokerError: 명시적 거부. cancel_exc=TimeoutError: 취소 요청이 닿았는지조차 알 수 없음.
+    cum/done 을 바꿔 '사실은 체결돼 있었다'·'증권사가 끝난 주문이라고 한다'를 흉내 낸다."""
     supports_poll = True
 
     def __init__(self, lookup="unknown", cancel_exc=BrokerError):
         super().__init__()
         self.cancels = self.polls = self.lookups = 0
         self.lookup, self.cancel_exc = lookup, cancel_exc
+        self.cum, self.done = 0, False
+        self.cancel_ok = False
 
     async def place_order(self, order):
         order.broker_id = "1"
 
     async def cancel_order(self, order):
         self.cancels += 1
-        raise self.cancel_exc("취소할 주문이 없습니다")
+        if self.cancel_ok:
+            self.done = True
+            return
+        raise self.cancel_exc("취소할 수 없습니다")
 
     async def poll_order(self, order):
         self.polls += 1
-        return 0, 0.0, False
+        return self.cum, 166.0 if self.cum else 0.0, self.done
 
     async def lookup_order(self, order):
         self.lookups += 1
@@ -521,86 +532,124 @@ def _saved(created, broker_id="1", status="ACK"):
 
 
 async def test_recover_does_not_drop_orders_it_could_not_cancel_or_find():
-    """재시작 정리: 취소 요청이 닿았는지 모르고 끝났다는 확인도 없는 '오늘' 주문, 접수 여부를 알 수 없는 주문은
-    잠가 두고 사람을 부른다. 취소가 명시적으로 거부된 주문(취소할 것이 없다)은 수량이 그대로인지 확인한 뒤 끝내고
-    얼마간 더 지켜본다. 지난 거래일의 주문과 증권사에 닿지 않은 것이 확인된 주문은 조용히 정리한다."""
+    """재시작 정리: 끝났다고 확인하지 못한 주문은 잊지도, 끝났다고 단정하지도 않는다.
+      · 취소가 안 되고(거부든 응답 없음이든) 증권사의 '끝남' 표시도 없는 오늘 주문 → 잠가 두고 사람을 부른다.
+        (취소 거부를 '취소할 것이 없다 = 끝났다'로 읽으면, 호출 한도 같은 사유로 거부된 살아 있는 주문을 놓친다)
+      · 증권사가 끝난 주문이라고 하면 조용히 끝낸다. 그 주문을 낸 날의 장이 이미 끝났어도 마찬가지(당일 주문은 소멸).
+      · 접수 여부를 알 수 없으면 잠그고, 증권사에 닿지 않은 것이 확인되면 정리한다."""
     cfg = Config.for_market("US")
 
-    def env(br):
+    def env(br, wall=WALL):
         e = Engine(cfg, StrategyParams(), 30_000)
         ex = Executor(br, e, 10.0)
         ex.settle_delays = (0.0, 0.01, 0.01, 0.01, 0.01, 0.01)
         ex.follow_delays = (0.01, 0.02)
+        ex.stuck_poll_sec = 1e9                              # 이 테스트에서는 자동 재확인을 돌리지 않는다
+        ex.wall = lambda: wall
         return e, ex
 
-    br = _Stale(cancel_exc=asyncio.TimeoutError)            # 취소가 닿았는지 모른다 + 끝났다는 표시도 없다
-    e, ex = env(br)
-    assert await ex.recover(_saved(time.time())) == 0
-    assert br.cancels == 1 and [o.status for o in ex.orders.values()] == ["STUCK"] and e.risk.halted and "NVDA" in e.pending
+    for exc in (asyncio.TimeoutError, BrokerError):         # 취소가 닿았는지 모름 / 명시적 거부 — 어느 쪽도 '끝남'의 증거가 아니다
+        br = _Stale(cancel_exc=exc)
+        e, ex = env(br)
+        assert await ex.recover(_saved(WALL - 60)) == 0
+        assert br.cancels == 1 and [o.status for o in ex.orders.values()] == ["STUCK"], exc
+        assert e.risk.halted and "NVDA" in e.pending and ex.unsettled() == {"NVDA"}
 
-    br = _Stale()                                           # 취소할 것이 없다는 명시적 거부 + 수량 변화 없음 → 끝난 주문
+    br = _Stale()                                           # 취소는 거부됐지만 증권사가 끝난 주문이라고 한다(이미 취소돼 있었다)
+    br.done = True
     e, ex = env(br)
-    assert await ex.recover(_saved(time.time())) == 0
-    assert br.cancels == 1 and not ex.orders and not e.risk.halted and not e.pending
-    assert [d["status"] for d in ex.export()] == ["CANCELED"]            # 뒤늦은 체결은 얼마간 더 지켜본다
-    ex.shutdown()
+    assert await ex.recover(_saved(WALL - 60)) == 0
+    assert not ex.orders and not e.risk.halted and not e.pending and ex.export() == []
 
     br = _Stale(cancel_exc=asyncio.TimeoutError)
     e, ex = env(br)
-    assert await ex.recover(_saved(time.time() - 4 * 86400)) == 0        # 나흘 전에 낸 주문(당일 주문이라 이미 소멸)
+    assert await ex.recover(_saved(WALL - 4 * 86400)) == 0  # 나흘 전에 낸 주문(당일 주문이라 이미 소멸)
+    assert br.cancels == 1 and not ex.orders and not e.risk.halted and not e.pending
+    ex.shutdown()
+
+    br = _Stale()
+    e, ex = env(br, wall=AFTER_CLOSE)                       # 오늘 낸 주문이지만 장이 이미 끝났다
+    assert await ex.recover(_saved(WALL - 60)) == 0
     assert br.cancels == 1 and not ex.orders and not e.risk.halted and not e.pending
     ex.shutdown()
 
     br = _Stale(lookup="unknown")                           # 전송 도중 꺼져 주문번호 없이 저장됨 + 조회로도 알 수 없음
     e, ex = env(br)
-    assert await ex.recover(_saved(time.time(), broker_id="", status="SENT")) == 0
+    assert await ex.recover(_saved(WALL - 60, broker_id="", status="SENT")) == 0
     assert br.lookups >= 2 and [o.status for o in ex.orders.values()] == ["STUCK"] and e.risk.halted
 
     br = _Stale(lookup="absent")                            # 두 번 연속 '없음' → 증권사에 닿지 않은 주문
     e, ex = env(br)
-    assert await ex.recover(_saved(time.time(), broker_id="", status="SENT")) == 0
+    assert await ex.recover(_saved(WALL - 60, broker_id="", status="SENT")) == 0
     assert br.lookups == 2 and not ex.orders and not e.risk.halted and not e.pending
 
 
-async def test_cancel_that_keeps_failing_does_not_loop_forever():
-    """취소가 실패하는데 조회로도 주문이 끝났다는 표시가 없을 때, 같은 주문을 붙잡고 끝없이 취소를 되풀이하지 않는다.
-    (이전: 10초마다 취소 요청을 무한 반복 — 종목 잠금이 풀리지 않아 그 종목의 손절이 나가지 않고 계좌 대사도 멈추는데
-           정지·알림이 전혀 없음. 한 시간에 취소 요청 360번)
-      · 취소가 닿았는지 모르는 실패(시간 초과)가 이어지면 → 세 번 만에 멈추고 사람을 부른다.
-      · 증권사가 명시적으로 거부하면(취소할 것이 없다) → 수량이 그대로인지 조회로 확인하고 그 주문을 끝낸다."""
+async def test_cancel_failure_is_not_taken_as_proof_that_the_order_ended():
+    """취소 요청이 실패했을 때: 끝없이 되풀이하지도, '끝난 주문'이라고 단정하지도 않는다.
+    (처음: 10초마다 취소를 무한 반복 — 종목 잠금·계좌 대사 중단이 조용히 계속되고 경보가 없음.
+     그다음 고친 것: 명시적 거부를 '취소할 것이 없다'로 읽고 수량이 그대로면 끝낸 것 → 호출 한도로 거부된 살아 있는
+     주문의 잠금이 풀려 같은 종목에 새 주문이 나가고, 둘 다 체결되면 수량이 두 배)"""
     cfg = Config.for_market("US")
-    t0 = US.epoch(date(2026, 1, 5), 15, 59)
+    t0 = US.epoch(date(2026, 3, 11), 10, 59)
 
-    async def run(br):
+    async def run(br, cycles=40):
         e = Engine(cfg, StrategyParams(), 30_000)
         clock = [1000.0]
         ex = Executor(br, e, cfg.risk.order_timeout_sec, clock=lambda: clock[0])
         ex.settle_delays = (0.0, 0.002, 0.002, 0.002, 0.002, 0.002)
         ex.follow_delays = (0.002,)
+        ex.stuck_poll_sec = 1e9                              # 자동 재확인은 아래에서 따로 본다
+        ex.wall = lambda: WALL
         e.on_tick(Tick("NVDA", t0, 166.0, 1, 165.9, 166.1))
         e.on_fill(Fill("NVDA", BUY, 10, 166.0, t0, ctx={"stop_dist": 4.0}))
         e._send(OrderIntent("NVDA", SELL, 10, 0.0, "stop_loss"), e.sym["NVDA"])
         await asyncio.sleep(0.01)
         o = next(iter(ex.orders.values()))
         made = o.created_ts
-        for _ in range(40):
+        for _ in range(cycles):
             clock[0] += cfg.risk.order_timeout_sec + 0.5
             ex.on_timer(clock[0])
-            await asyncio.sleep(0.003)
+            await asyncio.sleep(0.004)
         assert o.created_ts == made                         # 주문을 낸 시각은 건드리지 않는다(주문 내역과 견주는 기준)
-        return e, ex, o
+        return e, ex, o, clock
 
-    br = _Stale(cancel_exc=asyncio.TimeoutError)
-    e, ex, o = await run(br)
-    assert o.status == "STUCK" and br.cancels == MAX_CANCEL_FAILS and e.risk.halted and "NVDA" in e.pending
-    assert sum(1 for ev in e.events if ev["kind"] == "risk") == 1
-    assert ex.drop_stuck() == ["NVDA"] and "NVDA" not in e.pending       # 사람이 확인하고 [재개]
+    # 1) 취소가 닿았는지 모르는 실패가 이어진다 / 2) 명시적으로 거부되는데 조회에는 아직 열려 있다 → 세 번 만에 멈추고 사람을 부른다
+    for exc in (asyncio.TimeoutError, BrokerError):
+        br = _Stale(cancel_exc=exc)
+        e, ex, o, clock = await run(br)
+        assert o.status == "STUCK" and br.cancels == MAX_CANCEL_FAILS and e.risk.halted and "NVDA" in e.pending, exc
+        assert sum(1 for ev in e.events if ev["kind"] == "risk") == 1
+        # 확인 불가 주문은 주기적으로 다시 본다: 아직 살아 있으면 취소를 다시 보내고, 접수되면 정리된다
+        ex.stuck_poll_sec = 0.0
+        br.cancel_ok = True                                 # 막혀 있던 사유(호출 한도 등)가 풀렸다
+        ex.on_timer(clock[0])
+        await asyncio.sleep(0.05)
+        assert br.cancels == MAX_CANCEL_FAILS + 1 and not ex.orders and "NVDA" not in e.pending and e.risk.halted
+        ex.shutdown()
+
+    # 3) 거부된 까닭이 '이미 끝난 주문'이었다(증권사가 끝남 표시를 준다) → 그 자리에서 끝내고 멈추지 않는다
+    br = _Stale()
+    br.done = True
+    e, ex, o, clock = await run(br, cycles=3)
+    assert o.status == "CANCELED" and br.cancels == 1 and not ex.orders and not e.risk.halted and "NVDA" not in e.pending
     ex.shutdown()
 
+    # 4) 거부된 까닭이 '취소보다 먼저 전량 체결'이었다 → 체결을 반영하고 끝(평범한 상황 — 정지 없음)
     br = _Stale()
-    e, ex, o = await run(br)
-    assert o.status == "CANCELED" and br.cancels == 1 and not ex.orders and not e.risk.halted
-    assert "NVDA" not in e.pending and e.positions["NVDA"].qty == 10     # 잠금이 풀려 다음 시세에 손절을 다시 낼 수 있다
+    br.cum = 10
+    e, ex, o, clock = await run(br, cycles=3)
+    assert o.status == "FILLED" and br.cancels == 1 and "NVDA" not in e.positions and not e.risk.halted
+    ex.shutdown()
+
+    # 5) 확인 불가로 남은 주문도, 그 주문을 낸 날의 장이 끝나면 소멸한 것으로 정리한다(다음 날까지 잠겨 있지 않게)
+    br = _Stale(cancel_exc=asyncio.TimeoutError)
+    e, ex, o, clock = await run(br)
+    assert o.status == "STUCK"
+    ex.stuck_poll_sec = 0.0
+    ex.wall = lambda: AFTER_CLOSE
+    ex.on_timer(clock[0])
+    await asyncio.sleep(0.05)
+    assert o.status == "CANCELED" and not ex.orders and "NVDA" not in e.pending and e.risk.halted
     ex.shutdown()
 
 
@@ -798,7 +847,8 @@ def test_overseas_order_row_time_is_treated_as_a_range():
     lo, hi = br._row_span(row)
     assert hi == US.epoch(date(2026, 1, 5), 9, 35) and hi - lo == 14 * 3600        # 겨울: 뉴욕과 서울은 14시간 차이
     assert br._maybe_at(row, hi) and br._maybe_at(row, lo) and not br._maybe_at(row, hi + 3600)
-    assert br._not_before(row, hi + 200) and not br._not_before(row, hi + 400)
+    assert br._maybe_at(row, hi + 200) and not br._maybe_at(row, hi + 400)
+    assert br._maybe_at(row, lo - 800, 900) and not br._maybe_at(row, lo - 800)     # 접수가 늦게 찍히는 쪽은 따로 허용폭을 준다
     assert br._row_span({"ord_tmd": "093500"}) is None and br._maybe_at({}, 123.0)   # 날짜가 없으면 판단하지 않는다
     lo2, hi2 = br._row_span({"ord_dt": "20260105"})                                  # 시각이 없으면 그날 전체
     assert hi2 - lo2 > 86000
@@ -922,6 +972,7 @@ def _exec_env(br):
     ex.settle_delays = (0.0, 0.01, 0.01, 0.01, 0.01, 0.01)
     ex.follow_delays = (0.02, 0.05, 0.1)
     ex.stuck_poll_sec = 0.0
+    ex.wall = lambda: WALL
     return e, ex
 
 
@@ -930,7 +981,7 @@ async def test_stuck_order_resolves_itself_once_the_broker_answers_again():
     (정지는 그대로 — 사람이 [재개]를 누른다. 이전: 사람이 누를 때까지 그대로였고, 그 사이의 체결은 장부에 들어오지 않음)"""
     br = _Flaky()
     e, ex = _exec_env(br)
-    saved = _saved(time.time())
+    saved = _saved(WALL - 60)
     saved[0].update(filled=3, avg_price=166.0)              # 이전 실행에서 3주는 이미 장부에 넣었다
     e.on_fill(Fill("NVDA", BUY, 3, 166.0, time.time(), ctx={"stop_dist": 4.0}))
     assert await ex.recover(saved) == 0
@@ -951,7 +1002,7 @@ async def test_stuck_order_resolves_itself_once_the_broker_answers_again():
     # 주문번호조차 모르던 주문(전송 도중 꺼짐): 접수 여부부터 다시 찾는다
     br = _Flaky()
     e, ex = _exec_env(br)
-    assert await ex.recover(_saved(time.time(), broker_id="", status="SENT")) == 0
+    assert await ex.recover(_saved(WALL - 60, broker_id="", status="SENT")) == 0
     o = next(iter(ex.orders.values()))
     assert o.status == "STUCK" and not o.broker_id
     br.up, br.found, br.cum, br.done = True, "77", 10, True
@@ -966,7 +1017,7 @@ async def test_stuck_order_resolves_itself_once_the_broker_answers_again():
     # 증권사에 없다는 답이 두 번 이어지면 접수되지 않은 주문으로 정리한다
     br = _Flaky()
     e, ex = _exec_env(br)
-    await ex.recover(_saved(time.time(), broker_id="", status="SENT"))
+    await ex.recover(_saved(WALL - 60, broker_id="", status="SENT"))
     br.up = True
     for _ in range(2):
         ex.on_timer(ex.clock())
@@ -981,7 +1032,7 @@ async def test_recover_keeps_watching_an_order_it_cancelled_without_confirmation
     br = _Flaky()
     br.up = True                                            # 조회는 되지만 '끝남' 표시는 주지 않는다
     e, ex = _exec_env(br)
-    assert await ex.recover(_saved(time.time())) == 0
+    assert await ex.recover(_saved(WALL - 60)) == 0
     assert br.cancels == 1 and not ex.orders and not e.risk.halted and not e.pending
     assert [d["status"] for d in ex.export()] == ["CANCELED"]            # 이 상태로 또 꺼지면 다음에 한 번 더 본다
     br.cum = 4                                              # 취소가 실제로 처리되기 직전에 4주가 체결됐다

@@ -122,6 +122,7 @@ class Supervisor(Agent):
         self.tps = 0.0
         self._recon_ts = 0.0
         self._recon_prev: dict[str, int] = {}
+        self._acct_extra: dict[str, int] = {}         # 종목 → 계좌에 장부보다 더 있는 수량(이미 알린 값. 달라질 때만 다시 알린다)
         self._save_ts = 0.0
         self._save_failed = False
         self._warmed: set[str] = set()                # 일봉 이력으로 지표를 예열한 종목
@@ -479,6 +480,8 @@ class Supervisor(Agent):
                 new.append(ev)
         for ev in reversed(new[:5]):                    # 한 번에 최근 5건까지(폭주 방지)
             self.notifier.send("⚠ " + (f"[{ev['symbol']}] " if ev["symbol"] else "") + ev["text"])
+        if len(new) > 5:
+            self.notifier.send(f"⚠ 그 밖의 경고 {len(new) - 5}건은 대시보드 로그에서 확인하세요")
 
     def _check_clock(self) -> None:
         """이 컴퓨터의 시계가 서버와 크게 어긋나 있으면 알린다(장 시작·마감 판단, 시세 신선도, 주문 시각 비교가 모두 틀어진다)."""
@@ -539,12 +542,13 @@ class Supervisor(Agent):
             return
         self._save_ts = time.monotonic()
         data = {"engine": self.engine.export_state(), "orders": self.executor.export(), "ts": time.time(),
-                "broker": self.broker.export_state()}
+                "broker": self.broker.export_state(), "acct_extra": self._acct_extra}
         try:
             tmp = self.dir / "state.tmp"
-            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            # default=str: 주문 맥락(ctx)에 JSON 으로 못 쓰는 값이 섞여 있어도 저장은 되게 한다
+            tmp.write_text(json.dumps(data, ensure_ascii=False, default=str), encoding="utf-8")
             tmp.replace(self.dir / "state.json")
-        except OSError as ex:                           # 디스크 문제로 매매 루프가 죽으면 안 된다
+        except (OSError, TypeError, ValueError) as ex:  # 디스크·직렬화 문제로 매매 루프(타이머)가 죽으면 안 된다
             if not self._save_failed:
                 self._save_failed = True
                 self.engine.emit("system", "", f"상태 저장 실패(매매는 계속): {ex!r}")
@@ -564,11 +568,13 @@ class Supervisor(Agent):
         acct = await self.broker.get_account()
         if (e.fill_seq, ex._n) != ver or e.pending or ex.busy():
             return                                      # 조회하는 사이 주문·체결이 있었다 → 낡은 스냅샷은 버린다
+        hold = ex.unsettled()                           # 취소 뒤 지켜보는 중인 주문이 있는 종목 — 그 체결이 확정된 뒤에 맞춘다
         mism = {}
         for sym, pos in e.positions.items():
             bq = int(acct.positions.get(sym, (0, 0.0))[0])
-            if bq < pos.qty:
+            if bq < pos.qty and sym not in hold:
                 mism[sym] = bq
+        self._note_extra(acct, hold)
         confirmed = {s: q for s, q in mism.items() if self._recon_prev.get(s) == q}   # 두 번 연속 같은 불일치만 인정
         self._recon_prev = mism
         for sym, bq in confirmed.items():
@@ -584,6 +590,23 @@ class Supervisor(Agent):
             self._recon_prev.pop(sym, None)
         if confirmed:
             self._save_state()
+
+    def _note_extra(self, acct, hold: set) -> None:
+        """계좌에 장부보다 많은 수량이 있으면 한 번 알린다(수량이 달라지면 다시). 봇은 자기가 산 것만 관리하므로
+        멈추거나 팔지는 않는다 — 하지만 봇이 모르는 체결(잊힌 주문이 체결된 경우)이라면 그 주식에는 손절도 없으므로,
+        조용히 넘어가지 않고 사람이 확인하게 한다. 직접 보유한 주식이면 무시하면 된다."""
+        e = self.engine
+        for sym in dict.fromkeys(list(e.positions) + list(self.symbols)):
+            pos = e.positions.get(sym)
+            extra = int(acct.positions.get(sym, (0, 0.0))[0]) - (pos.qty if pos is not None else 0)
+            if extra <= 0 or sym in hold or sym in e.pending:
+                if extra <= 0:
+                    self._acct_extra.pop(sym, None)
+                continue
+            if self._acct_extra.get(sym) != extra:
+                self._acct_extra[sym] = extra
+                e.emit("risk", sym, f"{sym}: 계좌에 장부보다 {extra}주 더 있습니다 — 봇이 모르는 체결일 수 있습니다. "
+                       "이 수량은 봇이 관리하지 않습니다(손절 없음). 직접 보유한 주식이면 무시하세요")
 
     async def _restore(self, acct) -> None:
         """시작 시: 저장된 장부가 있으면 이어받고, 없으면 계좌 현금(운용 한도 이내)으로 새로 시작한다.
@@ -660,14 +683,23 @@ class Supervisor(Agent):
         if acct is not None:
             if saved_orders:
                 acct = await self.broker.get_account()  # 주문 정리(체결 반영·취소) 뒤의 계좌를 다시 본다
+            # 이전 실행의 주문 가운데 체결 수량을 아직 확정하지 못한 것(확인 불가로 남긴 주문, 취소 뒤 더 지켜보는 주문)이
+            # 걸린 종목은 여기서 맞추지 않는다. 계좌와의 차이가 바로 그 주문의 체결일 수 있어서, 지금 '판 것'으로 정리하면
+            # 나중에 그 체결이 확인될 때 같은 수량을 한 번 더 반영하게 된다. 확정된 뒤 주기적 대사가 맞춘다.
+            hold = self.executor.unsettled()
             for sym, pos in list(e.positions.items()):
                 bq = int(acct.positions.get(sym, (0, 0.0))[0])
-                if bq < pos.qty:
+                if bq < pos.qty and sym in hold:
+                    e.emit("risk", sym, f"{sym} 장부 {pos.qty}주 ≠ 계좌 {bq}주 — 이전 실행의 주문 체결이 확정될 때까지 "
+                           "계좌 대사를 미룹니다")
+                elif bq < pos.qty:
                     missing = pos.qty - bq
                     last = e.sym[sym].last or pos.avg_price
                     mism.append(f"{sym} 장부 {pos.qty}주 ≠ 계좌 {bq}주")
                     # 그냥 지우면 그만큼의 자산이 사라진 것처럼 보여 낙폭 한도가 잘못 발동한다 → 판 것으로 기록
                     e.on_fill(Fill(sym, SELL, missing, last, time.time(), reason="reconcile"))
+            self._acct_extra = {str(k): int(v) for k, v in (st.get("acct_extra") or {}).items()}
+            self._note_extra(acct, hold)
             if acct.cash < e.cash - max(1.0, 0.001 * e.cash):
                 e.emit("risk", "", f"계좌의 주문가능금액({self.m.money(acct.cash, signed=False)})이 장부 현금"
                        f"({self.m.money(e.cash, signed=False)})보다 적습니다 — 매수 주문이 거부될 수 있습니다")

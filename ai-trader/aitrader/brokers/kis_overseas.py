@@ -29,7 +29,7 @@ from ..config import Config
 from ..market import is_trading_day
 from ..models import BUY, AccountSnapshot, Bar, Order, Tick
 from .base import BrokerError, BrokerUnknown
-from .kis import SKEW, KISBroker, aes_cbc_decrypt
+from .kis import SKEW, SKEW_AFTER, KISBroker, aes_cbc_decrypt
 
 log = logging.getLogger("aitrader.kis")
 KST_TZ = timezone(timedelta(hours=9))
@@ -167,7 +167,7 @@ class KISOverseasBroker(KISBroker):
                 "PDNO": order.symbol, "ORGN_ODNO": odno, "RVSE_CNCL_DVSN_CD": "02",
                 "ORD_QTY": str(max(order.qty - order.filled, 0)), "OVRS_ORD_UNPR": "0",
                 "MGCO_APTM_ODNO": "", "ORD_SVR_DVSN_CD": "0"}
-        await self._call("POST", "/uapi/overseas-stock/v1/trading/order-rvsecncl", self.tr["cancel"], body)
+        await self._cancel_call("/uapi/overseas-stock/v1/trading/order-rvsecncl", body)
 
     async def _orders_today(self, symbol: str, want: str = "", since_ts: float = 0.0) -> list[dict]:
         """주문체결내역(현지 날짜 기준 어제~오늘). 주문번호로는 검색할 수 없어 받아서 고른다.
@@ -224,15 +224,11 @@ class KISOverseasBroker(KISBroker):
                     pass
         return (min(out), max(out)) if out else None
 
-    def _maybe_at(self, row: dict, ts: float) -> bool:
-        """이 행이 ts 무렵에 낸 주문의 것일 수 있는가(시각을 알 수 없으면 True)."""
+    def _maybe_at(self, row: dict, ts: float, after: float = SKEW) -> bool:
+        """이 행이 ts 무렵에 낸 주문의 것일 수 있는가(시각을 알 수 없으면 True).
+        after: 주문을 보낸 뒤 접수 시각이 찍히기까지 허용하는 폭."""
         sp = self._row_span(row) if ts > 0 else None
-        return sp is None or sp[0] - SKEW <= ts <= sp[1] + SKEW
-
-    def _not_before(self, row: dict, ts: float) -> bool:
-        """이 행이 ts 이후에 접수된 주문의 것일 수 있는가(시각을 알 수 없으면 True)."""
-        sp = self._row_span(row) if ts > 0 else None
-        return sp is None or sp[1] + SKEW >= ts
+        return sp is None or sp[0] - after <= ts <= sp[1] + SKEW
 
     async def poll_order(self, order: Order) -> tuple[int, float, bool]:
         hit = None
@@ -263,6 +259,8 @@ class KISOverseasBroker(KISBroker):
         """접수 여부를 모르는 주문 찾기: 같은 종목·방향·수량이면서 이 봇이 모르는, 그 주문을 낸 뒤에 접수된 주문.
         후보가 둘 이상이면 고르지 않고 'unknown' 을 돌려준다(잘못 고르면 다른 주문의 체결을 장부에 넣게 된다)."""
         sent = self._order_ts(order)
+        if sent > 0 and self._now() - sent > 6 * 86400.0:
+            return "unknown", ""                          # 조회 범위(최대 7일) 밖의 주문 — '없다'고 단정하지 않는다
         try:
             rows = await self._orders_today(order.symbol, since_ts=sent)
         except Exception:
@@ -277,8 +275,8 @@ class KISOverseasBroker(KISBroker):
             known = self._known.get(key)
             if known is not None and self._maybe_at(row, known):
                 continue                                  # 이 봇이 이미 알고 있는 주문(재시작 전 것 포함)
-            if not self._not_before(row, sent):
-                continue                                  # 이 주문을 내기 전에 접수된 주문(예전 주문, 사람이 직접 낸 주문)
+            if not self._maybe_at(row, sent, SKEW_AFTER):
+                continue                                  # 이 주문을 낸 무렵에 접수된 주문이 아니다(예전 주문, 한참 뒤의 주문)
             cands[key] = row
         if not cands:
             return "absent", ""
