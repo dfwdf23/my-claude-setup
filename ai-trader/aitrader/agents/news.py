@@ -504,7 +504,7 @@ class NewsAgent(Agent):
             if impact <= -2 and self.nc.exit_on_severe and (sym in held or (pend is not None and pend.side == BUY)):
                 # 보유 중이거나 매수 주문이 나가 있는 종목만 청산 지시(체결되면 곧바로 정리). 그 밖의 종목은 매수 보류로 충분하다.
                 self.engine.exit_now.add(sym)
-                self.engine.emit("news", sym, f"심각한 악재 확인(Claude): {it.title[:80]} — 보유분 청산")
+                self.engine.emit("news", sym, f"심각한 악재 확인(Claude): {it.title[:80]} — 보유분 청산", alert=1)
             if self.journal is not None:
                 self.journal.news(it)
         return n

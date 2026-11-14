@@ -44,6 +44,8 @@ TR = {
              "ccld": "VTTC0081R", "notice": "H0STCNI9"},
 }
 MAX_SUBS = 40
+SKEW = 300.0        # 이 컴퓨터의 시계와 증권사 시계가 어긋나도 되는 폭(초). 주문 시각을 비교할 때 이만큼 여유를 둔다
+KNOWN_KEEP = 3 * 86400.0
 
 
 class RateLimiter:
@@ -102,6 +104,9 @@ class KISBroker(Broker):
         self._aes: tuple[str, str] | None = None
         self._aes_by_tr: dict[str, tuple[str, str]] = {}
         self._raw: dict[str, tuple[str, str]] = {}       # 주문번호(정규화) → (주문조직번호, 원주문번호)
+        # 이 봇이 낸 주문번호 → 낸 시각. 접수 여부를 모르는 주문을 찾을 때 '이미 아는 주문'을 빼는 데 쓴다.
+        # 주문번호는 날마다 다시 쓰일 수 있으므로 번호만이 아니라 날짜도 함께 본다. 재시작해도 이어받는다(export_state).
+        self._known: dict[str, float] = {}
         self._day_cache: dict[str, float] = {}
         self._stop = False
         self.ws_connected = False
@@ -168,6 +173,7 @@ class KISBroker(Broker):
             body = await r.read()
             next_cont = r.headers.get("tr_cont", "")
             status = r.status
+            self._note_date(r.headers)
         try:
             d = _loads(body)
         except ValueError:
@@ -210,8 +216,41 @@ class KISBroker(Broker):
             raise BrokerUnknown("주문은 성공 응답인데 주문번호가 없습니다")      # 접수됐을 가능성이 높다 → 조회로 확정
         key = odno.lstrip("0") or "0"
         self._raw[key] = (str(out.get("KRX_FWDG_ORD_ORGNO", "")), odno)
+        self._known[key] = self._order_ts(order) or self._now()
         order.broker_id = key
         order.broker_org = self._raw[key][0]
+
+    def _now(self) -> float:
+        """지금 시각(증권사 서버 시계 기준 — 이 컴퓨터 시계의 오차를 보정)."""
+        return time.time() + self.clock_off
+
+    def _order_ts(self, order: Order) -> float:
+        """주문을 낸 시각(증권사 서버 시계 기준). 주문 내역의 접수 시각과 견줄 때 쓴다. 모르면 0."""
+        t = order.wall_ts or order.created_ts
+        return t + self.clock_off if t > 0 else 0.0
+
+    # ------------------------------------------------------------------ 재시작 대비
+    def export_state(self) -> dict:
+        lo = self._now() - KNOWN_KEEP
+        return {"known": {k: round(t, 1) for k, t in self._known.items() if t >= lo}}
+
+    def import_state(self, d: dict) -> None:
+        lo = self._now() - KNOWN_KEEP
+        for k, t in ((d or {}).get("known") or {}).items():
+            try:
+                t = float(t)
+            except (TypeError, ValueError):
+                continue
+            if t >= lo:
+                self._known.setdefault(str(k), t)
+
+    def _is_known(self, key: str, ord_dt: str) -> bool:
+        """이 봇이 이미 알고 있는 주문인가. ord_dt: 그 주문 행의 주문일자(YYYYMMDD, 한국 날짜). 없으면 오늘로 본다."""
+        t = self._known.get(key)
+        if t is None:
+            return False
+        day = ord_dt if len(ord_dt) == 8 else datetime.fromtimestamp(self._now(), KST_TZ).strftime("%Y%m%d")
+        return datetime.fromtimestamp(t, KST_TZ).strftime("%Y%m%d") == day
 
     async def cancel_order(self, order: Order) -> None:
         # 재시작 후에는 원래 주문번호 표기를 모른다 → 10자리로 0을 채운다
@@ -222,26 +261,43 @@ class KISBroker(Broker):
         await self._call("POST", "/uapi/domestic-stock/v1/trading/order-rvsecncl", self.tr["cancel"], body)
 
     async def poll_order(self, order: Order) -> tuple[int, float, bool]:
-        """체결통보 누락 대비: 주문의 (누적 체결수량, 평균가, 종료 여부)를 조회한다."""
-        today = datetime.now(KST_TZ).strftime("%Y%m%d")
+        """체결통보 누락 대비: 주문의 (누적 체결수량, 평균가, 종료 여부)를 조회한다.
+        주문 내역에 그 주문이 없으면 BrokerUnknown — '0주 체결, 진행 중'이라고 지어내지 않는다."""
+        now = datetime.fromtimestamp(self._now(), KST_TZ)
+        today = now.strftime("%Y%m%d")
+        day = today
+        sent = self._order_ts(order)
+        if sent > 0:                                   # 지난 날에 낸 주문(재시작 정리)은 그날부터 조회한다
+            made = datetime.fromtimestamp(sent, KST_TZ)
+            if now - timedelta(days=30) <= made <= now:
+                day = made.strftime("%Y%m%d")
         _, odno = self._raw.get(order.broker_id, ("", order.broker_id.zfill(10)))
-        q = {**self._acct(), "INQR_STRT_DT": today, "INQR_END_DT": today, "SLL_BUY_DVSN_CD": "00",
+        q = {**self._acct(), "INQR_STRT_DT": day, "INQR_END_DT": today, "SLL_BUY_DVSN_CD": "00",
              "PDNO": order.symbol, "CCLD_DVSN": "00", "INQR_DVSN": "00", "INQR_DVSN_3": "00",
              "ORD_GNO_BRNO": "", "ODNO": odno, "INQR_DVSN_1": "", "CTX_AREA_FK100": "", "CTX_AREA_NK100": ""}
         d, _ = await self._call("GET", "/uapi/domestic-stock/v1/trading/inquire-daily-ccld", self.tr["ccld"], q)
+        hit = None
         for row in d.get("output1") or []:
-            if (str(row.get("odno", "")).lstrip("0") or "0") == order.broker_id:
-                filled = int(float(row.get("tot_ccld_qty") or 0))
-                done = (row.get("cncl_yn") == "Y" or int(float(row.get("rmn_qty") or 0)) == 0
-                        or int(float(row.get("rjct_qty") or 0)) > 0)
-                return filled, float(row.get("avg_prvs") or 0.0), done
-        return 0, 0.0, False
+            if (str(row.get("odno", "")).lstrip("0") or "0") != order.broker_id:
+                continue
+            if row.get("pdno") not in (None, "", order.symbol):
+                continue
+            rd = str(row.get("ord_dt") or "")
+            if hit is None or rd == day:               # 여러 날에 같은 번호가 있으면 주문을 낸 날의 것
+                hit = row
+        if hit is None:
+            raise BrokerUnknown(f"주문 내역에 {order.symbol} 주문 {order.broker_id} 이(가) 보이지 않습니다")
+        filled = int(float(hit.get("tot_ccld_qty") or 0))
+        done = (hit.get("cncl_yn") == "Y" or int(float(hit.get("rmn_qty") or 0)) == 0
+                or int(float(hit.get("rjct_qty") or 0)) > 0)
+        return filled, float(hit.get("avg_prvs") or 0.0), done
 
     async def lookup_order(self, order: Order) -> tuple[str, str]:
-        """주문 응답을 못 받았을 때: 오늘 주문 내역에서 같은 종목·방향·수량의 '모르는' 주문을 찾는다."""
-        now = datetime.now(KST_TZ)
+        """주문 응답을 못 받았을 때: 오늘 주문 내역에서 같은 종목·방향·수량의 '모르는' 주문을 찾는다.
+        후보가 둘 이상이면 고르지 않고 'unknown' 을 돌려준다(잘못 고르면 남의 주문의 체결을 장부에 넣게 된다)."""
+        now = datetime.fromtimestamp(self._now(), KST_TZ)
         today = now.strftime("%Y%m%d")
-        sent = datetime.fromtimestamp(order.created_ts or time.time(), KST_TZ) - timedelta(seconds=10)
+        sent = datetime.fromtimestamp(self._order_ts(order) or self._now(), KST_TZ) - timedelta(seconds=SKEW)
         since = sent.strftime("%H%M%S") if sent.date() == now.date() else "000000"
         q = {**self._acct(), "INQR_STRT_DT": today, "INQR_END_DT": today,
              "SLL_BUY_DVSN_CD": "02" if order.side == BUY else "01", "PDNO": order.symbol, "CCLD_DVSN": "00",
@@ -251,19 +307,21 @@ class KISBroker(Broker):
             d, _ = await self._call("GET", "/uapi/domestic-stock/v1/trading/inquire-daily-ccld", self.tr["ccld"], q)
         except Exception:
             return "unknown", ""
-        best = None
+        cands = {}
         for row in d.get("output1") or []:
             key = str(row.get("odno", "")).lstrip("0") or "0"
-            if key in self._raw or row.get("pdno") != order.symbol:
+            if self._is_known(key, str(row.get("ord_dt") or "")) or row.get("pdno") != order.symbol:
                 continue
             if int(float(row.get("ord_qty") or 0)) != order.qty or str(row.get("ord_tmd", "")) < since:
                 continue
-            if best is None or str(row.get("ord_tmd", "")) > str(best.get("ord_tmd", "")):
-                best = row
-        if best is None:
+            cands[key] = row
+        if not cands:
             return "absent", ""
-        key = str(best["odno"]).lstrip("0") or "0"
+        if len(cands) > 1:
+            return "unknown", ""
+        key, best = next(iter(cands.items()))
         self._raw[key] = (str(best.get("ord_gno_brno", "")), str(best["odno"]))
+        self._known[key] = self._order_ts(order) or self._now()
         order.broker_org = self._raw[key][0]
         return "found", key
 

@@ -23,12 +23,13 @@ import logging
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from ..config import Config
 from ..market import is_trading_day
 from ..models import BUY, AccountSnapshot, Bar, Order, Tick
 from .base import BrokerError, BrokerUnknown
-from .kis import KISBroker, aes_cbc_decrypt
+from .kis import SKEW, KISBroker, aes_cbc_decrypt
 
 log = logging.getLogger("aitrader.kis")
 KST_TZ = timezone(timedelta(hours=9))
@@ -75,7 +76,7 @@ class KISOverseasBroker(KISBroker):
         self.poll_gap = 1.2                       # 모의투자 호출 한도(초당 약 2건) 안에서 주문용 여유를 남긴다
         self.emul_pct = cfg.mkt.emul_pct
         self._cum: dict[str, int] = {}
-        self._known: set[str] = set()             # 이 프로세스가 낸 주문번호
+        self._ltz = ZoneInfo(cfg.mkt.tz)          # 거래소 현지 시간대
         self._sell_tr = ""                        # 모의 매도 TR 중 실제로 통한 것
         self._news_first = True
         self._titles: list[str] = []
@@ -156,7 +157,7 @@ class KISOverseasBroker(KISBroker):
             raise BrokerUnknown("주문은 성공 응답인데 주문번호가 없습니다")      # 접수됐을 가능성이 높다 → 조회로 확정
         key = _norm(odno)
         self._raw[key] = (str(out.get("KRX_FWDG_ORD_ORGNO", "")), odno)
-        self._known.add(key)
+        self._known[key] = self._order_ts(order) or self._now()
         order.broker_id = key
         order.broker_org = self._raw[key][0]
 
@@ -168,14 +169,19 @@ class KISOverseasBroker(KISBroker):
                 "MGCO_APTM_ODNO": "", "ORD_SVR_DVSN_CD": "0"}
         await self._call("POST", "/uapi/overseas-stock/v1/trading/order-rvsecncl", self.tr["cancel"], body)
 
-    async def _orders_today(self, symbol: str, want: str = "") -> list[dict]:
+    async def _orders_today(self, symbol: str, want: str = "", since_ts: float = 0.0) -> list[dict]:
         """주문체결내역(현지 날짜 기준 어제~오늘). 주문번호로는 검색할 수 없어 받아서 고른다.
 
         want: 찾는 주문번호. 실전은 종목별·최신순이라 찾으면 거기서 멈춘다. 모의는 전 종목·오래된 순으로만
-        오므로(정렬 변경 불가) 끝까지 읽어야 최신 주문이 보인다."""
-        today = self.m.now().date()
+        오므로(정렬 변경 불가) 끝까지 읽어야 최신 주문이 보인다.
+        since_ts: 찾는 주문을 낸 시각. 며칠 전에 낸 주문(재시작 정리)이면 조회 시작일을 그만큼 앞당긴다(최대 7일)."""
+        today = self.m.local(self._now()).date()
+        start = today - timedelta(days=1)
+        if since_ts > 0:
+            made = self.m.local(since_ts).date() - timedelta(days=1)
+            start = max(min(start, made), today - timedelta(days=7))
         real = self.env == "real"
-        q = {**self._acct(), "PDNO": symbol if real else "", "ORD_STRT_DT": (today - timedelta(days=1)).strftime("%Y%m%d"),
+        q = {**self._acct(), "PDNO": symbol if real else "", "ORD_STRT_DT": start.strftime("%Y%m%d"),
              "ORD_END_DT": today.strftime("%Y%m%d"), "SLL_BUY_DVSN": "00", "CCLD_NCCS_DVSN": "00",
              "OVRS_EXCG_CD": "NASD" if real else "", "SORT_SQN": "AS" if real else "DS", "ORD_DT": "",
              "ORD_GNO_BRNO": "", "ODNO": "", "CTX_AREA_NK200": "", "CTX_AREA_FK200": ""}
@@ -187,7 +193,7 @@ class KISOverseasBroker(KISBroker):
             rows += got
             if nxt not in ("F", "M"):
                 break
-            if want and real and any(_norm(r.get("odno")) == want for r in got):
+            if want and real and any(_norm(r.get("odno")) == want and self._maybe_at(r, since_ts) for r in got):
                 break
             if page == MAX_PAGES - 1:
                 # 더 있는데 못 읽었다 — '주문 없음'으로 오해하면 접수된 주문을 놓친다. 모르는 것은 모른다고 올린다.
@@ -197,39 +203,91 @@ class KISOverseasBroker(KISBroker):
             q["CTX_AREA_NK200"] = d.get("ctx_area_nk200", "")
         return rows
 
-    async def poll_order(self, order: Order) -> tuple[int, float, bool]:
-        for row in await self._orders_today(order.symbol, order.broker_id):
-            if _norm(row.get("odno")) != order.broker_id:
+    # 주문 행의 접수 시각 비교 ------------------------------------------------------------
+    # 주문번호는 날마다 다시 쓰일 수 있고, 같은 종목·방향·수량의 주문이 며칠 사이에 또 있을 수 있다. 그래서 주문 행이
+    # '언제 접수됐는가'도 본다. 다만 날짜·시각 필드(ord_dt·ord_tmd·dmst_ord_dt·thco_ord_tmd)가 현지 시각인지 한국
+    # 시각인지는 실제 서버로 확인하지 못했다 → 가능한 해석을 모두 계산해 '참값이 있을 수 있는 구간'으로 다루고,
+    # 그 구간 밖이 확실할 때만 다른 주문으로 본다(모르면 같은 주문일 수 있다고 본다).
+    def _row_span(self, row: dict) -> tuple[float, float] | None:
+        out = []
+        pairs = ((row.get("ord_dt"), row.get("ord_tmd"), self._ltz), (row.get("ord_dt"), row.get("ord_tmd"), KST_TZ),
+                 (row.get("dmst_ord_dt"), row.get("thco_ord_tmd") or row.get("ord_tmd"), KST_TZ))
+        for ds, tm, tz in pairs:
+            ds, tm = str(ds or "").strip(), str(tm or "").strip()
+            if len(ds) != 8 or not ds.isdigit():
                 continue
-            filled = _i(row.get("ft_ccld_qty"))
-            price = _f(row.get("ft_ccld_unpr3"))
-            if price <= 0 and filled > 0:
-                price = _f(row.get("ft_ccld_amt3")) / filled
-            status = str(row.get("prcs_stat_name", ""))
-            rejected = bool(str(row.get("rjct_rson", "")).strip()) or "거부" in status
-            done = _i(row.get("nccs_qty")) == 0 or rejected or "취소" in status
-            return filled, price, done
-        return order.filled, 0.0, False
+            times = (tm.zfill(6),) if tm.isdigit() and len(tm) <= 6 else ("000000", "235959")   # 시각이 없으면 그날 전체
+            for t in times:
+                try:
+                    out.append(datetime.strptime(ds + t, "%Y%m%d%H%M%S").replace(tzinfo=tz).timestamp())
+                except ValueError:
+                    pass
+        return (min(out), max(out)) if out else None
+
+    def _maybe_at(self, row: dict, ts: float) -> bool:
+        """이 행이 ts 무렵에 낸 주문의 것일 수 있는가(시각을 알 수 없으면 True)."""
+        sp = self._row_span(row) if ts > 0 else None
+        return sp is None or sp[0] - SKEW <= ts <= sp[1] + SKEW
+
+    def _not_before(self, row: dict, ts: float) -> bool:
+        """이 행이 ts 이후에 접수된 주문의 것일 수 있는가(시각을 알 수 없으면 True)."""
+        sp = self._row_span(row) if ts > 0 else None
+        return sp is None or sp[1] + SKEW >= ts
+
+    async def poll_order(self, order: Order) -> tuple[int, float, bool]:
+        hit = None
+        sent = self._order_ts(order)
+        for row in await self._orders_today(order.symbol, order.broker_id, sent):
+            if _norm(row.get("odno")) != order.broker_id or row.get("pdno") not in (None, "", order.symbol):
+                continue
+            if not self._maybe_at(row, sent):
+                continue                                  # 주문번호만 같은 다른 날의 주문
+            sp = self._row_span(row)
+            if hit is None or (sp is not None and sp[1] >= hit[0]):
+                hit = (sp[1] if sp is not None else 0.0, row)
+        if hit is None:
+            # 주문 내역에 아직(또는 더는) 보이지 않는다. '체결 없음·진행 중'이라고 지어내면 집행기가 그것을 확인된
+            # 사실로 세어 취소를 확정해 버린다 → 모른다고 올린다.
+            raise BrokerUnknown(f"주문체결내역에 {order.symbol} 주문 {order.broker_id} 이(가) 보이지 않습니다")
+        row = hit[1]
+        filled = _i(row.get("ft_ccld_qty"))
+        price = _f(row.get("ft_ccld_unpr3"))
+        if price <= 0 and filled > 0:
+            price = _f(row.get("ft_ccld_amt3")) / filled
+        status = str(row.get("prcs_stat_name", ""))
+        rejected = bool(str(row.get("rjct_rson", "")).strip()) or "거부" in status
+        done = _i(row.get("nccs_qty")) == 0 or rejected or "취소" in status
+        return filled, price, done
 
     async def lookup_order(self, order: Order) -> tuple[str, str]:
+        """접수 여부를 모르는 주문 찾기: 같은 종목·방향·수량이면서 이 봇이 모르는, 그 주문을 낸 뒤에 접수된 주문.
+        후보가 둘 이상이면 고르지 않고 'unknown' 을 돌려준다(잘못 고르면 다른 주문의 체결을 장부에 넣게 된다)."""
+        sent = self._order_ts(order)
         try:
-            rows = await self._orders_today(order.symbol)
+            rows = await self._orders_today(order.symbol, since_ts=sent)
         except Exception:
             return "unknown", ""
         side = "02" if order.side == BUY else "01"
-        best = ""
+        cands: dict[str, dict] = {}
         for row in rows:
             key = _norm(row.get("odno"))
-            if (key in self._known or row.get("pdno") != order.symbol or row.get("sll_buy_dvsn_cd") != side
+            if (row.get("pdno") != order.symbol or row.get("sll_buy_dvsn_cd") != side
                     or _i(row.get("ft_ord_qty")) != order.qty or str(row.get("rvse_cncl_dvsn", "")).strip() not in ("", "00")):
                 continue
-            if not best or int(key) > int(best):
-                best = key
-                self._raw[key] = (str(row.get("ord_gno_brno", "")), str(row.get("odno")))
-        if not best:
+            known = self._known.get(key)
+            if known is not None and self._maybe_at(row, known):
+                continue                                  # 이 봇이 이미 알고 있는 주문(재시작 전 것 포함)
+            if not self._not_before(row, sent):
+                continue                                  # 이 주문을 내기 전에 접수된 주문(예전 주문, 사람이 직접 낸 주문)
+            cands[key] = row
+        if not cands:
             return "absent", ""
-        self._known.add(best)
-        return "found", best
+        if len(cands) > 1:
+            return "unknown", ""
+        key, row = next(iter(cands.items()))
+        self._raw[key] = (str(row.get("ord_gno_brno", "")), str(row.get("odno")))
+        self._known[key] = sent or self._now()
+        return "found", key
 
     # ------------------------------------------------------------------ 계좌
     async def _holdings(self, excg: str) -> dict:

@@ -5,7 +5,9 @@
 """
 from __future__ import annotations
 
+import time
 from datetime import date
+from email.utils import parsedate_to_datetime
 from typing import Awaitable, Callable
 
 from ..models import AccountSnapshot, Bar, Order, Tick
@@ -32,6 +34,8 @@ class Broker:
     has_account = True        # False면 계좌 대사(reconcile) 생략
     supports_poll = False     # True면 poll_order 로 체결 여부를 다시 물어볼 수 있다
     expect_data = False       # 총괄이 설정: 지금은 시세가 계속 들어와야 하는 시간(무응답이면 재연결)
+    clock_off = 0.0           # (서버 시각 − 이 컴퓨터 시각) 초. 서버 응답의 Date 헤더로 잰다. 0 = 일치하거나 아직 모름
+    _date_seen = 0.0
 
     def __init__(self) -> None:
         # 속도를 위해 큐 없이 콜백을 직접 호출한다(수신 루프 → 엔진, 같은 스레드)
@@ -58,13 +62,35 @@ class Broker:
         raise NotImplementedError
 
     async def poll_order(self, order: Order) -> tuple[int, float, bool]:
-        """(누적 체결수량, 평균 체결가, 주문 종료 여부). supports_poll 이 True 인 브로커만 구현."""
+        """(누적 체결수량, 평균 체결가, 주문 종료 여부). supports_poll 이 True 인 브로커만 구현.
+        주문 내역에서 그 주문을 찾지 못했으면 값을 지어내지 말고 예외(BrokerUnknown)를 올린다 —
+        '체결 0주, 진행 중'처럼 보이는 답을 돌려주면 집행기가 그것을 확인된 사실로 센다."""
         raise NotImplementedError
 
     async def lookup_order(self, order: Order) -> tuple[str, str]:
         """주문 전송 중 오류가 나서 접수 여부를 모를 때 호출.
         ("found", 주문번호) | ("absent", "") = 접수되지 않음이 확실 | ("unknown", "") = 알 수 없음."""
         return "unknown", ""
+
+    def _note_date(self, headers) -> None:
+        """서버 응답의 Date 헤더로 이 컴퓨터 시계가 얼마나 어긋났는지 잰다(30초에 한 번이면 충분하다).
+        장 시작·마감 판단, 시세의 신선도, 주문 접수 시각 비교가 모두 이 컴퓨터의 시계에 기대고 있기 때문이다."""
+        mono = time.monotonic()
+        if mono - self._date_seen < 30.0 and self._date_seen:
+            return
+        try:
+            srv = parsedate_to_datetime(headers.get("Date")).timestamp() + float(headers.get("Age") or 0.0)
+        except (TypeError, ValueError, AttributeError):
+            return
+        self._date_seen = mono
+        self.clock_off = srv - time.time()
+
+    def export_state(self) -> dict:
+        """재시작한 뒤 이어받아야 하는 증권사 쪽 상태(예: 이 봇이 낸 주문번호). 총괄이 상태 파일에 함께 저장한다."""
+        return {}
+
+    def import_state(self, d: dict) -> None:
+        """export_state 로 저장해 둔 것을 되살린다(시작 직후, 이전 주문을 정리하기 전에 불린다)."""
 
     async def get_account(self) -> AccountSnapshot:
         raise NotImplementedError

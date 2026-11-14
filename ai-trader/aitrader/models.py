@@ -90,6 +90,8 @@ class Order:
     sent_ns: int = 0
     rtt_ms: float = 0.0
     error: str = ""
+    timer_ts: float = 0.0    # 미체결 시간 초과를 다시 재기 시작한 시각(취소 실패 뒤). created_ts(주문을 낸 시각)는 바꾸지 않는다
+    wall_ts: float = 0.0     # 주문을 낸 실제 시각(이 컴퓨터의 시계). 증권사 주문 내역의 접수 시각과 견줄 때 쓴다(시세 시각과 무관)
 
 
 @dataclass(slots=True)

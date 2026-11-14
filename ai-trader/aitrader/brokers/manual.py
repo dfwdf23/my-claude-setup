@@ -76,6 +76,7 @@ class ManualBroker(Broker):
             if r.status != 200:
                 raise BrokerError(f"시세 조회 실패 HTTP {r.status}")
             d = await r.json(content_type=None)
+            self._note_date(r.headers)
         out = []
         for res in (d.get("spark") or {}).get("result") or []:
             try:

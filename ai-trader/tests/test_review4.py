@@ -355,3 +355,641 @@ def test_journal_adds_the_verdict_column_to_an_older_database(tmp_path):
     j.flush()
     assert j.news_verdicts(0.0) == {it.id: ({"NVDA": -2}, "earnings")}
     j.close()
+
+
+# ====================================================================== 주문 처리(네 번째 검토)
+import json
+import time
+from datetime import datetime
+from email.utils import formatdate
+from zoneinfo import ZoneInfo
+
+import pytest
+from aiohttp import web
+
+from aitrader.brokers.base import BrokerError, BrokerUnknown
+from aitrader.brokers.kis_overseas import KISOverseasBroker
+from aitrader.brokers.manual import ManualBroker
+from aitrader.executor import MAX_CANCEL_FAILS, Executor
+from aitrader.models import BUY, Order, OrderIntent
+
+from test_kis_overseas import os_cfg
+from test_review2 import Acct, FakeOS2
+
+
+async def test_late_confirmed_buy_gets_its_exit_ticket_without_waiting_for_the_snooze(tmp_path):
+    """주문 보조: 만료된 매수 제안을 '사실은 체결됨'으로 늦게 확인한 직후에도 손절 제안은 바로 뜬다.
+    (이전: 제안이 만료될 때 걸린 '다시 제안하지 않는 30분'이 그대로 남아, 방금 산 종목이 손절가 아래로
+           급락해도 30분 동안 매도 제안이 하나도 뜨지 않음 — 전량 청산·악재 청산도 같은 문에 막힘)"""
+    cfg = Config.for_market("US")
+    cfg.mode, cfg.data_dir = "manual", str(tmp_path)
+    cfg.llm.enabled = cfg.news.enabled = cfg.learn.enabled = False
+    cfg.universe = ["SPY"]
+    br = ManualBroker(cfg, base_url="http://127.0.0.1:9")
+    sup = Supervisor(cfg, br)
+    e = sup.engine
+    t0 = US.epoch(date(2026, 1, 5), 10, 0)
+    br.last["SPY"] = 500.0
+    e.on_tick(Tick("SPY", t0, 500.0, 100, 499.9, 500.1))
+    e._send(OrderIntent("SPY", BUY, 10, 500.0, "entry", {"stop_dist": 10.0, "atr": 5.0, "signal_px": 500.0}), e.sym["SPY"])
+    await asyncio.sleep(0.01)
+    t1 = list(br.tickets.values())[-1]
+    sup.executor.on_timer(sup.executor.clock() + cfg.manual.ticket_ttl_min * 60 + 1)    # 5분 안에 답하지 못해 만료
+    await asyncio.sleep(0.01)
+    assert t1["status"] == "EXPIRED" and e.sym["SPY"].retry_after - e.now > 1000
+    ok, _ = br.confirm(t1["id"], 10, 500.0)                 # 사실은 샀다 → 늦은 체결 확인
+    assert ok and e.positions["SPY"].stop == 490.0 and e.sym["SPY"].retry_after == 0.0
+    br.last["SPY"] = 465.0
+    e.on_tick(Tick("SPY", t0 + 60, 465.0, 100, 464.9, 465.1))           # 1분 뒤 손절가 아래로 급락
+    await asyncio.sleep(0.01)
+    assert [(t["status"], t["reason"]) for t in br.tickets.values() if t["side"] == SELL] == [("OPEN", "stop_loss")]
+    sup.journal.close()
+
+
+# ---------------------------------------------------------------------- 재시작 정리(recover)
+async def _crash_with_live_buy(tmp_path):
+    """매수 주문 1건이 증권사에 살아 있는 채로 프로세스가 죽은 상태를 만든다. (설정, 이전 증권사 흉내)"""
+    cfg = live_cfg(tmp_path)
+    sup, br = await fresh(cfg)
+    e = sup.engine
+    e.on_tick(Tick(SYMS[0], US.epoch(US.now().date(), 10, 0), 100.0, 10, 99.9, 100.1))
+    e._send(OrderIntent(SYMS[0], BUY, 10, 100.0, "entry", {"stop_dist": 3.0, "atr": 1.5}), e.sym[SYMS[0]])
+    await asyncio.sleep(0.05)
+    st = json.loads((sup.dir / "state.json").read_text())
+    assert [(d["symbol"], d["status"], d["broker_id"]) for d in st["orders"]] == [(SYMS[0], "ACK", "1")]
+    sup.journal.close()
+    return cfg, br
+
+
+def _reborn(cfg, old, poll=None):
+    br = Acct(old.cash)
+    br.holdings, br.orders, br.n, br.daily = dict(old.holdings), old.orders, old.n, old.daily
+    if poll is not None:
+        br.poll_order = poll(br.poll_order)
+    sup = Supervisor(cfg, br)
+    sup.executor.settle_delays = (0.0, 0.01, 0.01, 0.01, 0.01, 0.01)
+    return sup, br
+
+
+async def test_recover_retries_a_failed_poll_instead_of_forgetting_the_order(tmp_path):
+    """재시작 직후 주문 상태 조회가 한 번 실패해도 그 주문을 잊지 않는다 — 다시 조회해서 취소까지 마친다.
+    (이전: 이벤트 한 줄만 남기고 넘어감 → 살아 있는 주문이 추적도 취소도 안 된 채 남고, 나중에 체결되면
+           계좌에는 있는데 장부에는 없는 주식이 됨)"""
+    cfg, old = await _crash_with_live_buy(tmp_path)
+    calls = [0]
+
+    def flaky(real):
+        async def poll(order):
+            calls[0] += 1
+            if calls[0] == 1:
+                raise asyncio.TimeoutError()
+            return await real(order)
+        return poll
+
+    sup, br = _reborn(cfg, old, flaky)
+    await sup.reconcile(initial=True)
+    assert calls[0] >= 2 and br.orders["1"]["done"]         # 다시 조회했고, 살아 있던 주문은 취소됐다
+    assert not sup.executor.orders and not sup.engine.risk.halted and not sup.engine.pending
+    sup.journal.close()
+
+
+async def test_recover_keeps_an_unverifiable_order_locked_and_halts(tmp_path):
+    """끝내 상태를 확인하지 못한 이전 주문은 '확인 불가' 주문으로 남긴다: 종목 잠금 + 신규 매수 정지 + 상태 저장.
+    뒤늦게 온 체결 통보는 그 주문으로 장부에 반영되고, 사람이 [재개]를 누르면 잠금이 풀린다."""
+    cfg, old = await _crash_with_live_buy(tmp_path)
+
+    def dead(real):
+        async def poll(order):
+            raise asyncio.TimeoutError()
+        return poll
+
+    sup, br = _reborn(cfg, old, dead)
+    await sup.reconcile(initial=True)
+    e, ex = sup.engine, sup.executor
+    o = next(iter(ex.orders.values()))
+    assert o.status == "STUCK" and o.broker_id == "1" and SYMS[0] in e.pending and e.risk.halted
+    assert any("이전 실행의" in ev["text"] and "계좌를 직접 확인" in ev["text"] for ev in e.events if ev["kind"] == "risk")
+    st = json.loads((sup.dir / "state.json").read_text())
+    assert [(d["status"], d["broker_id"]) for d in st["orders"]] == [("STUCK", "1")]      # 다음 시작 때 다시 확인한다
+    br.fill("1")                                            # 그 주문이 나중에 체결된다(통보가 온다)
+    await asyncio.sleep(0.05)
+    assert e.positions[SYMS[0]].qty == 10 and not ex.orders and SYMS[0] not in e.pending
+    sup.journal.close()
+
+    # 같은 상황에서 체결 없이 사람이 계좌를 확인하고 [재개]
+    cfg2, old2 = await _crash_with_live_buy(tmp_path / "b")
+    sup2, br2 = _reborn(cfg2, old2, dead)
+    await sup2.reconcile(initial=True)
+    assert sup2.engine.risk.halted and sup2.executor.orders
+    sup2.notifier.send = lambda text: None
+    sup2.control("resume")
+    assert not sup2.executor.orders and not sup2.engine.pending and not sup2.engine.risk.halted
+    sup2.journal.close()
+
+
+class _Stale(Broker):
+    """조회는 '체결 없음·진행 중'만 돌려주고(끝났다는 표시가 없다), 취소 요청은 실패하는 증권사.
+    cancel_exc=BrokerError: 명시적 거부('취소할 주문이 없습니다' — 장 마감으로 소멸했거나 앞선 취소가 이미 처리됨).
+    cancel_exc=TimeoutError: 취소 요청이 닿았는지조차 알 수 없음."""
+    supports_poll = True
+
+    def __init__(self, lookup="unknown", cancel_exc=BrokerError):
+        super().__init__()
+        self.cancels = self.polls = self.lookups = 0
+        self.lookup, self.cancel_exc = lookup, cancel_exc
+
+    async def place_order(self, order):
+        order.broker_id = "1"
+
+    async def cancel_order(self, order):
+        self.cancels += 1
+        raise self.cancel_exc("취소할 주문이 없습니다")
+
+    async def poll_order(self, order):
+        self.polls += 1
+        return 0, 0.0, False
+
+    async def lookup_order(self, order):
+        self.lookups += 1
+        return self.lookup, ""
+
+
+def _saved(created, broker_id="1", status="ACK"):
+    return [{"id": 1, "symbol": "NVDA", "side": "BUY", "qty": 10, "limit_price": 166.0, "reason": "entry",
+             "ctx": {"stop_dist": 4.0}, "created_ts": created, "wall_ts": created, "status": status,
+             "broker_id": broker_id, "broker_org": "", "filled": 0, "avg_price": 0.0}]
+
+
+async def test_recover_does_not_drop_orders_it_could_not_cancel_or_find():
+    """재시작 정리: 취소 요청이 닿았는지 모르고 끝났다는 확인도 없는 '오늘' 주문, 접수 여부를 알 수 없는 주문은
+    잠가 두고 사람을 부른다. 취소가 명시적으로 거부된 주문(취소할 것이 없다)은 수량이 그대로인지 확인한 뒤 끝내고
+    얼마간 더 지켜본다. 지난 거래일의 주문과 증권사에 닿지 않은 것이 확인된 주문은 조용히 정리한다."""
+    cfg = Config.for_market("US")
+
+    def env(br):
+        e = Engine(cfg, StrategyParams(), 30_000)
+        ex = Executor(br, e, 10.0)
+        ex.settle_delays = (0.0, 0.01, 0.01, 0.01, 0.01, 0.01)
+        ex.follow_delays = (0.01, 0.02)
+        return e, ex
+
+    br = _Stale(cancel_exc=asyncio.TimeoutError)            # 취소가 닿았는지 모른다 + 끝났다는 표시도 없다
+    e, ex = env(br)
+    assert await ex.recover(_saved(time.time())) == 0
+    assert br.cancels == 1 and [o.status for o in ex.orders.values()] == ["STUCK"] and e.risk.halted and "NVDA" in e.pending
+
+    br = _Stale()                                           # 취소할 것이 없다는 명시적 거부 + 수량 변화 없음 → 끝난 주문
+    e, ex = env(br)
+    assert await ex.recover(_saved(time.time())) == 0
+    assert br.cancels == 1 and not ex.orders and not e.risk.halted and not e.pending
+    assert [d["status"] for d in ex.export()] == ["CANCELED"]            # 뒤늦은 체결은 얼마간 더 지켜본다
+    ex.shutdown()
+
+    br = _Stale(cancel_exc=asyncio.TimeoutError)
+    e, ex = env(br)
+    assert await ex.recover(_saved(time.time() - 4 * 86400)) == 0        # 나흘 전에 낸 주문(당일 주문이라 이미 소멸)
+    assert br.cancels == 1 and not ex.orders and not e.risk.halted and not e.pending
+    ex.shutdown()
+
+    br = _Stale(lookup="unknown")                           # 전송 도중 꺼져 주문번호 없이 저장됨 + 조회로도 알 수 없음
+    e, ex = env(br)
+    assert await ex.recover(_saved(time.time(), broker_id="", status="SENT")) == 0
+    assert br.lookups >= 2 and [o.status for o in ex.orders.values()] == ["STUCK"] and e.risk.halted
+
+    br = _Stale(lookup="absent")                            # 두 번 연속 '없음' → 증권사에 닿지 않은 주문
+    e, ex = env(br)
+    assert await ex.recover(_saved(time.time(), broker_id="", status="SENT")) == 0
+    assert br.lookups == 2 and not ex.orders and not e.risk.halted and not e.pending
+
+
+async def test_cancel_that_keeps_failing_does_not_loop_forever():
+    """취소가 실패하는데 조회로도 주문이 끝났다는 표시가 없을 때, 같은 주문을 붙잡고 끝없이 취소를 되풀이하지 않는다.
+    (이전: 10초마다 취소 요청을 무한 반복 — 종목 잠금이 풀리지 않아 그 종목의 손절이 나가지 않고 계좌 대사도 멈추는데
+           정지·알림이 전혀 없음. 한 시간에 취소 요청 360번)
+      · 취소가 닿았는지 모르는 실패(시간 초과)가 이어지면 → 세 번 만에 멈추고 사람을 부른다.
+      · 증권사가 명시적으로 거부하면(취소할 것이 없다) → 수량이 그대로인지 조회로 확인하고 그 주문을 끝낸다."""
+    cfg = Config.for_market("US")
+    t0 = US.epoch(date(2026, 1, 5), 15, 59)
+
+    async def run(br):
+        e = Engine(cfg, StrategyParams(), 30_000)
+        clock = [1000.0]
+        ex = Executor(br, e, cfg.risk.order_timeout_sec, clock=lambda: clock[0])
+        ex.settle_delays = (0.0, 0.002, 0.002, 0.002, 0.002, 0.002)
+        ex.follow_delays = (0.002,)
+        e.on_tick(Tick("NVDA", t0, 166.0, 1, 165.9, 166.1))
+        e.on_fill(Fill("NVDA", BUY, 10, 166.0, t0, ctx={"stop_dist": 4.0}))
+        e._send(OrderIntent("NVDA", SELL, 10, 0.0, "stop_loss"), e.sym["NVDA"])
+        await asyncio.sleep(0.01)
+        o = next(iter(ex.orders.values()))
+        made = o.created_ts
+        for _ in range(40):
+            clock[0] += cfg.risk.order_timeout_sec + 0.5
+            ex.on_timer(clock[0])
+            await asyncio.sleep(0.003)
+        assert o.created_ts == made                         # 주문을 낸 시각은 건드리지 않는다(주문 내역과 견주는 기준)
+        return e, ex, o
+
+    br = _Stale(cancel_exc=asyncio.TimeoutError)
+    e, ex, o = await run(br)
+    assert o.status == "STUCK" and br.cancels == MAX_CANCEL_FAILS and e.risk.halted and "NVDA" in e.pending
+    assert sum(1 for ev in e.events if ev["kind"] == "risk") == 1
+    assert ex.drop_stuck() == ["NVDA"] and "NVDA" not in e.pending       # 사람이 확인하고 [재개]
+    ex.shutdown()
+
+    br = _Stale()
+    e, ex, o = await run(br)
+    assert o.status == "CANCELED" and br.cancels == 1 and not ex.orders and not e.risk.halted
+    assert "NVDA" not in e.pending and e.positions["NVDA"].qty == 10     # 잠금이 풀려 다음 시세에 손절을 다시 낼 수 있다
+    ex.shutdown()
+
+
+class _Slow(Broker):
+    """취소가 '접수'만 되고 주문은 잠깐 더 살아 있는 증권사(그 사이 체결될 수 있다)."""
+    supports_poll = True
+
+    def __init__(self):
+        super().__init__()
+        self.cum, self.done = 0, False
+
+    async def place_order(self, order):
+        order.broker_id = "1"
+
+    async def cancel_order(self, order):
+        return None
+
+    async def poll_order(self, order):
+        return self.cum, 10_000.0 if self.cum else 0.0, self.done
+
+
+async def test_cancelled_order_still_being_watched_is_saved_and_rechecked_after_restart():
+    """취소로 끝낸 뒤 뒤늦은 체결을 지켜보던 주문은, 그 상태로 꺼지면 저장해 두었다가 다음 시작 때 한 번 더 조회한다.
+    (이전: 종료 절차가 '수량이 두 번 같다'로 주문을 끝내고 저장 대상에서 빼 버려, 취소 직전에 체결된 4주가
+           영영 장부에 들어오지 않음)"""
+    def env(br):
+        e = Engine(Config(), StrategyParams(), 10_000_000)
+        ex = Executor(br, e, 10.0)
+        ex.settle_delays = (0.0, 0.01, 0.01, 0.01, 0.01, 0.01)
+        ex.follow_delays = (0.05, 0.1, 0.2)
+        e.on_tick(Tick("A", US.epoch(date(2026, 1, 5), 10, 0), 10_000.0, 1))
+        return e, ex
+
+    br = _Slow()
+    e, ex = env(br)
+    it = OrderIntent("A", BUY, 10, 10_000.0, "entry", {"stop_dist": 300.0})
+    e.pending["A"] = it
+    ex.submit(it)
+    await asyncio.sleep(0.01)
+    await ex.cancel_all()                                   # 종료 절차(Supervisor.run 의 마무리와 같은 순서)
+    assert not ex.orders and [d["status"] for d in ex.export()] == ["CANCELED"]
+    br.cum, br.done = 4, True                               # 취소가 처리되기 직전에 4주가 체결됐다
+    ex.shutdown()
+    saved = ex.export()
+    assert [(d["status"], d["broker_id"], d["filled"]) for d in saved] == [("CANCELED", "1", 0)]
+
+    e2, ex2 = env(br)
+    assert await ex2.recover(saved) == 1
+    assert e2.positions["A"].qty == 4 and not ex2.orders and not e2.risk.halted
+
+    # 꺼지지 않고 계속 돌았다면: 추적 조회가 끝난 주문은 더 이상 저장하지 않는다
+    br3 = _Slow()
+    e3, ex3 = env(br3)
+    e3.pending["A"] = it
+    ex3.submit(it)
+    await asyncio.sleep(0.01)
+    await ex3.cancel_all()
+    await asyncio.sleep(0.5)
+    assert ex3.export() == []
+    ex3.shutdown()
+
+
+async def test_settle_does_not_count_answers_that_are_behind_the_ledger():
+    """취소 확정 조회에서 '이미 장부에 넣은 수량보다 적은' 답은 확인으로 세지 않는다(그 주문의 최신 상태가 아니다).
+    (이전: 주문 행을 못 찾아 돌려준 '0주·진행 중' 두 번을 '수량이 더 변하지 않는다'로 보고 취소를 확정)"""
+    br = _Slow()
+    e = Engine(Config(), StrategyParams(), 10_000_000)
+    ex = Executor(br, e, 10.0)
+    ex.settle_delays = (0.0, 0.01, 0.01, 0.01)
+    e.on_tick(Tick("A", US.epoch(date(2026, 1, 5), 10, 0), 10_000.0, 1))
+    it = OrderIntent("A", BUY, 10, 10_000.0, "entry", {"stop_dist": 300.0})
+    e.pending["A"] = it
+    ex.submit(it)
+    await asyncio.sleep(0.01)
+    ex.on_fill("1", 4, 10_000.0, time.time())               # 통보로 4주 체결을 이미 반영했다
+    assert e.positions["A"].qty == 4
+    br.cum = 0                                              # 그런데 조회는 계속 '0주'라고 한다(행을 못 찾는 상황)
+    await ex.cancel_all()
+    o = next(iter(ex.orders.values()))
+    assert o.status == "STUCK" and e.risk.halted and "A" in e.pending
+    ex.shutdown()
+
+
+# ---------------------------------------------------------------------- 해외 어댑터: 주문 찾기
+@pytest.fixture
+async def osx(tmp_path, unused_tcp_port):
+    fake = FakeOS2()
+    runner = web.AppRunner(fake.app, access_log=None)
+    await runner.setup()
+    await web.TCPSite(runner, "127.0.0.1", unused_tcp_port).start()
+    cfg = os_cfg(tmp_path)
+    made = []
+
+    async def broker():
+        br = KISOverseasBroker(cfg, f"http://127.0.0.1:{unused_tcp_port}", f"ws://127.0.0.1:{unused_tcp_port}")
+        br.rl.interval = 0.0
+        await br.start()
+        br.last["NVDA"] = Tick("NVDA", 0.0, 166.19, 1, 166.18, 166.20)
+        made.append(br)
+        return br
+
+    yield fake, broker
+    for br in made:
+        await br.stop()
+    await runner.cleanup()
+
+
+def _order(n, qty=7, at=None):
+    t = time.time() if at is None else at
+    return Order(n, "NVDA", BUY, qty, 166.25, "entry", {}, t, wall_ts=t)
+
+
+async def test_overseas_poll_says_unknown_when_the_order_row_is_missing(osx):
+    """주문체결내역에 그 주문이 (아직) 없으면 '0주 체결·진행 중'을 지어내지 않고 '모름'으로 올린다.
+    (이전: 지어낸 답 두 번이 '수량이 더 변하지 않는다'로 세어져 취소가 확정되고 잠금이 풀림 — 남은 수량이 그 뒤에
+           체결되면 장부에 들어오지 않음)"""
+    fake, broker = osx
+    br = await broker()
+    o = _order(1)
+    await br.place_order(o)
+    fake.hidden = {1}
+    with pytest.raises(BrokerUnknown):
+        await br.poll_order(o)
+    fake.hidden = set()
+    assert await br.poll_order(o) == (7, 166.25, True)
+
+
+async def test_overseas_lookup_is_not_fooled_by_an_older_identical_order(osx):
+    """접수 여부를 모르는 주문을 찾을 때, 같은 종목·방향·수량의 '예전 주문'을 그 주문으로 착각하지 않는다.
+    (이전: '아는 주문' 목록이 프로세스마다 비어 있고 시간 조건도 없어, 재시작 뒤에는 어제 체결된 같은 주문에
+           붙어 그 체결을 한 번 더 장부에 넣음 — 계좌에 없는 주식이 장부에 생김)"""
+    fake, broker = osx
+    br1 = await broker()
+    await br1.place_order(_order(1))                        # 이전 실행: NVDA 7주 매수(접수·체결, 장부에 반영 끝)
+    state = br1.export_state()
+    assert list(state["known"]) == ["30100001"]
+
+    # 1) 재시작: 이 봇이 냈던 주문번호를 이어받는다 → 그 주문은 후보가 아니다
+    br2 = await broker()
+    br2.import_state(state)
+    assert await br2.lookup_order(_order(2)) == ("absent", "")
+    # 같은 프로세스에서도 마찬가지
+    assert await br1.lookup_order(_order(2)) == ("absent", "")
+
+    # 2) 주문번호를 이어받지 못했더라도(상태 파일 유실), 이틀 전에 접수된 주문은 시각으로 걸러진다 — 시각 필드가
+    #    현지 시각이든 한국 시각이든 마찬가지
+    for kst in (False, True):
+        fake.tmd_kst = kst
+        fake.times[0] = time.time() - 2 * 86400
+        br3 = await broker()
+        assert await br3.lookup_order(_order(3)) == ("absent", "")
+    fake.tmd_kst = False
+
+    # 3) 방금 접수된 모르는 주문이 하나면 그것이 이 주문이다
+    fake.times[0] = time.time() - 2 * 86400
+    probe = _order(4)
+    fake.gateway_error = True                               # 접수는 됐지만 응답이 게이트웨이 오류 화면
+    br4 = await broker()
+    with pytest.raises(BrokerUnknown):
+        await br4.place_order(probe)
+    fake.gateway_error = False
+    assert await br4.lookup_order(probe) == ("found", "30100002")
+
+    # 4) 후보가 둘이면(사람이 같은 주문을 직접 또 냈다) 고르지 않는다 → 'unknown'(집행기가 잠그고 사람을 부른다)
+    br5 = await broker()
+    await br5.place_order(_order(5))                        # 다른 누군가의 같은 주문(이 프로세스는 모른다고 치자)
+    br6 = await broker()
+    assert (await br6.lookup_order(_order(6, at=time.time() - 30)))[0] == "unknown"
+
+
+async def test_overseas_poll_ignores_another_days_order_with_the_same_number(osx):
+    """주문번호가 날마다 다시 쓰여도, 다른 날의 같은 번호 주문을 이 주문으로 착각하지 않는다."""
+    fake, broker = osx
+    br = await broker()
+    o = _order(1)
+    await br.place_order(o)                                 # 오늘 주문 30100001
+    old = datetime.fromtimestamp(time.time() - 2 * 86400, ZoneInfo("America/New_York"))
+    fake.extra = [{"odno": "0030100001", "pdno": "NVDA", "sll_buy_dvsn_cd": "02", "ft_ord_qty": "7", "ft_ccld_qty": "3",
+                   "ft_ccld_unpr3": "150.00", "nccs_qty": "0", "prcs_stat_name": "완료", "rjct_rson": "",
+                   "rvse_cncl_dvsn": "00", "ord_gno_brno": "01790", "ord_dt": old.strftime("%Y%m%d"),
+                   "ord_tmd": old.strftime("%H%M%S")}]      # 이틀 전의 같은 번호(3주만 체결되고 끝난 주문)
+    assert await br.poll_order(o) == (7, 166.25, True)      # 오늘 것만 본다
+    fake.hidden = {1}
+    with pytest.raises(BrokerUnknown):
+        await br.poll_order(o)                              # 오늘 것이 안 보이면 이틀 전 것으로 대신하지 않는다
+
+
+def test_overseas_order_row_time_is_treated_as_a_range():
+    """주문 행의 접수 시각은 '현지 시각 해석'과 '한국 시각 해석' 사이의 구간으로 다룬다(어느 쪽인지 확인하지 못했다)."""
+    cfg = Config.for_market("US")
+    cfg.kis.app_key = cfg.kis.app_secret = "x"
+    cfg.kis.account = "12345678"
+    br = KISOverseasBroker(cfg, "http://127.0.0.1:9", "ws://127.0.0.1:9")
+    row = {"ord_dt": "20260105", "ord_tmd": "093500"}
+    lo, hi = br._row_span(row)
+    assert hi == US.epoch(date(2026, 1, 5), 9, 35) and hi - lo == 14 * 3600        # 겨울: 뉴욕과 서울은 14시간 차이
+    assert br._maybe_at(row, hi) and br._maybe_at(row, lo) and not br._maybe_at(row, hi + 3600)
+    assert br._not_before(row, hi + 200) and not br._not_before(row, hi + 400)
+    assert br._row_span({"ord_tmd": "093500"}) is None and br._maybe_at({}, 123.0)   # 날짜가 없으면 판단하지 않는다
+    lo2, hi2 = br._row_span({"ord_dt": "20260105"})                                  # 시각이 없으면 그날 전체
+    assert hi2 - lo2 > 86000
+
+
+# ---------------------------------------------------------------------- 알림·시계
+async def test_engine_and_executor_risk_events_reach_the_notifier(tmp_path):
+    """엔진·집행기가 낸 위험 이벤트(손실 한도, 확인 불가 주문 등)와 심각한 악재 청산은 텔레그램으로도 나간다.
+    (이전: 화면에만 표시 — 사람이 보고 있지 않으면 봇이 멈춘 것을 알 길이 없음)"""
+    cfg = live_cfg(tmp_path)
+    sup, br = await fresh(cfg)
+    sent = []
+    sup.notifier.send = sent.append
+    e = sup.engine
+    sup._forward_alerts()
+    sent.clear()
+    e.emit("risk", "", "일일 손실 한도 2.0% 도달 — 오늘 매매 중단")
+    e.emit("news", "NVDA", "심각한 악재 확인(Claude): 회계부정 — 보유분 청산", alert=1)
+    e.emit("news", "NVDA", "악재 감지: 평범한 소식")                          # 알림 대상 아님
+    e.emit("risk", "", "시세 수신 지연 — 신규 매수 보류", sent=1)              # 보낸 곳에서 직접 알린 것
+    sup._forward_alerts()
+    assert sent == ["⚠ 일일 손실 한도 2.0% 도달 — 오늘 매매 중단", "⚠ [NVDA] 심각한 악재 확인(Claude): 회계부정 — 보유분 청산"]
+    sup._forward_alerts()
+    assert len(sent) == 2                                   # 같은 이벤트를 두 번 보내지 않는다
+    sup.journal.close()
+
+
+async def test_clock_offset_is_measured_from_server_date_and_reported(tmp_path, unused_tcp_port):
+    """서버 응답의 Date 헤더로 이 컴퓨터 시계의 오차를 재고, 크게 어긋나면 경고한다. 주문 접수 시각을 견줄 때도 보정한다."""
+    fake = FakeOS2()
+    skew = [600.0]                                           # 서버 시계가 10분 빠르다(= 이 컴퓨터가 10분 느리다)
+    fake.clock = lambda: time.time() + skew[0]
+
+    @web.middleware
+    async def dated(request, handler):
+        resp = await handler(request)
+        resp.headers["Date"] = formatdate(time.time() + skew[0], usegmt=True)
+        return resp
+
+    fake.app.middlewares.append(dated)
+    runner = web.AppRunner(fake.app, access_log=None)
+    await runner.setup()
+    await web.TCPSite(runner, "127.0.0.1", unused_tcp_port).start()
+    cfg = os_cfg(tmp_path)
+    br = KISOverseasBroker(cfg, f"http://127.0.0.1:{unused_tcp_port}", f"ws://127.0.0.1:{unused_tcp_port}")
+    br.rl.interval = 0.0
+    try:
+        await br.start()
+        br.last["NVDA"] = Tick("NVDA", 0.0, 166.19, 1, 166.18, 166.20)
+        o = _order(1)
+        await br.place_order(o)
+        assert abs(br.clock_off - 600.0) < 5.0
+        assert await br.poll_order(o) == (7, 166.25, True)   # 10분 어긋나 있어도 제 주문을 찾는다(보정하지 않으면 5분 허용폭 밖)
+        sup = Supervisor(cfg, br)
+        sup._check_clock()
+        sup._check_clock()
+        warn = [ev["text"] for ev in sup.engine.events if ev["kind"] == "risk"]
+        assert len(warn) == 1 and "느립니다" in warn[0] and "시간 동기화" in warn[0]
+        sup.journal.close()
+    finally:
+        await br.stop()
+        await runner.cleanup()
+
+
+async def test_broker_state_is_saved_and_handed_back_on_restart(tmp_path):
+    """증권사 연동이 내보낸 상태(이 봇이 낸 주문번호 등)는 상태 파일에 저장되고, 재시작 때 이전 주문을 정리하기 전에 되돌려진다."""
+    class Acct2(Acct):
+        got = None
+
+        def export_state(self):
+            return {"known": {"30100001": 1.5}}
+
+        def import_state(self, d):
+            self.got = d
+
+    cfg = live_cfg(tmp_path)
+    br = Acct2(30_000.0)
+    sup = Supervisor(cfg, br)
+    await sup.reconcile(initial=True)
+    sup._save_state()
+    sup.journal.close()
+    assert json.loads((sup.dir / "state.json").read_text())["broker"] == {"known": {"30100001": 1.5}}
+    br2 = Acct2(30_000.0)
+    sup2 = Supervisor(cfg, br2)
+    await sup2.reconcile(initial=True)
+    assert br2.got == {"known": {"30100001": 1.5}}
+    sup2.journal.close()
+
+
+# ---------------------------------------------------------------------- 확인 불가 주문의 자동 재확인·재시작 뒤 추적
+class _Flaky(Broker):
+    """한동안 조회가 안 되다가(장애) 다시 되는 증권사."""
+    supports_poll = True
+
+    def __init__(self):
+        super().__init__()
+        self.up = False
+        self.cum, self.done, self.found = 0, False, ""
+        self.cancels = 0
+
+    async def place_order(self, order):
+        raise asyncio.TimeoutError()
+
+    async def cancel_order(self, order):
+        self.cancels += 1
+
+    async def poll_order(self, order):
+        if not self.up:
+            raise asyncio.TimeoutError()
+        return self.cum, 166.0 if self.cum else 0.0, self.done
+
+    async def lookup_order(self, order):
+        if not self.up:
+            return "unknown", ""
+        return ("found", self.found) if self.found else ("absent", "")
+
+
+def _exec_env(br):
+    e = Engine(Config.for_market("US"), StrategyParams(), 30_000)
+    ex = Executor(br, e, 10.0)
+    ex.settle_delays = (0.0, 0.01, 0.01, 0.01, 0.01, 0.01)
+    ex.follow_delays = (0.02, 0.05, 0.1)
+    ex.stuck_poll_sec = 0.0
+    return e, ex
+
+
+async def test_stuck_order_resolves_itself_once_the_broker_answers_again():
+    """확인 불가 주문은 가끔 다시 조회한다. 장애가 끝나 조회가 되면 그 사이의 체결을 장부에 넣고, 끝난 주문이면 종목 잠금을 푼다.
+    (정지는 그대로 — 사람이 [재개]를 누른다. 이전: 사람이 누를 때까지 그대로였고, 그 사이의 체결은 장부에 들어오지 않음)"""
+    br = _Flaky()
+    e, ex = _exec_env(br)
+    saved = _saved(time.time())
+    saved[0].update(filled=3, avg_price=166.0)              # 이전 실행에서 3주는 이미 장부에 넣었다
+    e.on_fill(Fill("NVDA", BUY, 3, 166.0, time.time(), ctx={"stop_dist": 4.0}))
+    assert await ex.recover(saved) == 0
+    o = next(iter(ex.orders.values()))
+    assert o.status == "STUCK" and e.risk.halted and "NVDA" in e.pending
+    ex.on_timer(ex.clock())                                 # 아직 장애 중 — 변화 없음
+    await asyncio.sleep(0.02)
+    assert o.status == "STUCK" and e.positions["NVDA"].qty == 3
+    ex.on_fill("1", 2, 166.0, time.time())                  # 그 사이 통보로 2주(누적 5주) — 이전 실행분 다음부터 더한다
+    assert e.positions["NVDA"].qty == 5
+    br.up, br.cum, br.done = True, 10, True                 # 장애가 끝났다: 전량 체결돼 있었다
+    ex.on_timer(ex.clock())
+    await asyncio.sleep(0.02)
+    assert e.positions["NVDA"].qty == 10 and not ex.orders and "NVDA" not in e.pending
+    assert e.risk.halted                                    # 정지는 사람이 푼다
+    ex.shutdown()
+
+    # 주문번호조차 모르던 주문(전송 도중 꺼짐): 접수 여부부터 다시 찾는다
+    br = _Flaky()
+    e, ex = _exec_env(br)
+    assert await ex.recover(_saved(time.time(), broker_id="", status="SENT")) == 0
+    o = next(iter(ex.orders.values()))
+    assert o.status == "STUCK" and not o.broker_id
+    br.up, br.found, br.cum, br.done = True, "77", 10, True
+    ex.on_timer(ex.clock())
+    await asyncio.sleep(0.02)
+    assert o.broker_id == "77" and o.status == "STUCK"
+    ex.on_timer(ex.clock())
+    await asyncio.sleep(0.02)
+    assert e.positions["NVDA"].qty == 10 and not ex.orders and not e.pending
+    ex.shutdown()
+
+    # 증권사에 없다는 답이 두 번 이어지면 접수되지 않은 주문으로 정리한다
+    br = _Flaky()
+    e, ex = _exec_env(br)
+    await ex.recover(_saved(time.time(), broker_id="", status="SENT"))
+    br.up = True
+    for _ in range(2):
+        ex.on_timer(ex.clock())
+        await asyncio.sleep(0.02)
+    assert not ex.orders and not e.pending and "NVDA" not in e.positions
+    ex.shutdown()
+
+
+async def test_recover_keeps_watching_an_order_it_cancelled_without_confirmation():
+    """재시작 정리에서 취소한 주문도, 증권사의 '끝남' 표시를 받지 못했으면 얼마간 더 지켜본다.
+    (취소 '접수'와 실제 취소 사이에 체결된 수량이 그 뒤에 나타날 수 있다 — 운영 중의 취소와 같은 기준)"""
+    br = _Flaky()
+    br.up = True                                            # 조회는 되지만 '끝남' 표시는 주지 않는다
+    e, ex = _exec_env(br)
+    assert await ex.recover(_saved(time.time())) == 0
+    assert br.cancels == 1 and not ex.orders and not e.risk.halted and not e.pending
+    assert [d["status"] for d in ex.export()] == ["CANCELED"]            # 이 상태로 또 꺼지면 다음에 한 번 더 본다
+    br.cum = 4                                              # 취소가 실제로 처리되기 직전에 4주가 체결됐다
+    await asyncio.sleep(0.3)
+    assert e.positions["NVDA"].qty == 4
+    assert ex.export() == []                                # 추적이 끝났다
+    ex.on_fill("1", 4, 166.0, time.time())                  # 조회로 이미 넣은 4주의 통보가 뒤늦게 왔다 → 두 번 넣지 않는다
+    assert e.positions["NVDA"].qty == 4
+    ex.on_fill("1", 1, 166.0, time.time())                  # 그다음 통보(누적 5주)는 새 체결이다
+    assert e.positions["NVDA"].qty == 5
+    ex.shutdown()

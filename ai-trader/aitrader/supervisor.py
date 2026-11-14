@@ -125,6 +125,9 @@ class Supervisor(Agent):
         self._save_ts = 0.0
         self._save_failed = False
         self._warmed: set[str] = set()                # 일봉 이력으로 지표를 예열한 종목
+        self._alert_seq = 0                           # 텔레그램으로 넘긴 마지막 이벤트 번호
+        self._clock_ts = 0.0
+        self._clock_bad = False
         self._day_started: date | None = None
         self._day_ended: date | None = None
 
@@ -247,7 +250,7 @@ class Supervisor(Agent):
             msg = (f"일봉을 받지 못한 종목: {', '.join(lost)} — 일봉 맥락(추세·평균 거래량)은 지난번 값 그대로 씁니다"
                    + (f". {', '.join(cold)} 는 지표가 준비되지 않아 오늘 새 매수 판단을 하지 않습니다" if cold else "")
                    + (f". 보유 중인 {', '.join(held)} 는 전일 종가 기준 평가를 건너뛰고 손절·익절만 감시합니다" if held else ""))
-            e.emit("risk" if held else "system", "", msg)
+            e.emit("risk" if held else "system", "", msg, sent=1)
             if held:
                 self.notifier.send("⚠ " + msg)
         if e.view_on:
@@ -433,6 +436,10 @@ class Supervisor(Agent):
                 self._tick_mark = (e.ticks, mono)
             realtime = self.live or self.manual
             self.executor.on_timer(self.executor.clock())
+            if realtime and mono - self._clock_ts >= 60.0:
+                self._clock_ts = mono
+                self._check_clock()
+            self._forward_alerts()
             if self.phase != "OPEN":
                 self.broker.expect_data = False
                 continue
@@ -455,6 +462,33 @@ class Supervisor(Agent):
             if self.keep_state and mono - self._save_ts >= 60.0:
                 self._save_state()                      # 고점·추적 손절가·마지막 가격을 주기적으로 남긴다(체결이 없어도)
 
+    def _forward_alerts(self) -> None:
+        """엔진·집행기가 낸 위험 이벤트(손실 한도 발동, 확인 불가 주문, 거부 반복 정지, 심각한 악재 청산 등)를
+        텔레그램으로도 알린다. 사람이 화면을 보고 있지 않아도 '멈췄다·팔았다'는 사실은 알아야 한다.
+        알림을 직접 보내는 곳의 이벤트는 sent 표시가 있어 건너뛴다(같은 내용을 두 번 보내지 않는다)."""
+        e = self.engine
+        last = self._alert_seq
+        if e._seq == last:
+            return
+        self._alert_seq = e._seq
+        new = []
+        for ev in reversed(e.events):
+            if ev["seq"] <= last:
+                break
+            if (ev["kind"] == "risk" or ev.get("alert")) and not ev.get("sent"):
+                new.append(ev)
+        for ev in reversed(new[:5]):                    # 한 번에 최근 5건까지(폭주 방지)
+            self.notifier.send("⚠ " + (f"[{ev['symbol']}] " if ev["symbol"] else "") + ev["text"])
+
+    def _check_clock(self) -> None:
+        """이 컴퓨터의 시계가 서버와 크게 어긋나 있으면 알린다(장 시작·마감 판단, 시세 신선도, 주문 시각 비교가 모두 틀어진다)."""
+        off = float(getattr(self.broker, "clock_off", 0.0) or 0.0)
+        bad = abs(off) > 120.0
+        if bad and not self._clock_bad:
+            self.engine.emit("risk", "", f"이 컴퓨터의 시계가 서버보다 {abs(off):.0f}초 {'느립니다' if off > 0 else '빠릅니다'} — "
+                             "장 시작·마감 판단과 시세·주문 시각 비교가 그만큼 어긋납니다. 운영체제의 시간 동기화를 켜세요")
+        self._clock_bad = bad
+
     def _watch_feed(self, mono: float, in_session: bool) -> None:
         """시세가 들어와야 할 시간인데 끊겼는지 본다. 끊기면 신규 매수를 보류하고 알린다."""
         e = self.engine
@@ -464,9 +498,8 @@ class Supervisor(Agent):
         stale = in_session and mono - self._last_tick_wall > self.stale_sec
         if stale != e.risk.feed_stale:
             e.risk.feed_stale = stale
-            e.emit("risk", "", "시세 수신 지연 — 신규 매수 보류" if stale else "시세 수신 정상화")
-            if stale:
-                self.notifier.send("⚠ 시세 수신이 끊겼습니다 — 신규 매수를 보류합니다")
+            e.emit("risk", "", "시세 수신 지연 — 신규 매수 보류" if stale else "시세 수신 정상화", sent=1)
+            self.notifier.send("⚠ 시세 수신이 끊겼습니다 — 신규 매수를 보류합니다" if stale else "시세 수신이 다시 정상입니다")
 
     async def _market_update(self) -> None:
         try:
@@ -505,7 +538,8 @@ class Supervisor(Agent):
         if not (self.keep_state and self.dir):
             return
         self._save_ts = time.monotonic()
-        data = {"engine": self.engine.export_state(), "orders": self.executor.export(), "ts": time.time()}
+        data = {"engine": self.engine.export_state(), "orders": self.executor.export(), "ts": time.time(),
+                "broker": self.broker.export_state()}
         try:
             tmp = self.dir / "state.tmp"
             tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
@@ -542,7 +576,7 @@ class Supervisor(Agent):
             missing = pos.qty - bq
             last = e.sym[sym].last or pos.avg_price
             msg = f"{sym} 장부 {pos.qty}주 ≠ 계좌 {bq}주 — {missing}주를 현재가에 판 것으로 장부를 정리하고 신규 매수를 멈춥니다"
-            e.emit("risk", sym, "계좌 대사: " + msg)
+            e.emit("risk", sym, "계좌 대사: " + msg, sent=1)
             # 그냥 지우면 자산이 그만큼 사라진 것처럼 보여 손실 한도가 잘못 발동한다 → 매도로 기록해 현금을 맞춘다
             e.on_fill(Fill(sym, SELL, missing, last, e.now or time.time(), reason="reconcile"))
             e.risk.halt(f"{sym} 장부·계좌 불일치 — 계좌 확인 후 [재개]", flatten=False)
@@ -612,6 +646,10 @@ class Supervisor(Agent):
         e.risk.restore(es.get("risk", {}), same_day)
         e.risk.peak_equity = max(e.risk.peak_equity, eq)
         # 2) 꺼져 있는 동안의 체결
+        try:
+            self.broker.import_state(st.get("broker") or {})      # 이 봇이 냈던 주문번호 등(예전 주문과 혼동하지 않게)
+        except Exception as ex:
+            e.emit("system", "", f"증권사 연동 상태를 이어받지 못했습니다: {ex!r}")
         saved_orders = st.get("orders", [])
         n = await self.executor.recover(saved_orders) if self.live else 0
         # 3) 계좌와 비교
@@ -633,7 +671,7 @@ class Supervisor(Agent):
         e.mark()
         if mism:
             msg = "계좌 대사(재시작): " + ", ".join(mism) + " — 모자란 수량은 마지막 가격에 판 것으로 정리했습니다"
-            e.emit("risk", "", msg)
+            e.emit("risk", "", msg, sent=1)
             e.risk.halt("장부·계좌 불일치 — 계좌 확인 후 [재개]", flatten=False)
             self.notifier.send("⛔ " + msg + ". 신규 매수를 멈췄습니다. 계좌를 확인한 뒤 [재개]를 눌러 주세요.")
         e.emit("system", "", f"계좌 연결 — 장부 복원: 현금 {self.m.money(e.cash, signed=False)}, 포지션 "
@@ -659,7 +697,7 @@ class Supervisor(Agent):
                 f" · 확인 불가 주문 해제: {', '.join(freed)}" if freed else "")
         else:
             return "알 수 없는 명령"
-        e.emit("risk", "", msg)
+        e.emit("risk", "", msg, sent=1)
         self.notifier.send(msg)
         self._save_state()
         return msg
@@ -676,6 +714,9 @@ class Supervisor(Agent):
         s = e.symbol_state(sym)
         s.last = s.last or price
         e.on_fill(Fill(sym, side, qty, price, self.broker.now(), reason=t["reason"], ctx=dict(t.get("ctx") or {})))
+        # 제안이 만료·건너뜀으로 끝났을 때 걸린 '다시 제안하지 않는 시간'을 푼다. 체결된 제안은 성공한 주문과 같다 —
+        # 그대로 두면 그 시간(기본 30분) 동안 방금 산 종목의 손절·익절·악재 청산 제안이 하나도 뜨지 않는다.
+        s.retry_after = 0.0
         e.emit("order", sym, f"만료된 제안의 늦은 체결 반영: {side} {qty}주 @ {self.m.px(price)}")
         return True, f"{sym} {side} {qty}주 @ {self.m.px(price)} 늦은 체결 반영"
 

@@ -204,6 +204,13 @@ async def test_recover_books_only_the_new_part_at_its_own_price():
 
 
 # ---------------------------------------------------------------------- 한국투자증권 해외주식 연동
+import time
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+_KST = timezone(timedelta(hours=9))
+
+
 class FakeOS2(FakeOS):
     """주문체결내역을 실제 접수된 주문으로 만들어 주고, 쪽 나눔(연속 조회)과 게이트웨이 오류를 흉내 낸다."""
     PAGE = 15
@@ -215,6 +222,12 @@ class FakeOS2(FakeOS):
         self.invalid_tr = ""                # 이 TR은 '없는 TR'
         self.earlier = 0                    # 오늘 주문 앞에 쌓여 있는 다른 주문 수
         self.ccnl_calls = 0
+        self.times: list = []               # 주문별 접수 시각(주문체결내역의 날짜·시각 필드로 나간다)
+        self.clock = time.time
+        self.hidden: set = set()            # 주문체결내역에서 감출 주문(1번부터) — 내역 반영이 늦는 상황
+        self.tmd_kst = False                # True 면 주문시각(ord_tmd)을 한국 시각으로 준다(문서와 실제가 다른 경우)
+        self.filled_all = True              # False 면 체결 없이 걸려 있는 주문으로 보인다
+        self.extra: list = []               # 내역 앞에 끼워 넣을 임의의 행(다른 날의 같은 주문번호 등)
 
     async def order(self, req):
         tr = req.headers["tr_id"]
@@ -224,6 +237,8 @@ class FakeOS2(FakeOS):
             self.business_reject_tr = ""                                # 한 번만
             return web.json_response({"rt_cd": "1", "msg_cd": "APBK0400", "msg1": "주문가능수량을 초과했습니다"})
         r = await super().order(req)
+        while len(self.times) < len(self.orders):
+            self.times.append(self.clock())
         if self.gateway_error:
             return web.Response(status=504, text="<html><body>504 Gateway Time-out</body></html>",
                                 content_type="text/html")
@@ -234,11 +249,19 @@ class FakeOS2(FakeOS):
         rows = [{"odno": f"00200{i:05d}", "pdno": "MSFT", "sll_buy_dvsn_cd": "02", "ft_ord_qty": "1", "ft_ccld_qty": "1",
                  "ft_ccld_unpr3": "500", "nccs_qty": "0", "prcs_stat_name": "완료", "rjct_rson": "",
                  "rvse_cncl_dvsn": "00", "ord_gno_brno": "01790"} for i in range(self.earlier)]
+        rows += self.extra
         for i, (tr, b) in enumerate(self.orders, 1):
+            if i in self.hidden:
+                continue
+            t = self.times[i - 1] if i <= len(self.times) else self.clock()
+            loc, kst = datetime.fromtimestamp(t, ZoneInfo("America/New_York")), datetime.fromtimestamp(t, _KST)
             rows.append({"odno": f"00301{i:05d}", "pdno": b["PDNO"], "sll_buy_dvsn_cd": "02" if tr.endswith("1002U") else "01",
-                         "ft_ord_qty": b["ORD_QTY"], "ft_ccld_qty": b["ORD_QTY"], "ft_ccld_unpr3": b["OVRS_ORD_UNPR"],
-                         "nccs_qty": "0", "prcs_stat_name": "완료", "rjct_rson": "", "rvse_cncl_dvsn": "00",
-                         "ord_gno_brno": "01790"})
+                         "ft_ord_qty": b["ORD_QTY"], "ft_ccld_qty": b["ORD_QTY"] if self.filled_all else "0",
+                         "ft_ccld_unpr3": b["OVRS_ORD_UNPR"], "nccs_qty": "0" if self.filled_all else b["ORD_QTY"],
+                         "prcs_stat_name": "완료" if self.filled_all else "", "rjct_rson": "", "rvse_cncl_dvsn": "00",
+                         "ord_gno_brno": "01790", "ord_dt": loc.strftime("%Y%m%d"),
+                         "ord_tmd": (kst if self.tmd_kst else loc).strftime("%H%M%S"),
+                         "dmst_ord_dt": kst.strftime("%Y%m%d"), "thco_ord_tmd": kst.strftime("%H%M%S")})
         start = int(req.query.get("CTX_AREA_NK200") or 0)
         page = rows[start:start + self.PAGE]
         more = start + self.PAGE < len(rows)
