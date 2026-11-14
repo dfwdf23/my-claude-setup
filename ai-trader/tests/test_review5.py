@@ -285,3 +285,139 @@ async def test_late_start_still_evaluates_exits_for_held_positions(tmp_path):
     await asyncio.sleep(0.02)
     assert [e2.positions[s].bars_held for s in SYMS[:2]] == [1, 1] and not e2.sym[SYMS[0]].undecided
     sup2.journal.close()
+
+
+# ====================================================================== 증권사 어댑터: 주문 찾기·취소
+def _domestic(tmp_path):
+    cfg = Config()
+    cfg.data_dir = str(tmp_path)
+    k = cfg.kis
+    k.env, k.app_key, k.app_secret, k.account, k.hts_id = "mock", "AK", "SEC", "12345678", "HTS"
+    return KISBroker(cfg, "http://127.0.0.1:9", "ws://127.0.0.1:9")
+
+
+def _drow(odno, at: datetime, orgn="", name="현금매수", ccld="0", rmn="0", cncl="N", qty="7"):
+    return {"odno": odno, "orgn_odno": orgn, "pdno": "005930", "sll_buy_dvsn_cd": "02", "sll_buy_dvsn_cd_name": name,
+            "ord_qty": qty, "ord_dt": at.strftime("%Y%m%d"), "ord_tmd": at.strftime("%H%M%S"), "tot_ccld_qty": ccld,
+            "avg_prvs": "70000" if ccld != "0" else "0", "rmn_qty": rmn, "cncl_yn": cncl, "rjct_qty": "0",
+            "ord_gno_brno": "06010"}
+
+
+def _serve(br, rows, seen):
+    async def fake_call(method, path, tr, q, cont="", retry=True):
+        seen.append((q["INQR_STRT_DT"], q["INQR_END_DT"]))
+        return {"output1": [r for r in rows if q["INQR_STRT_DT"] <= r["ord_dt"] <= q["INQR_END_DT"]]}, ""
+    br._call = fake_call
+
+
+async def test_domestic_lookup_searches_the_day_the_order_was_sent(tmp_path):
+    """접수 여부를 모르는 주문은 '그 주문을 낸 날'의 주문 내역에서 찾는다.
+    (이전: 항상 오늘 것만 조회 → 다음 날 다시 켜면 어제 접수·체결된 주문을 '없음'으로 보고 버림 —
+           계좌에는 주식이 있는데 장부에는 없고, 아무도 알려 주지 않음)"""
+    br = _domestic(tmp_path)
+    now = datetime.now(KST)
+    made = (now - timedelta(days=1)).replace(hour=15, minute=10, second=0, microsecond=0)    # 어제 15:10 에 낸 주문
+    rows, seen = [_drow("0000012345", made + timedelta(seconds=2), ccld="7")], []
+    _serve(br, rows, seen)
+    o = Order(1, "005930", BUY, 7, 70000.0, "entry", {}, made.timestamp(), wall_ts=made.timestamp())
+    assert await br.lookup_order(o) == ("found", "12345")
+    assert seen[-1][0] == made.strftime("%Y%m%d")           # 어제부터 조회했다
+
+    # 조회로 확인할 수 없을 만큼 오래된 주문은 '없음'이 아니라 '모름'(집행기가 잠그고 사람을 부른다)
+    old = now - timedelta(days=40)
+    o2 = Order(2, "005930", BUY, 7, 70000.0, "entry", {}, old.timestamp(), wall_ts=old.timestamp())
+    assert await br.lookup_order(o2) == ("unknown", "")
+
+    # 그 주문을 낸 무렵에 접수된 행만 후보다 — 두 시간 뒤에 사람이 직접 낸 같은 주문은 아니다
+    br3 = _domestic(tmp_path)
+    t = now.replace(hour=10, minute=0, second=0, microsecond=0) - timedelta(days=1)
+    _serve(br3, [_drow("0000000900", t + timedelta(hours=2))], [])
+    o3 = Order(3, "005930", BUY, 7, 70000.0, "entry", {}, t.timestamp(), wall_ts=t.timestamp())
+    assert await br3.lookup_order(o3) == ("absent", "")
+
+
+async def test_domestic_lookup_ignores_cancel_rows(tmp_path):
+    """정정·취소 주문은 주문 내역에 같은 종목·수량의 별도 행으로 남는다 — 그 행을 '모르는 주문'으로 세지 않는다.
+    (이전: 시간 초과 → 취소 → 같은 수량으로 다시 주문(응답 유실)이라는 평범한 흐름에서 취소 행과 새 주문이 둘 다
+           후보가 되어 영영 '모름'으로 남거나, 새 주문이 접수되지 않았을 때 취소 행을 그 주문으로 착각)"""
+    br = _domestic(tmp_path)
+    d = (datetime.now(KST) - timedelta(days=1)).replace(hour=10, minute=0, second=0, microsecond=0)
+    br._known["100"] = d.timestamp()                         # 봇의 첫 주문(10:00) — 시간 초과로 10:01 에 취소
+    rows = [_drow("0000000100", d, cncl="Y"), _drow("0000000101", d + timedelta(minutes=1), orgn="0000000100", name="매수취소")]
+    _serve(br, rows, [])
+    sent = d + timedelta(minutes=3)                          # 10:03 에 같은 수량으로 다시 주문 — 응답 유실
+    o = Order(2, "005930", BUY, 7, 70000.0, "entry", {}, sent.timestamp(), wall_ts=sent.timestamp())
+    assert await br.lookup_order(o) == ("absent", "")        # 새 주문이 접수되지 않았다면: 취소 행을 대신 집지 않는다
+    rows.append(_drow("0000000102", sent + timedelta(seconds=1), rmn="7"))
+    assert await br.lookup_order(o) == ("found", "102")      # 접수됐다면: 그 주문을 찾는다
+
+
+class _CancelErr(FakeOS2):
+    """취소 요청에 정해 둔 오류 코드로 답하는 가짜 서버."""
+    code = ""
+
+    async def cancel(self, req):
+        if self.code:
+            return web.json_response({"rt_cd": "1", "msg_cd": self.code, "msg1": "취소할 수 없습니다"})
+        return web.json_response({"rt_cd": "0", "output": {"ODNO": "0030100099"}})
+
+
+async def test_gateway_level_cancel_rejection_is_not_treated_as_nothing_to_cancel(tmp_path, unused_tcp_port):
+    """취소 요청이 게이트웨이 단계에서 거절되면(호출 한도 초과 등, 코드 EGW…) '취소할 것이 없다'가 아니라
+    '취소 요청이 처리되지 않았다'는 뜻이다 → 명시적 거부(BrokerError)가 아니라 결과 모름(BrokerUnknown)으로 올린다.
+    업무 단계의 거부는 그대로 BrokerError. 성공하면 취소 주문 자체의 번호를 '아는 주문'에 넣는다."""
+    fake = _CancelErr()
+    runner = web.AppRunner(fake.app, access_log=None)
+    await runner.setup()
+    await web.TCPSite(runner, "127.0.0.1", unused_tcp_port).start()
+    br = KISOverseasBroker(os_cfg(tmp_path), f"http://127.0.0.1:{unused_tcp_port}", f"ws://127.0.0.1:{unused_tcp_port}")
+    br.rl.interval = 0.0
+    try:
+        await br.start()
+        br.last["NVDA"] = Tick("NVDA", 0.0, 166.19, 1, 166.18, 166.20)
+        o = Order(1, "NVDA", BUY, 7, 166.25, "entry", {}, time.time(), wall_ts=time.time())
+        await br.place_order(o)
+        fake.code = "EGW00201"
+        with pytest.raises(BrokerUnknown):
+            await br.cancel_order(o)
+        fake.code = "APBK0344"
+        with pytest.raises(BrokerError) as err:
+            await br.cancel_order(o)
+        assert err.value.code == "APBK0344"
+        fake.code = ""
+        await br.cancel_order(o)
+        assert "30100099" in br._known
+        # 조회 범위(최대 7일)보다 오래된 주문의 접수 여부는 '없음'이 아니라 '모름'
+        old = Order(2, "NVDA", BUY, 7, 166.25, "entry", {}, time.time() - 8 * 86400, wall_ts=time.time() - 8 * 86400)
+        assert await br.lookup_order(old) == ("unknown", "")
+    finally:
+        await br.stop()
+        await runner.cleanup()
+
+
+# ====================================================================== 알림·상태 저장
+async def test_many_alerts_at_once_end_with_a_summary_line(tmp_path):
+    """경고가 한꺼번에 많이 나오면 최근 5건을 보내고, 나머지가 있었다는 것을 한 줄로 알린다(조용히 버리지 않는다)."""
+    cfg = live_cfg(tmp_path)
+    sup, br = await fresh(cfg)
+    sent = []
+    sup.notifier.send = sent.append
+    sup._forward_alerts()
+    sent.clear()
+    for i in range(7):
+        sup.engine.emit("risk", "", f"경고 {i}")
+    sup._forward_alerts()
+    assert sent[:5] == [f"⚠ 경고 {i}" for i in range(2, 7)] and len(sent) == 6 and "2건" in sent[5]
+    sup.journal.close()
+
+
+async def test_state_save_survives_values_json_cannot_encode(tmp_path):
+    """주문 맥락에 JSON 으로 못 쓰는 값이 섞여 있어도 상태 저장은 되고, 타이머 루프를 죽이는 예외가 나지 않는다."""
+    cfg = live_cfg(tmp_path)
+    sup, br = await fresh(cfg)
+    await open_book(sup, br, US.now().date())
+    sup.engine.positions[SYMS[0]].ctx["odd"] = {1, 2, 3}      # 집합은 JSON 으로 쓸 수 없다
+    sup._save_state()
+    st = json.loads((sup.dir / "state.json").read_text())
+    assert len(st["engine"]["positions"]) == 9 and not sup._save_failed
+    sup.journal.close()
