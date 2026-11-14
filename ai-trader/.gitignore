@@ -6,3 +6,10 @@ __pycache__/
 *.egg-info/
 .env
 config.toml
+# 실행 중 생기는 데이터(일지·상태)는 저장소에 넣지 않는다
+*.db
+*.db-shm
+*.db-wal
+sim*/
+manual*/
+kis-*/

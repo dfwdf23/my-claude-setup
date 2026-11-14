@@ -87,6 +87,7 @@ tr.pick { cursor: pointer; } tr.pick:hover td { background: var(--hover); } tr.s
 .agent .n { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
 .tag { font-size: 10.5px; padding: 1px 5px; border-radius: 4px; border: 1px solid var(--border); color: var(--ink2); font-weight: 500; white-space: nowrap; }
 .tag.flag { border-color: var(--crit); color: var(--crit); }
+.warn-text { color: var(--crit); font-weight: 600; }
 .flexcol { display: flex; flex-direction: column; }
 .list { flex: 1 1 0; min-height: 280px; height: 0; overflow-y: auto; font-size: 12.5px; }
 .log div { display: grid; grid-template-columns: 62px 58px 1fr; gap: 8px; padding: 3px 0; border-bottom: 1px solid var(--grid); }
@@ -419,7 +420,10 @@ function renderNews(s) {
   $("news-card").hidden = !s.news_on;                       // 소식을 수집하지 않는 모드(합성 시세)에서는 차트를 넓게
   $("chart-card").className = "card " + (s.news_on ? "c8" : "c12");
   if (!s.news_on) return;
-  $("news-sub").textContent = "수집 중 · 악재는 해당 종목 매수를 잠시 막습니다";
+  const na = (s.agents || []).find(a => a.role === "정보수집");
+  const off = na && na.llm_off;                             // Claude 분류를 못 쓰는 이유(예산 소진·장애 등)
+  $("news-sub").textContent = off ? "Claude 분류 중단: " + off + " — 규칙 판정(매수 보류)만 동작" : "수집 중 · 악재는 해당 종목 매수를 잠시 막습니다";
+  $("news-sub").className = "sub" + (off ? " warn-text" : "");
   const key = s.news.map(n => n.ts + n.title + n.score).join("|");
   if (host.dataset.key === key) return;
   host.dataset.key = key; host.replaceChildren();
