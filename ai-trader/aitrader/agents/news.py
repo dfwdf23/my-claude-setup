@@ -21,7 +21,7 @@ from email.utils import parsedate_to_datetime
 
 from ..config import Config
 from ..llm import LLM
-from ..models import BUY, NewsState
+from ..models import BUY, EXIT_SESSIONS, NewsState
 from .base import Agent
 
 ATOM = "{http://www.w3.org/2005/Atom}"
@@ -513,7 +513,7 @@ class NewsAgent(Agent):
                 else:
                     self.exits_day += 1
                     self.engine.exit_now.add(sym)
-                    self.engine.exit_day[sym] = self.engine.m.local_day(now)
+                    self.engine.exit_left[sym] = EXIT_SESSIONS
                     drop = self.nc.exit_min_drop_pct
                     cond = f"가격이 전일 종가보다 {drop:g}% 이상 내려 있으면 " if drop > 0 else ""
                     self.engine.emit("news", sym, f"심각한 악재 확인(Claude): {it.title[:80]} — {cond}보유분 청산", alert=1)

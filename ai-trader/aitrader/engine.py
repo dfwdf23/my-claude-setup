@@ -19,7 +19,7 @@ from .agents.guards import OverboughtGuard, RiskManager
 from .agents.trade import BuyAgent, PositionSizer, SellAgent
 from .config import Config
 from .indicators import IndicatorSet
-from .models import BUY, Bar, Features, Fill, NewsState, OrderIntent, Position, Regime, Tick, Trade, reason_ko
+from .models import EXIT_SESSIONS, BUY, Bar, Features, Fill, NewsState, OrderIntent, Position, Regime, Tick, Trade, reason_ko
 from .params import StrategyParams
 
 DAY = 86400.0
@@ -124,7 +124,10 @@ class Engine:
         self.regime = Regime()
         self.news: dict[str, NewsState] = {}   # 정보수집 에이전트가 갱신(종목별 소식 상태)
         self.exit_now: set[str] = set()        # 심각한 악재로 청산할 종목(정보수집이 건다)
-        self.exit_day: dict[str, int] = {}     # 그 지시가 걸린 날 — 며칠이 지나도록 가격이 반응하지 않으면 버린다
+        # 그 지시가 살아 있을 남은 장(세션) 수. 장이 새로 열릴 때마다 하나씩 줄고, 0이 되면 버린다 — 가격이 반응하지
+        # 않은 지시가 끝없이 매수를 막고 있지 않게. 달력 날짜가 아니라 '열린 장'으로 센다(긴 연휴 뒤 첫 장에서도 유효).
+        self.exit_left: dict[str, int] = {}
+        self.decided: dict[str, int] = {}      # 종목 → 일봉 판단(전날 봉 기준)을 마친 날. 같은 날 다시 켜도 두 번 판단하지 않게
         # 청산은 가격이 전일 종가의 이 배수 이하일 때만(시장이 실제로 반응했는지 확인). 조건을 끄면 항상 참
         drop = cfg.news.exit_min_drop_pct
         self.exit_k = 1.0 - drop / 100.0 if drop > 0 else float("inf")
@@ -315,6 +318,7 @@ class Engine:
             # 진행 중인 주문·재시도 대기 때문에 판단을 못 했으면 표시를 남겨 다음 틱에 다시 본다(하루치 판단을 잃지 않게).
             if not self.carry or self._decide(s, s.f, tod):
                 s.undecided = False
+                self.decided[t.symbol] = day
 
         if self.view_on:
             vb = ts - ts % self.view_sec
@@ -501,7 +505,7 @@ class Engine:
     def _close(self, pos: Position, fl: Fill) -> Trade:
         del self.positions[pos.symbol]
         self.exit_now.discard(pos.symbol)
-        self.exit_day.pop(pos.symbol, None)
+        self.exit_left.pop(pos.symbol, None)
         self.bar_exit.pop(pos.symbol, None)
         r = pos.risk_per_share or 1.0
         tq = pos.exit_qty
@@ -568,10 +572,16 @@ class Engine:
             s.cum_vol = 0
             s.rvol = -1.0
         # 장 마감 뒤에 확인된 심각한 악재의 청산 지시는 다음 장에서 실행돼야 한다 → 보유 중인 종목의 지시는 남긴다.
-        # 다만 닷새가 지나도록 가격이 반응하지 않은 지시는 버린다(끝없이 매수를 막고 있지 않게).
-        for x in [x for x in self.exit_now if x not in self.positions or day - self.exit_day.get(x, day) > 4]:
-            self.exit_now.discard(x)
-            self.exit_day.pop(x, None)
+        # 다만 지시가 걸린 뒤 EXIT_SESSIONS 번째로 열리는 장부터는 버린다(그동안 가격이 반응하지 않았다는 뜻).
+        for x in list(self.exit_now):
+            left = self.exit_left.get(x, EXIT_SESSIONS) - 1
+            if x not in self.positions or left <= 0:
+                self.exit_now.discard(x)
+                self.exit_left.pop(x, None)
+                if x in self.positions:
+                    self.emit("news", x, f"{x} 악재 청산 지시 해제 — 지시가 걸린 뒤 가격이 기준만큼 내려가지 않았습니다")
+            else:
+                self.exit_left[x] = left
         if not first:
             self.mark()
         self.day_start_equity = self.equity
@@ -612,7 +622,8 @@ class Engine:
                 # 보유 종목의 마지막 가격 — 재시작 직후 취득가로 평가하면 평가손익이 통째로 사라져 한도가 잘못 발동한다
                 "last": {p.symbol: sym[p.symbol].last for p in self.positions.values() if p.symbol in sym},
                 "since_loss": since, "exit_now": sorted(self.exit_now),
-                "exit_day": {k: v for k, v in self.exit_day.items() if k in self.exit_now},
+                "exit_left": {k: self.exit_left.get(k, EXIT_SESSIONS) for k in self.exit_now},
+                "decided": {k: v for k, v in self.decided.items() if v == self.day},
                 # 결정됐지만 아직 체결되지 않은 봉 기준 청산(추세 이탈·시간 청산) — 일봉 방식은 판단이 하루 한 번뿐이라
                 # 재시작으로 잊으면 청산이 통째로 사라진다
                 "bar_exit": {k: v for k, v in self.bar_exit.items() if k in self.positions}}

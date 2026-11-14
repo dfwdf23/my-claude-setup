@@ -61,7 +61,13 @@ async def test_midsession_restart_after_days_off_takes_yesterdays_close_as_today
             feed(e2, d0, 11, k, today_px)
         await asyncio.sleep(0.03)
         assert e2.risk.day_stop == stop and e2.risk.flatten_all == stop, name
-        assert len(sells(br2)) == (9 if stop else 0), name
+        reasons = {it.reason for it in e2.pending.values()}
+        if stop:
+            assert len(sells(br2)) == 9 and reasons == {"risk_flatten"}, name
+        else:
+            # 손실 한도로 인한 전량 청산은 없다. (어제 봉이 추세를 이탈했다는 일봉 판단에 따른 청산은 별개다 —
+            # 늦게 켜도 보유 종목의 청산 판단은 한다)
+            assert "risk_flatten" not in reasons and reasons <= {"trend_exit", "time_stop"}, name
         sup2.journal.close()
 
 
@@ -1049,8 +1055,7 @@ async def test_recover_keeps_watching_an_order_it_cancelled_without_confirmation
 # ====================================================================== 소식으로 거는 청산의 안전장치
 def test_news_exit_waits_until_the_price_has_actually_dropped():
     """'심각한 악재' 청산 지시는 가격이 실제로 전일 종가보다 설정한 폭 이상 내려 있을 때만 실행한다.
-    (소식 제목은 바깥에서 온 글이다 — 틀렸거나 누가 일부러 흘린 제목 한 줄과 모델의 판정만으로 보유분을 던지지 않는다)
-    며칠이 지나도록 가격이 반응하지 않은 지시는 버린다."""
+    (소식 제목은 바깥에서 온 글이다 — 틀렸거나 누가 일부러 흘린 제목 한 줄과 모델의 판정만으로 보유분을 던지지 않는다)"""
     cfg = Config.for_market("US")
     sent = []
     e = Engine(cfg, StrategyParams(), 30_000, execute=sent.append)
@@ -1059,28 +1064,14 @@ def test_news_exit_waits_until_the_price_has_actually_dropped():
     e.on_fill(Fill("X", BUY, 10, 100.0, US.epoch(d1, 10, 0), ctx={"stop_dist": 20.0, "atr": 5.0}))
     e.sym["X"].prev_close = 100.0                           # 전일 종가(장전 준비 때 채워진다)
     e.exit_now.add("X")
-    e.exit_day["X"] = e.day
     e.on_tick(Tick("X", US.epoch(d1, 10, 1), 99.2, 100))    # −0.8%: 시장은 반응하지 않았다 → 아직 팔지 않는다
     assert not sent and "X" in e.exit_now
     e.on_tick(Tick("X", US.epoch(d1, 10, 2), 98.4, 100))    # −1.6%: 기준(1.5%)을 넘었다 → 청산
     assert [(it.symbol, it.reason, it.limit_price) for it in sent] == [("X", "news_exit", 0)]
 
-    sent.clear()
-    e2 = Engine(cfg, StrategyParams(), 30_000, execute=sent.append)
-    e2.on_tick(Tick("X", US.epoch(d1, 10, 0), 100.0, 100))
-    e2.on_fill(Fill("X", BUY, 10, 100.0, US.epoch(d1, 10, 0), ctx={"stop_dist": 20.0, "atr": 5.0}))
-    e2.sym["X"].prev_close = 100.0
-    e2.exit_now.add("X")
-    e2.exit_day["X"] = e2.day
-    assert e2.export_state()["exit_day"] == {"X": e2.day}
-    for k in (1, 2, 3):                                     # 사흘 뒤까지는 지시가 살아 있다(주말을 넘겨도)
-        e2.on_tick(Tick("X", US.epoch(d1 + timedelta(days=k), 10, 0), 100.5, 100))
-        assert "X" in e2.exit_now and not sent
-    e2.on_tick(Tick("X", US.epoch(d1 + timedelta(days=7), 10, 0), 100.5, 100))
-    assert "X" not in e2.exit_now and not e2.exit_day and not sent          # 닷새 넘게 가격이 반응하지 않았다 → 버린다
-
     cfg0 = Config.for_market("US")
     cfg0.news.exit_min_drop_pct = 0.0                       # 조건을 끄면 예전처럼 즉시
+    sent.clear()
     e3 = Engine(cfg0, StrategyParams(), 30_000, execute=sent.append)
     e3.on_tick(Tick("X", US.epoch(d1, 10, 0), 100.0, 100))
     e3.on_fill(Fill("X", BUY, 10, 100.0, US.epoch(d1, 10, 0), ctx={"stop_dist": 20.0, "atr": 5.0}))
@@ -1088,6 +1079,35 @@ def test_news_exit_waits_until_the_price_has_actually_dropped():
     e3.exit_now.add("X")
     e3.on_tick(Tick("X", US.epoch(d1, 10, 1), 100.4, 100))
     assert sent and sent[-1].reason == "news_exit"
+
+
+def test_news_exit_flag_lives_for_sessions_not_calendar_days():
+    """악재 청산 지시의 수명은 달력 날짜가 아니라 '열린 장'으로 센다: 지시가 걸린 뒤 두 장 동안 유효하고 그다음 장에서 버린다.
+    (이전: 닷새라는 달력 기준 → 연말·명절처럼 닷새 쉬고 열리는 첫 장에서, 10% 갭 하락이 나와도 지시가 이미 지워져 있음)"""
+    cfg = Config.for_market("US")
+    d0 = date(2026, 1, 5)
+
+    def held():
+        sent = []
+        e = Engine(cfg, StrategyParams(), 30_000, execute=sent.append)
+        e.on_tick(Tick("X", US.epoch(d0, 10, 0), 100.0, 100))
+        e.on_fill(Fill("X", BUY, 10, 100.0, US.epoch(d0, 10, 0), ctx={"stop_dist": 30.0, "atr": 5.0}))
+        e.sym["X"].prev_close = 100.0
+        e.exit_now.add("X")                                  # 장 마감 뒤에 걸린 지시
+        return e, sent
+
+    e, sent = held()
+    e.on_tick(Tick("X", US.epoch(d0 + timedelta(days=6), 9, 35), 90.0, 100))      # 엿새 쉬고 열린 첫 장: 10% 갭 하락
+    assert [it.reason for it in sent] == ["news_exit"]
+
+    e, sent = held()
+    assert e.export_state()["exit_left"] == {"X": 3}
+    for k in (1, 2):                                        # 가격이 반응하지 않는 동안: 두 장은 지시가 살아 있다
+        e.on_tick(Tick("X", US.epoch(d0 + timedelta(days=k), 10, 0), 100.5, 100))
+        assert "X" in e.exit_now and not sent
+    e.on_tick(Tick("X", US.epoch(d0 + timedelta(days=3), 10, 0), 100.5, 100))     # 세 번째 장: 버린다(알림 이벤트를 남긴다)
+    assert "X" not in e.exit_now and not e.exit_left and not sent
+    assert any("악재 청산 지시 해제" in ev["text"] for ev in e.events)
 
 
 async def test_news_exit_orders_are_capped_per_day():
@@ -1098,7 +1118,7 @@ async def test_news_exit_orders_are_capped_per_day():
     cfg.news.max_exits_per_day = 2
     na.ingest([(NOW, f"{name} hit by accounting fraud probe", "", "x", ()) for name in ("AMD", "Nvidia", "Apple", "Microsoft")], NOW)
     assert await na.classify(NOW + 400) == 4
-    assert len(e.exit_now) == 2 and set(e.exit_day) == e.exit_now
+    assert len(e.exit_now) == 2 and set(e.exit_left) == e.exit_now
     over = [ev for ev in e.events if ev.get("alert") and "한도" in ev["text"]]
     assert len(over) == 2 and all(e.news[s].block_until > NOW for s in held)      # 나머지는 알림 + 매수 보류만
     na.new_day()                                            # 날이 바뀌면 상한은 새로 센다

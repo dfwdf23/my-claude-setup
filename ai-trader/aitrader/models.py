@@ -7,6 +7,8 @@ BUY = "BUY"
 SELL = "SELL"
 
 # 주문·청산 사유 코드 → 화면·알림에 보여 줄 말(코드는 일지·통계에 그대로 남긴다)
+EXIT_SESSIONS = 3       # 악재 청산 지시가 걸린 뒤 세 번째로 열리는 장에서 버린다(= 그 뒤 두 장 동안 유효)
+
 REASON_KO = {"entry": "매수 신호", "stop_loss": "손절", "trailing_stop": "추적 손절", "take_profit": "익절",
              "time_stop": "시간 청산", "trend_exit": "추세 이탈", "eod_flatten": "장 마감 청산",
              "news_exit": "악재 소식", "risk_flatten": "전량 청산", "reconcile": "계좌 대사",

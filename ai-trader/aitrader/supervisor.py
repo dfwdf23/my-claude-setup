@@ -26,7 +26,7 @@ from .executor import Executor
 from .journal import Journal
 from .llm import LLM
 from .metrics import summarize
-from .models import SELL, Fill, Position, Trade, reason_ko
+from .models import EXIT_SESSIONS, SELL, Fill, Position, Trade, reason_ko
 from .notify import Notifier
 from .params import ParamStore
 
@@ -209,6 +209,7 @@ class Supervisor(Agent):
         day0 = self.m.epoch(d)
         ses = self.cfg.session
         early = self.m.local(now).hour * 3600 + self.m.local(now).minute * 60 < ses.tod("open") + 1800
+        today_n = self.m.local_day(now)
         # 오늘 아침에 일봉을 실제로 받은 종목 → (가장 최근 일봉의 날짜, 그 종가)
         fresh: dict[str, tuple[int, float]] = {}
         n_warm = 3 * self.cfg.strategy.warmup_bars
@@ -236,7 +237,11 @@ class Supervisor(Agent):
                 if dbars and (sym not in self._warmed or (sym in fresh and have < fresh[sym][0])):
                     e.warm(sym, dbars[-n_warm:])
                     self._warmed.add(sym)
-                    s.undecided = early               # 장 초반에 켜졌다면 어제 봉에 대한 판단을 오늘 한다
+                    # 어제 봉에 대한 판단을 오늘 할 것인가:
+                    #  · 오늘 이미 판단을 마쳤으면(같은 날 다시 켠 경우) 다시 하지 않는다 — 보유 일수가 두 번 세어진다.
+                    #  · 장 초반에 켜졌으면 한다(새 매수 판단 포함).
+                    #  · 늦게 켜졌으면 새 매수는 건너뛰되, 보유 종목의 청산 판단(추세 이탈·보유 기간)은 한다.
+                    s.undecided = e.decided.get(sym) != today_n and (early or sym in e.positions)
             elif s.ind.n == 0:
                 e.warm(sym, self.journal.recent_bars(sym, n_warm))
         if self.daily:                                # 4) 장중에 켜졌다 → 오늘 봉의 지나간 구간을 채운다
@@ -653,9 +658,11 @@ class Supervisor(Agent):
             st_sym = e.symbol_state(sym)                # 손실 청산 뒤 재진입 금지 기간을 이어 간다
             st_sym.last_loss_bar = st_sym.bar_count - int(since)
         e.exit_now.update(x for x in (es.get("exit_now") or []) if x in e.positions)
-        saved_day = es.get("exit_day") or {}
-        for x in e.exit_now:                            # 지시가 걸린 날(없으면 오늘로 본다)
-            e.exit_day[x] = int(saved_day.get(x, self.m.local_day(time.time())))
+        left = es.get("exit_left") or {}
+        for x in e.exit_now:                            # 지시가 살아 있을 남은 장 수(저장된 값이 없으면 처음부터)
+            e.exit_left[x] = max(1, int(left.get(x, EXIT_SESSIONS)))
+        # 오늘 이미 마친 일봉 판단(같은 날 다시 켜도 두 번 판단하지 않는다)
+        e.decided.update({str(k): int(v) for k, v in (es.get("decided") or {}).items()})
         e.bar_exit.update({k: str(v) for k, v in (es.get("bar_exit") or {}).items() if k in e.positions})
         eq = e.cash + sum(p.qty * e.sym[p.symbol].last for p in e.positions.values())
         same_day = int(es.get("day", -1)) == self.m.local_day(time.time())
