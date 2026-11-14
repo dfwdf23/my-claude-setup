@@ -437,3 +437,12 @@ def test_startup_says_which_settings_were_read(tmp_path):
     (tmp_path / ".env").write_text("", encoding="utf-8")
     text = "\n".join(startup_notes(None, "kis-mock", tmp_path))
     assert "config.toml 을 읽었습니다" in text and ".env 를 읽었습니다" in text and "!" not in text and "모의투자" in text
+
+
+def test_broker_refusal_at_startup_is_explained():
+    """증권사가 시작할 때 연결을 거부하면 흔한 원인을 알아볼 말로 알려 준다.
+    (실제 사례: 실전용 앱키를 모의투자 모드에 넣음 → '해당 앱키는 모의투자용 앱키가 아닙니다 [EGW02007]' 와 긴 오류 추적만 나옴)"""
+    from aitrader.__main__ import broker_hint
+    assert "모의투자계좌" in broker_hint("해당 앱키는 모의투자용 앱키가 아닙니다. [EGW02007]")
+    assert "KIS_APP_SECRET" in broker_hint("유효하지 않은 AppSecret입니다. [EGW00105]")
+    assert ".env" in broker_hint("알 수 없는 오류 [XXXX]")

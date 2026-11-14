@@ -23,6 +23,7 @@ import sys
 import time
 import tomllib
 
+from .brokers.base import BrokerError
 from .config import Config, load_config
 
 LIVE_CONFIRM = "I_UNDERSTAND_REAL_MONEY"
@@ -86,9 +87,35 @@ async def _run(cfg: Config, dashboard: bool) -> None:
 def _loop_run(coro) -> None:
     try:
         import uvloop                                  # libuv 기반 이벤트 루프 — 기본 asyncio보다 빠르다
+    except ImportError:                                # 윈도우에는 uvloop 이 없다 → 기본 이벤트 루프(오류가 아니다)
+        uvloop = None
+    # 실행은 except 블록 밖에서 한다 — 안에서 돌리면, 나중에 난 오류 앞에 'uvloop 없음' 추적이 덧붙어 원인처럼 보인다
+    if uvloop is not None:
         uvloop.run(coro)
-    except ImportError:
+    else:
         asyncio.run(coro)
+
+
+BROKER_HINTS = {
+    "EGW02007": "실전용 앱키를 모의투자 모드(kis-mock)에 넣었습니다. KIS Developers 에서 '모의투자계좌'로 API 를 따로 신청해 "
+                "받은 앱키·시크릿과 모의투자 계좌번호를 .env 에 넣으세요. (실전으로 켜려는 것이라면 mode 를 kis-live 로 — "
+                "다만 모의투자로 먼저 확인하기를 권합니다)",
+    "EGW02006": "모의투자용 앱키를 실전 모드(kis-live)에 넣었습니다. 실전용 앱키·계좌번호로 바꾸거나 mode 를 kis-mock 으로 두세요.",
+    "EGW00103": "앱키가 유효하지 않습니다. .env 의 KIS_APP_KEY 를 다시 복사해 넣으세요(앞뒤 공백·따옴표 없이).",
+    "EGW00105": "앱 시크릿이 유효하지 않습니다. .env 의 KIS_APP_SECRET 을 다시 복사해 넣으세요(한 줄로, 앞뒤 공백 없이).",
+}
+
+
+def broker_hint(msg: str) -> str:
+    """증권사가 연결을 거부했을 때, 흔한 원인을 사람이 알아볼 말로 덧붙인다."""
+    for code, hint in BROKER_HINTS.items():
+        if code in msg:
+            return hint
+    if "토큰 발급 실패" in msg:
+        return ".env 의 KIS_APP_KEY·KIS_APP_SECRET 이 맞는지, 모드(모의/실전)와 같은 종류의 키인지 확인하세요."
+    if "계좌" in msg:
+        return ".env 의 KIS_ACCOUNT(계좌번호 앞 8자리)·KIS_PRODUCT(뒤 2자리)가 그 키를 발급받은 계좌와 같은지 확인하세요."
+    return "키·계좌번호가 모드(모의/실전)와 맞는지 .env 를 확인하세요."
 
 
 def _cfg(a) -> Config:
@@ -157,7 +184,10 @@ def cmd_run(a) -> None:
             "실전 매매는 실제 돈이 움직입니다. 모의투자(kis-mock)로 충분히 검증한 뒤,\n"
             f"환경변수 AITRADER_LIVE_CONFIRM={LIVE_CONFIRM} 을 설정해야 시작됩니다.")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    _loop_run(_run(cfg, not a.no_dashboard))
+    try:
+        _loop_run(_run(cfg, not a.no_dashboard))
+    except BrokerError as e:                           # 긴 오류 추적 대신 무엇이 틀렸는지 알려 주고 끝낸다
+        raise SystemExit(f"\n증권사 연결 실패: {e}\n→ {broker_hint(str(e))}") from None
 
 
 def _report(tag: str, r: dict, e, m, el: float) -> None:
