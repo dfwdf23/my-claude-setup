@@ -73,6 +73,10 @@ class RateLimiter:
         if t > now:
             await asyncio.sleep(t - now)
 
+    def back_off(self, sec: float) -> None:
+        """서버가 '호출이 너무 잦다'고 했다 → 다음 호출들을 그만큼 뒤로 민다(대기 중인 호출 전부에 적용된다)."""
+        self._next = max(self._next, asyncio.get_running_loop().time()) + sec
+
 
 def aes_cbc_decrypt(key: str, iv: str, b64: str) -> str:
     from cryptography.hazmat.primitives import padding
@@ -103,7 +107,8 @@ class KISBroker(Broker):
         self.base = base_url or REST[self.env]
         self.ws_base = ws_url or WS[self.env]
         self.tr = self.TR_TABLE[self.env]
-        self.rl = RateLimiter(18.0 if self.env == "real" else 1.8)
+        # 모의투자는 문서상 초당 2건이지만 실제로는 그보다 빡빡하게 걸린다(도착 간격이 흔들리면 초과로 센다) → 여유를 둔다
+        self.rl = RateLimiter(15.0 if self.env == "real" else 1.1)
         self.session: aiohttp.ClientSession | None = None
         self._tok = ""
         self._tok_exp = 0.0
@@ -179,7 +184,7 @@ class KISBroker(Broker):
                 "appkey": k.app_key, "appsecret": k.app_secret, "tr_id": tr_id, "custtype": "P", "tr_cont": cont}
 
     async def _call(self, method: str, path: str, tr_id: str, payload: dict, cont: str = "",
-                    retry: bool = True) -> tuple[dict, str]:
+                    retry: bool = True, busy: int = 0) -> tuple[dict, str]:
         await self.rl.wait()
         h = await self._headers(tr_id, cont)
         kw = {"params": payload} if method == "GET" else {"data": json.dumps(payload)}
@@ -206,9 +211,10 @@ class KISBroker(Broker):
             except OSError:
                 pass
             return await self._call(method, path, tr_id, payload, cont, retry=False)
-        if retry and code == "EGW00201":                 # 초당 거래건수 초과 → 접수되지 않았으므로 재시도 안전
-            await asyncio.sleep(0.6 if self.env == "mock" else 0.1)
-            return await self._call(method, path, tr_id, payload, cont, retry=False)
+        if code == "EGW00201" and busy < 3:              # 초당 거래건수 초과 → 접수되지 않았으므로 재시도 안전
+            # 한 번으로 포기하지 않고 간격을 넓혀 가며 다시 보낸다. 다른 호출들도 함께 늦춘다(같이 몰려서 또 걸리지 않게).
+            self.rl.back_off((1.0 if self.env == "mock" else 0.2) * (busy + 1))
+            return await self._call(method, path, tr_id, payload, cont, retry, busy + 1)
         err = BrokerError(f"{d.get('msg1', '').strip() or 'API 오류'} [{code or status}]")
         err.code = str(code)
         raise err

@@ -446,3 +446,32 @@ def test_broker_refusal_at_startup_is_explained():
     assert "모의투자계좌" in broker_hint("해당 앱키는 모의투자용 앱키가 아닙니다. [EGW02007]")
     assert "KIS_APP_SECRET" in broker_hint("유효하지 않은 AppSecret입니다. [EGW00105]")
     assert ".env" in broker_hint("알 수 없는 오류 [XXXX]")
+
+
+async def test_rate_limit_reply_is_retried_with_backoff(tmp_path, unused_tcp_port):
+    """'초당 거래건수 초과'(EGW00201)는 한 번으로 포기하지 않고 간격을 넓혀 다시 보낸다.
+    (실제 사례: 모의투자에서 '계좌 대사 실패: 초당 거래건수를 초과하였습니다' — 재시도가 한 번뿐이고 호출 간격이 한도에 붙어 있었다)"""
+    class Busy(FakeOS2):
+        left = 2
+
+        async def balance(self, req):
+            if Busy.left > 0:
+                Busy.left -= 1
+                return web.json_response({"rt_cd": "1", "msg_cd": "EGW00201", "msg1": "초당 거래건수를 초과하였습니다."})
+            return await super().balance(req)
+
+    fake = Busy()
+    runner = web.AppRunner(fake.app, access_log=None)
+    await runner.setup()
+    await web.TCPSite(runner, "127.0.0.1", unused_tcp_port).start()
+    br = KISOverseasBroker(os_cfg(tmp_path), f"http://127.0.0.1:{unused_tcp_port}", f"ws://127.0.0.1:{unused_tcp_port}")
+    assert br.rl.interval > 0.8                              # 모의투자 한도(초당 2건)보다 넉넉한 간격
+    br.rl.interval = 0.0
+    br.rl.back_off = lambda sec: None                        # 테스트에서는 기다리지 않는다
+    try:
+        await br.start()
+        acct = await br.get_account()                        # 두 번 거절당한 뒤 성공한다
+        assert Busy.left == 0 and acct.cash >= 0
+    finally:
+        await br.stop()
+        await runner.cleanup()
